@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="gradBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0284c7" />
+      <stop offset="100%" stop-color="#0369a1" />
+    </linearGradient>
+    <linearGradient id="paperGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#f0f9ff" />
+    </linearGradient>
+  </defs>
+  <!-- Background Card -->
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#gradBg)" filter="drop-shadow(0 4px 6px rgba(0,0,0,0.15))" />
+  <!-- Document Sheet -->
+  <path d="M34 26 h42 l22 22 v54 a6 6 0 0 1 -6 6 H34 a6 6 0 0 1 -6 -6 V32 a6 6 0 0 1 6 -6 z" fill="url(#paperGrad)" />
+  <!-- Folded Corner -->
+  <path d="M76 26 v16 a6 6 0 0 0 6 6 h16 z" fill="#bae6fd" />
+  <!-- Math Formula & Graph lines on Sheet -->
+  <line x1="38" y1="44" x2="66" y2="44" stroke="#0284c7" stroke-width="4" stroke-linecap="round" />
+  <line x1="38" y1="56" x2="88" y2="56" stroke="#94a3b8" stroke-width="3" stroke-linecap="round" />
+  <!-- Integral / Sigma curve / Math shape -->
+  <path d="M42 88 Q 50 68, 64 78 T 86 68" fill="none" stroke="#0284c7" stroke-width="4" stroke-linecap="round" />
+  <!-- Target / Calibration Nodes -->
+  <circle cx="42" cy="88" r="4" fill="#38bdf8" />
+  <circle cx="64" cy="78" r="4" fill="#0284c7" />
+  <circle cx="86" cy="68" r="4" fill="#0369a1" />
+  <!-- Pipeline gear / indicator in bottom right -->
+  <circle cx="94" cy="94" r="16" fill="#0284c7" stroke="#ffffff" stroke-width="3" />
+  <path d="M94 84 v20 M84 94 h20" stroke="#ffffff" stroke-width="3" stroke-linecap="round" />
+</svg>

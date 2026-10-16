@@ -1,0 +1,5 @@
+- insert:
+    - id: qchain
+      name: '@local/qchain'
+      config:
+        pythonPath: 'python'

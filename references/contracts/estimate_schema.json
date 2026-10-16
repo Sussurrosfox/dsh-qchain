@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EstimateMinutesContract",
+  "type": "object",
+  "required": ["schema_version", "tool", "coefficients", "tasks", "totals"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "tool": { "type": "string", "const": "estimate_minutes" },
+    "coefficients": {
+      "type": "object",
+      "required": ["base_reading", "per_sub_item", "per_fillin", "proof_bonus", "per_dialogue_turn"],
+      "properties": {
+        "base_reading": {
+          "type": "object",
+          "properties": {
+            "core": { "type": "number" },
+            "support": { "type": "number" }
+          },
+          "required": ["core", "support"]
+        },
+        "per_sub_item": { "type": "number" },
+        "per_fillin": { "type": "number" },
+        "proof_bonus": { "type": "number" },
+        "per_dialogue_turn": { "type": "number" }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["node_id", "qid", "delivery_role", "sub_items", "sub_fillins", "est_minutes", "source"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "qid": { "type": "string" },
+          "delivery_role": { "type": "string" },
+          "sub_items": { "type": "integer" },
+          "sub_fillins": { "type": "integer" },
+          "est_minutes": { "type": "number" },
+          "override_minutes": { "type": ["number", "null"] },
+          "source": { "type": "string", "enum": ["estimated", "teacher_override"] }
+        }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "required": ["core", "support_inclass", "opening", "closing", "buffer", "grand_total"],
+      "properties": {
+        "core": { "type": "number" },
+        "support_inclass": { "type": "number" },
+        "opening": { "type": "number" },
+        "closing": { "type": "number" },
+        "buffer": { "type": "number" },
+        "grand_total": { "type": "number" }
+      }
+    }
+  }
+}

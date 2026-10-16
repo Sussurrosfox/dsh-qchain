@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ConfirmedSpecContract",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "delivery_profile",
+    "lesson_minutes",
+    "core_task_limit",
+    "max_student_pages",
+    "confirmed_at",
+    "phase0_token_digest",
+    "spec_digest"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "delivery_profile": { "type": "string", "enum": ["teaching", "classroom", "self_study"] },
+    "lesson_minutes": { "type": ["integer", "null"] },
+    "core_task_limit": { "type": "integer" },
+    "max_student_pages": { "type": "integer" },
+    "confirmed_at": { "type": "string" },
+    "phase0_token_digest": { "type": "string" },
+    "spec_digest": { "type": "string" }
+  }
+}

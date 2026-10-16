@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="{{LANG}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="qchain-html deck template"><title>{{META_TITLE}}</title>
+<!-- ==========================================================================
+     qchain-html 题链 HTML · 一页一卡牌组模版 (deck.template.html)
+     --------------------------------------------------------------------------
+     本文件是 qchain-html 插件的交付模版：render_html.py 用 cards.json 填充占位符后
+     生成 student.html / teacher.html。填写规范（占位符、卡片结构、交互契约）
+     见 references/html-interface.md；请勿手改生成物，改模版须同步规范文档。
+
+     占位符一览（双花括号包裹；本注释内用单花括号免替换写法）：
+       {LANG}          文档语言（固定 zh-CN）
+       {META_TITLE}    浏览器标签标题
+       {MAIN_TITLE}    页眉主标题
+       {VERSION}        student | teacher（驱动默认答案显隐）
+       {VERSION_LABEL}  学生版 | 教师版
+       {GENERATED_AT}   生成时间
+       {TOC_HTML}       目录抽屉条目（按节分组）
+       {CARDS_HTML}     全部卡片（一张卡 = 一页）
+
+     交互契约：
+       - 翻页：底部/顶部按钮、目录跳转、键盘 ←/→/PgUp/PgDn/Home/End、URL #/
+       - 答案：顶部「显示答案」按钮切换本页 .qc-reveal；教师版默认展开
+       - 选择题：点击 .qc-option 即时红/绿判定（data-correct 标记），
+                 同组选项仅判定一次；卡片内「重置本页」可重做
+       - 数学公式：KaTeX CDN 渲染；离线时退化为 $...$ 源码文本，不影响交互
+     ========================================================================== -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+" crossorigin="anonymous">
+<style>
+:root{
+  --qc-primary:#0f5cc0; --qc-primary-dark:#0b47a0;
+  --qc-correct:#15803d; --qc-correct-bg:#dcfce7;
+  --qc-wrong:#b91c1c;  --qc-wrong-bg:#fee2e2;
+  --qc-teacher:#0f766e; --qc-teacher-bg:#f0fdfa;
+  --qc-ink:#1e293b; --qc-ink-2:#475569; --qc-ink-3:#64748b;
+  --qc-line:#cbd5e1; --qc-bg:#eef2f7; --qc-card:#ffffff;
+  --qc-shadow:0 1px 2px rgba(15,23,42,.06),0 8px 24px rgba(15,23,42,.08);
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:"PingFang SC","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC",-apple-system,"Segoe UI",Roboto,sans-serif;
+  background:var(--qc-bg); color:var(--qc-ink);
+  font-size:17px; line-height:1.85;
+}
+.qc-math{font-family:"KaTeX_Main","Times New Roman",serif; white-space:normal}
+.qc-math-display{display:block; text-align:center; margin:.6em 0; overflow-x:auto}
+html.qc-nokatex-css .qc-math{background:#f8fafc; border-radius:3px; padding:0 .15em}
+
+/* ---------- 顶栏 ---------- */
+.qc-topbar{
+  position:sticky; top:0; z-index:30;
+  display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  padding:10px 18px; background:rgba(255,255,255,.92); backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--qc-line);
+}
+.qc-topbar .qc-title{font-weight:700; font-size:17px; color:var(--qc-primary-dark); margin-right:auto}
+.qc-topbar .qc-title small{color:var(--qc-ink-3); font-weight:400; margin-left:8px}
+.qc-btn{
+  appearance:none; border:1px solid var(--qc-line); background:#fff; color:var(--qc-ink);
+  border-radius:8px; padding:6px 14px; font-size:14px; cursor:pointer; line-height:1.5;
+  transition:all .15s ease;
+}
+.qc-btn:hover{border-color:var(--qc-primary); color:var(--qc-primary)}
+.qc-btn:disabled{opacity:.4; cursor:default; pointer-events:none}
+.qc-btn.qc-primary{background:var(--qc-primary); border-color:var(--qc-primary); color:#fff}
+.qc-btn.qc-primary:hover{background:var(--qc-primary-dark)}
+.qc-btn.qc-answer-on{background:var(--qc-correct-bg); border-color:var(--qc-correct); color:var(--qc-correct)}
+.qc-version-chip{
+  font-size:12px; padding:2px 10px; border-radius:999px; letter-spacing:.5px;
+  background:var(--qc-teacher-bg); color:var(--qc-teacher); border:1px solid #99f6e4;
+}
+body[data-version="student"] .qc-version-chip{background:#eff6ff; color:var(--qc-primary); border-color:#bfdbfe}
+.qc-progress{position:absolute; left:0; bottom:-1px; height:3px; background:var(--qc-primary); width:0; transition:width .25s ease}
+
+/* ---------- 舞台与卡片 ---------- */
+#qc-stage{max-width:920px; margin:26px auto 90px; padding:0 16px}
+.qc-card{
+  background:var(--qc-card); border:1px solid var(--qc-line); border-radius:14px;
+  box-shadow:var(--qc-shadow); padding:30px 38px 26px; position:relative;
+}
+.qc-card[hidden]{display:none}
+.qc-card-head{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:14px}
+.qc-kind-badge{font-size:12px; padding:2px 10px; border-radius:999px; background:#eef2ff; color:#4338ca; border:1px solid #c7d2fe}
+.qc-card[data-kind="dialogue"] .qc-kind-badge{background:#f5f3ff; color:#6d28d9; border-color:#ddd6fe}
+.qc-card[data-kind="knowledge"] .qc-kind-badge,
+.qc-card[data-kind="conclusion"] .qc-kind-badge{background:#ecfdf5; color:#047857; border-color:#a7f3d0}
+.qc-card[data-kind="section"] .qc-kind-badge{background:#fff7ed; color:#c2410c; border-color:#fed7aa}
+.qc-qid{font-family:ui-monospace,Consolas,monospace; font-size:12px; color:var(--qc-ink-3)}
+.qc-card-meta{font-size:13px; color:var(--qc-teacher); margin-left:auto}
+.qc-card-meta .qc-tag{border:1px solid #99f6e4; background:var(--qc-teacher-bg); border-radius:6px; padding:0 8px; margin-left:6px}
+.qc-page-no{font-size:12px; color:var(--qc-ink-3)}
+.qc-card-title{font-size:23px; font-weight:700; margin:2px 0 12px; color:var(--qc-ink)}
+.qc-card-body{font-size:17px}
+.qc-lead{color:var(--qc-ink-2); border-left:3px solid var(--qc-line); padding-left:12px; margin:0 0 12px}
+.qc-stem{margin:0 0 10px}
+.qc-parts{margin:6px 0 4px; padding-left:0; list-style:none}
+.qc-parts>li{display:flex; gap:10px; margin:10px 0}
+.qc-part-label{font-weight:700; color:var(--qc-primary-dark); flex:none; min-width:2.2em}
+.qc-sublist{margin:6px 0 6px 1.4em; padding-left:1em}
+.qc-hintline{display:block; border-left:3px dashed #f59e0b; padding-left:10px; color:#92400e; margin:8px 0}
+
+/* ---------- 对话卡 ---------- */
+.qc-speaker{display:flex; gap:12px; margin:10px 0; align-items:flex-start}
+.qc-speaker .qc-role{
+  flex:none; font-weight:700; color:var(--qc-primary-dark);
+  background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px;
+  min-width:3.2em; text-align:center; padding:1px 8px;
+}
+.qc-speaker .qc-line{flex:1}
+.qc-speaker[data-teacher-only="1"] .qc-role{background:var(--qc-teacher-bg); border-color:#99f6e4; color:var(--qc-teacher)}
+.qc-speaker[data-teacher-only="1"] .qc-line{color:var(--qc-ink-2)}
+.qc-dlgteacher{color:var(--qc-ink-2)}
+
+/* ---------- 知识卡 / 结论卡 ---------- */
+.qc-know-items{margin:8px 0 0; padding-left:0; list-style:none; counter-reset:qcknow}
+.qc-know-items>li{counter-increment:qcknow; margin:10px 0; padding-left:2.4em; position:relative}
+.qc-know-items>li::before{
+  content:counter(qcknow); position:absolute; left:0; top:.15em;
+  width:1.7em; height:1.7em; border-radius:50%; text-align:center; line-height:1.7em;
+  background:#ecfdf5; color:#047857; font-size:13px; font-weight:700; border:1px solid #a7f3d0;
+}
+
+/* ---------- 选择题化填空（交互槽位） ---------- */
+.qc-slot{display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; margin:2px 4px; vertical-align:middle}
+.qc-blank{display:inline-block; border-bottom:2px solid var(--qc-ink-2); height:1.7em; min-width:3em}
+.qc-options{display:inline-flex; gap:6px; flex-wrap:wrap}
+.qc-option{
+  appearance:none; border:1.5px solid var(--qc-line); background:#fff; color:var(--qc-ink);
+  border-radius:999px; padding:2px 14px; font-size:15px; cursor:pointer; line-height:1.6;
+  transition:all .12s ease;
+}
+.qc-option:hover{border-color:var(--qc-primary); color:var(--qc-primary)}
+.qc-option.qc-correct{border-color:var(--qc-correct); background:var(--qc-correct-bg); color:var(--qc-correct); font-weight:700}
+.qc-option.qc-correct::after{content:" ✓"}
+.qc-option.qc-wrong{border-color:var(--qc-wrong); background:var(--qc-wrong-bg); color:var(--qc-wrong); font-weight:700; text-decoration:line-through}
+.qc-option.qc-wrong::after{content:" ✗"}
+.qc-option.qc-reveal-correct{border-color:var(--qc-correct); color:var(--qc-correct); border-style:dashed; animation:qcpulse 1s ease 2}
+@keyframes qcpulse{50%{box-shadow:0 0 0 4px var(--qc-correct-bg)}}
+.qc-options[data-answered="1"] .qc-option{cursor:default}
+.qc-slot-broken{border-bottom:2px dashed var(--qc-wrong)}
+
+/* ---------- 答题留白 ---------- */
+.qc-ansspace{display:block; margin:10px 0;
+  background:repeating-linear-gradient(to bottom, transparent 0, transparent 31px, #e2e8f0 31px, #e2e8f0 32px);
+  border-bottom:1px solid var(--qc-line);
+}
+body[data-version="teacher"] .qc-ansspace{background:transparent; border-bottom:none; height:.4em; margin:2px 0}
+
+/* ---------- 答案揭示区 ---------- */
+.qc-reveal{margin-top:16px; border-radius:10px; border:1px solid #bbf7d0; background:#f0fdf4; padding:12px 18px}
+.qc-reveal[hidden]{display:none}
+.qc-reveal-title{font-weight:700; color:var(--qc-correct); font-size:14px; letter-spacing:1px; margin-bottom:4px}
+.qc-teacher-note{margin-top:12px; border-radius:10px; border:1px solid #99f6e4; background:var(--qc-teacher-bg); padding:12px 18px; color:var(--qc-teacher)}
+.qc-teacher-note-title{font-weight:700; font-size:14px; letter-spacing:1px; margin-bottom:4px}
+.qc-img{max-width:100%; height:auto; border:1px solid var(--qc-line); border-radius:8px; margin:8px 0; background:#fff}
+
+/* ---------- 卡片底栏 ---------- */
+.qc-card-foot{display:flex; align-items:center; gap:10px; margin-top:18px; padding-top:12px; border-top:1px dashed var(--qc-line); font-size:13px; color:var(--qc-ink-3)}
+.qc-score{margin-right:auto}
+.qc-score b{color:var(--qc-primary)}
+
+/* ---------- 底部导航 ---------- */
+.qc-nav{
+  position:fixed; left:50%; transform:translateX(-50%); bottom:18px; z-index:25;
+  display:flex; align-items:center; gap:10px;
+  background:rgba(255,255,255,.95); backdrop-filter:blur(8px);
+  border:1px solid var(--qc-line); border-radius:999px; padding:8px 14px; box-shadow:var(--qc-shadow);
+}
+.qc-nav .qc-indicator{font-size:13px; color:var(--qc-ink-2); min-width:86px; text-align:center; font-variant-numeric:tabular-nums}
+
+/* ---------- 目录抽屉 ---------- */
+#qc-toc{
+  position:fixed; top:0; right:0; bottom:0; width:min(340px,86vw); z-index:40;
+  background:#fff; border-left:1px solid var(--qc-line); box-shadow:-8px 0 30px rgba(15,23,42,.12);
+  transform:translateX(102%); transition:transform .22s ease; overflow-y:auto; padding:18px 16px 40px;
+}
+#qc-toc.qc-open{transform:translateX(0)}
+#qc-toc h3{margin:0 0 10px; font-size:15px; color:var(--qc-ink-2)}
+.qc-toc-sec{font-size:12px; font-weight:700; color:var(--qc-primary-dark); margin:14px 0 4px; letter-spacing:.5px}
+.qc-toc-item{display:flex; gap:8px; align-items:baseline; padding:5px 8px; border-radius:8px; cursor:pointer; color:var(--qc-ink-2); font-size:14px; text-decoration:none}
+.qc-toc-item:hover{background:#f1f5f9}
+.qc-toc-item.qc-current{background:#eff6ff; color:var(--qc-primary-dark); font-weight:600}
+.qc-toc-no{font-family:ui-monospace,Consolas,monospace; font-size:12px; color:var(--qc-ink-3); flex:none}
+#qc-toc-mask{position:fixed; inset:0; z-index:35; background:rgba(15,23,42,.25); display:none}
+#qc-toc-mask.qc-open{display:block}
+
+/* ---------- 打印：展开全部卡片，每卡一页 ---------- */
+@media print{
+  body{background:#fff}
+  .qc-topbar,.qc-nav,#qc-toc,#qc-toc-mask,.qc-card-foot{display:none !important}
+  #qc-stage{max-width:none; margin:0; padding:0}
+  .qc-card{[hidden]{display:block !important} display:block !important; border:none; box-shadow:none; border-radius:0; padding:0 0 12px; page-break-after:always; break-after:page}
+  .qc-reveal[hidden]{display:none !important}
+}
+
+/* ---------- 窄屏 ---------- */
+@media (max-width:640px){
+  body{font-size:16px}
+  .qc-card{padding:20px 16px 18px}
+  .qc-card-title{font-size:20px}
+  .qc-nav{gap:6px; padding:6px 10px}
+}
+</style>
+</head>
+<body data-version="{{VERSION}}" data-lang="{{LANG}}">
+
+<header class="qc-topbar">
+  <span class="qc-title">{{MAIN_TITLE}}<small>{{VERSION_LABEL}} · qchain-html 题链 HTML</small></span>
+  <span class="qc-version-chip">{{VERSION_LABEL}}</span>
+  <button type="button" class="qc-btn" id="qc-btn-toc" title="目录（T）">☰ 目录</button>
+  <button type="button" class="qc-btn" id="qc-btn-answer" title="显示/隐藏本页答案（A）">显示答案</button>
+  <button type="button" class="qc-btn qc-primary" id="qc-btn-next" title="下一页（→）">下一页 ›</button>
+  <div class="qc-progress" id="qc-progress"></div>
+</header>
+
+<main id="qc-stage" aria-live="polite">
+{{CARDS_HTML}}
+</main>
+
+<nav class="qc-nav" aria-label="翻页导航">
+  <button type="button" class="qc-btn" id="qc-btn-prev" title="上一页（←）">‹ 上一页</button>
+  <span class="qc-indicator" id="qc-indicator">1 / 1</span>
+  <button type="button" class="qc-btn" id="qc-btn-next2" title="下一页（→）">下一页 ›</button>
+</nav>
+
+<div id="qc-toc-mask"></div>
+<aside id="qc-toc" aria-label="目录">
+  <h3>📑 目录 · 每卡一页</h3>
+  {{TOC_HTML}}
+</aside>
+
+<script>
+(function(){
+  "use strict";
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.qc-card'));
+  var total = cards.length;
+  var idx = 0;
+  var body = document.body;
+  var isTeacher = body.getAttribute('data-version') === 'teacher';
+
+  var btnPrev = document.getElementById('qc-btn-prev');
+  var btnNext = document.getElementById('qc-btn-next');
+  var btnNext2 = document.getElementById('qc-btn-next2');
+  var btnAnswer = document.getElementById('qc-btn-answer');
+  var btnToc = document.getElementById('qc-btn-toc');
+  var indicator = document.getElementById('qc-indicator');
+  var progress = document.getElementById('qc-progress');
+  var toc = document.getElementById('qc-toc');
+  var tocMask = document.getElementById('qc-toc-mask');
+
+  function pad(n){ return (n < 9 ? '0' : '') + (n + 1); }
+
+  function show(i, pushHash){
+    if (total === 0) return;
+    idx = Math.max(0, Math.min(total - 1, i));
+    cards.forEach(function(c, k){ c.hidden = (k !== idx); });
+    var cur = cards[idx];
+    indicator.textContent = pad(idx) + ' / ' + pad(total - 1);
+    progress.style.width = ((idx + 1) / total * 100) + '%';
+    btnPrev.disabled = (idx === 0);
+    btnNext.disabled = (idx === total - 1);
+    btnNext2.disabled = (idx === total - 1);
+    // 目录高亮
+    var links = document.querySelectorAll('.qc-toc-item');
+    for (var k = 0; k < links.length; k++){
+      var on = links[k].getAttribute('data-goto') === cur.id;
+      links[k].classList.toggle('qc-current', on);
+    }
+    // 答案按钮状态复位
+    syncAnswerBtn();
+    if (pushHash !== false){
+      try { history.replaceState(null, '', '#/' + cur.id.replace(/^qc-card-/, '')); } catch(e){}
+    }
+    window.scrollTo(0, 0);
+  }
+
+  function next(){ show(idx + 1); }
+  function prev(){ show(idx - 1); }
+
+  // ---- 答案揭示 ----
+  function currentReveals(){
+    var cur = cards[idx];
+    return cur ? cur.querySelectorAll('.qc-reveal') : [];
+  }
+  function anyRevealHidden(){
+    var rs = currentReveals();
+    for (var k = 0; k < rs.length; k++) if (rs[k].hidden) return true;
+    return false;
+  }
+  function syncAnswerBtn(){
+    var hidden = anyRevealHidden();
+    btnAnswer.textContent = hidden ? '显示答案' : '隐藏答案';
+    btnAnswer.classList.toggle('qc-answer-on', !hidden);
+  }
+  function toggleAnswers(){
+    var rs = currentReveals();
+    var toHidden = !anyRevealHidden();
+    for (var k = 0; k < rs.length; k++) rs[k].hidden = toHidden;
+    syncAnswerBtn();
+  }
+
+  // ---- 选择题交互：点击即时红/绿 ----
+  document.addEventListener('click', function(ev){
+    var opt = ev.target.closest ? ev.target.closest('.qc-option') : null;
+    if (!opt) return;
+    var group = opt.closest('.qc-options');
+    if (!group || group.getAttribute('data-answered') === '1') return;
+    group.setAttribute('data-answered', '1');
+    var correct = opt.getAttribute('data-correct') === 'true';
+    opt.classList.add(correct ? 'qc-correct' : 'qc-wrong');
+    if (!correct){
+      var right = group.querySelector('.qc-option[data-correct="true"]');
+      if (right) right.classList.add('qc-reveal-correct');
+    }
+    updateScore(opt.closest('.qc-card'));
+  });
+
+  // ---- 本页作答统计 ----
+  function updateScore(card){
+    if (!card) return;
+    var score = card.querySelector('.qc-score b');
+    if (!score) return;
+    var done = card.querySelectorAll('.qc-options[data-answered="1"]').length;
+    var all = card.querySelectorAll('.qc-options').length;
+    score.textContent = done + ' / ' + all;
+  }
+  document.querySelectorAll('.qc-card').forEach(function(card){
+    var reset = card.querySelector('.qc-reset');
+    if (!reset) return;
+    reset.addEventListener('click', function(){
+      card.querySelectorAll('.qc-options').forEach(function(g){
+        g.removeAttribute('data-answered');
+        g.querySelectorAll('.qc-option').forEach(function(o){
+          o.classList.remove('qc-correct','qc-wrong','qc-reveal-correct');
+        });
+      });
+      updateScore(card);
+    });
+  });
+
+  // ---- 目录 ----
+  function openToc(){ toc.classList.add('qc-open'); tocMask.classList.add('qc-open'); }
+  function closeToc(){ toc.classList.remove('qc-open'); tocMask.classList.remove('qc-open'); }
+  btnToc.addEventListener('click', function(){ toc.classList.contains('qc-open') ? closeToc() : openToc(); });
+  tocMask.addEventListener('click', closeToc);
+  document.querySelectorAll('.qc-toc-item').forEach(function(a){
+    a.addEventListener('click', function(ev){
+      ev.preventDefault();
+      var target = document.getElementById(a.getAttribute('data-goto'));
+      if (!target) return;
+      var k = cards.indexOf(target);
+      if (k >= 0){ show(k); closeToc(); }
+    });
+  });
+
+  btnPrev.addEventListener('click', prev);
+  btnNext.addEventListener('click', next);
+  btnNext2.addEventListener('click', next);
+  btnAnswer.addEventListener('click', toggleAnswers);
+
+  // ---- 键盘 ----
+  document.addEventListener('keydown', function(ev){
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    var tag = (ev.target && ev.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    switch (ev.key){
+      case 'ArrowRight': case 'PageDown': ev.preventDefault(); next(); break;
+      case 'ArrowLeft': case 'PageUp': ev.preventDefault(); prev(); break;
+      case 'Home': ev.preventDefault(); show(0); break;
+      case 'End': ev.preventDefault(); show(total - 1); break;
+      case 'a': case 'A': ev.preventDefault(); toggleAnswers(); break;
+      case 't': case 'T': ev.preventDefault(); toc.classList.contains('qc-open') ? closeToc() : openToc(); break;
+      case 'Escape': closeToc(); break;
+    }
+  });
+
+  // ---- 初始状态：URL hash / 教师版默认展开答案 ----
+  var start = 0;
+  var m = (location.hash || '').match(/^#\/(.+)$/);
+  if (m){
+    for (var k = 0; k < cards.length; k++){
+      if (cards[k].id === 'qc-card-' + m[1]) { start = k; break; }
+    }
+  }
+  if (isTeacher){
+    // 教师版：参考解答默认可见（仍可一键隐藏）
+    document.querySelectorAll('.qc-card .qc-reveal').forEach(function(r){ r.hidden = false; });
+  }
+  document.querySelectorAll('.qc-card').forEach(updateScore);
+  show(start, false);
+
+  // ---- KaTeX 渲染（CDN 失败时保留 $...$ 源码文本，交互不受影响） ----
+  function renderMath(){
+    if (typeof window.renderMathInElement !== 'function') return;
+    try {
+      window.renderMathInElement(document.body, {
+        delimiters: [
+          {left: '$$', right: '$$', display: true},
+          {left: '$', right: '$', display: false}
+        ],
+        macros: {
+          "\\linf": "\\ell_\\infty",
+          "\\bm": "\\boldsymbol"
+        },
+        throwOnError: false,
+        ignoredTags: ['script','noscript','style','textarea','pre','code']
+      });
+    } catch(e){ /* 数学渲染失败不影响翻页与交互 */ }
+  }
+  if (document.readyState === 'complete' || document.readyState === 'interactive'){
+    setTimeout(renderMath, 0);
+  } else {
+    document.addEventListener('DOMContentLoaded', function(){ setTimeout(renderMath, 0); });
+  }
+  window.addEventListener('load', function(){ setTimeout(renderMath, 50); });
+})();
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg" crossorigin="anonymous" onerror="document.documentElement.classList.add('qc-nokatex')"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" integrity="sha384-43gviWU0YVjaDtb/GhzOouOXtZMP/7XUzwPTstBeZFe/+rCMvRwr4yROQP43s0Xk" crossorigin="anonymous" onerror="document.documentElement.classList.add('qc-nokatex')"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+{
+  "name": "@local/qchain",
+  "version": "3.2.0",
+  "private": true,
+  "type": "module",
+  "description": "题链流水线：问题驱动数学自学案制作 (XeLaTeX PDF / HTML 卡片双模交付 + 零信任质量门禁)",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale",
+    "workflow",
+    "scripts",
+    "templates",
+    "prompts",
+    "references",
+    "README.md",
+    "USER_GUIDE.md",
+    "SKILL.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,61 @@
+# =============================================================================
+# 纯问题驱动自学案 —— 全局参数配置
+# 修改本文件后，运行:  python <skill>/scripts/gen_config.py --project <本文件所在目录>
+# 将重新生成 config-class.tex 与 config.tex（二者均为自动生成，请勿手改）。
+# 不同课程/学期只需复制本文件改参数，无需触碰 LaTeX 模板。
+# 注意：值为单行文本；若含冒号请用全角“：”或用双引号包裹整个值。
+# =============================================================================
+
+# --- 文档类 ---
+font_size: 12pt            # ctexart 字号选项 (10pt / 11pt / 12pt)
+
+# --- 纸张与版面几何 (geometry 宏包参数) ---
+paperwidth: 420mm          # A3 标准宽度（横向 420mm）
+paperheight: 297mm         # A3 标准高度（横向 297mm）
+orientation: landscape     # landscape / portrait
+margin_top: 20mm
+margin_bottom: 20mm
+margin_left: 25mm
+margin_right: 25mm
+headheight: 15pt
+
+# --- 双栏 ---
+columns: 2                 # multicols 栏数 (双栏)
+
+# --- 标题区 ---
+# 默认值为「学案」；具体课程标题（如「群论学案」）必须先用 ask_question 询问用户确认后填写，严禁自行杜撰。
+main_title: 学案
+
+# --- 页眉页脚文案 ---
+teacher_head_left: 【教师用书·参考解答与教学要点】
+
+# --- 输出格式交付配置 ---
+# 可选: both (全部输出 PDF 与 HTML 一页一卡) | pdf (仅输出 XeLaTeX PDF) | html (仅输出 HTML 一页一卡自学案)
+output_format: both
+
+# --- 交付模式 ---
+# self_study(默认，自主学习模式：不设时长上限、禁习题选讲独立成节、3 节精炼体系、长链题 12~15 分钟认知密度下限)
+# / teaching(课堂教学交付模式：保留课时总时长预算约束，默认 90 分钟) / classroom(同 teaching)
+delivery_profile: self_study
+
+# --- 对话层（可选；sectiondialogue / exampledialogue）---
+# enabled 取 true / false / 逗号分隔的小节列表（如 sec0,sec1，用于分节逐步改造）；
+# false 时完全沿用旧流程，任何对话块都会被 check_dialogue.py 判为配置矛盾。
+# 单节关闭写法：在该 secN.tex 内加注释 `% dialogue: off-section <理由>` 或
+# `% dialogue: off-example <理由>`（理由必填，登记于 overview-guide/coverage-map）。
+dialogue_enabled: true
+dialogue_section_opening: true   # 每个启用小节必须有且仅有一个 sectiondialogue
+dialogue_example_opening: true   # 每个启用小节的首个入口题必须有绑定的 exampledialogue
+dialogue_max_section_turns: 8    # sectiondialogue 台词句数上限（\speaker 计数）
+dialogue_max_example_turns: 6    # exampledialogue 台词句数上限
+dialogue_student_reveal: prompt_only   # prompt_only（学生版隐藏 \dlgteacher）| full（全显）
+dialogue_require_coverage_hook: true   # 对话块必须在 coverage-map.md 有承接记录
+
+# --- 课前预算与容量控制 ---
+# lesson_minutes: 课时总预算（仅 teaching/classroom 模式下生效，默认 90 分钟；self_study 模式不设时长上限）
+lesson_minutes: 90                     # 课时总预算（仅 teaching / classroom 模式校验）
+core_task_limit: 12                    # 核心任务数量上限
+max_student_pages: 6                   # 学生版页数硬上限（A3 横向双栏）
+
+
+
