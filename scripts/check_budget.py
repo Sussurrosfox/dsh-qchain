@@ -64,7 +64,7 @@ class BudgetResult(tuple):
     def to_dict(self):
         return {
             "schema_version": 2,
-            "tool": "check_budget",
+            "tool": "check_budget.py",
             "tool_version": "2.0",
             "status": "pass" if self.passed else "fail",
             "category": self.category,
@@ -394,7 +394,7 @@ def main(argv=None):
 
     report = {
         "schema_version": 2,
-        "tool": "check_budget",
+        "tool": "check_budget.py",
         "tool_version": TOOL_VERSION,
         "category": category,
         "problems": problems,

@@ -51,6 +51,25 @@ dialogue_max_example_turns: 6    # exampledialogue 台词句数上限
 dialogue_student_reveal: prompt_only   # prompt_only（学生版隐藏 \dlgteacher）| full（全显）
 dialogue_require_coverage_hook: true   # 对话块必须在 coverage-map.md 有承接记录
 
+# --- Agent 派发参数（T1/T2/T4 fan-out；q_audit.md 多 Agent 证据链）---
+# agent_dispatch 支持两种写法（等价）：
+#   ① 映射块（推荐，可配证据链逃生阀与子 Agent 路由表）：
+agent_dispatch:
+  profile: safe               # safe(调试/串行, 并发1) / fast(均衡, 并发4) / budget(成本受限, 并发2)
+  max_concurrency: 0          # 0=按档位自动；>0 固定并发上限
+  allow_unattested: false     # 证据链逃生阀：true=无代理证据（.pd/agent-calls/ 缺台账）的产物降级放行并打 unattested 标记；false=判 ok_unattested 失败并进入返修环（默认从严，严禁在生产环境开启）
+  model_map:                  # 子 Agent 路由表 {阶段: {provider, model}}；缺省继承父 Agent 路由
+    # T1: { provider: <provider>, model: <model> }    # 映射表阶段
+    # T2: { provider: <provider>, model: <model> }    # 切片写作阶段
+    # T4: { provider: <provider>, model: <model> }    # 验收阶段：应显式配置与 T2 不同的路由（创审分离 INV-2）
+#   ② 标量档位（旧写法，等价于映射块仅设 profile）：
+# agent_dispatch: safe
+agent_max_concurrency: 0      # 扁平兜底键（映射块未设 max_concurrency 时生效）
+agent_batch_window: 2         # 批次窗口倍数: batch_size = min(并发*窗口, 待写节数)
+agent_timeout_seconds: 900    # 单请求超时（秒）
+agent_max_retries: 2          # transient 故障重试次数（content/contract 类不重试）
+agent_allow_unattested: false # 扁平兜底逃生阀（等价 agent_dispatch.allow_unattested；映射块优先）
+
 # --- 课前预算与容量控制 ---
 # lesson_minutes: 课时总预算（仅 teaching/classroom 模式下生效，默认 90 分钟；self_study 模式不设时长上限）
 lesson_minutes: 90                     # 课时总预算（仅 teaching / classroom 模式校验）

@@ -293,6 +293,7 @@ def scan_project(project, salt=SEED_SALT, apply_changes=False):
         new_text, records, terr = shuffle_text(text, stem, salt)
         errors.extend(terr)
         changed = new_text != text
+        sha_before = sha_after = None
         if apply_changes and changed:
             # D5：解码替换字符防护——errors="replace" 读入产生的 U+FFFD
             # 不得被写回磁盘（会把编码受损永久固化进切片）
@@ -305,18 +306,57 @@ def scan_project(project, salt=SEED_SALT, apply_changes=False):
             else:
                 # D5：原子写回（tmp + os.replace），杜绝中断留下半截文件
                 try:
+                    with open(path, "rb") as fb:
+                        sha_before = hashlib.sha256(fb.read()).hexdigest()
                     tmp = "%s.tmp.%d.%d" % (path, os.getpid(), time.time_ns())
                     with open(tmp, "w", encoding="utf-8", newline="") as f:
                         f.write(new_text)
                     os.replace(tmp, path)
+                    with open(path, "rb") as fb:
+                        sha_after = hashlib.sha256(fb.read()).hexdigest()
                 except OSError as exc:
                     errors.append("%s: 无法写回打乱后的切片: %s" % (name, exc))
                     changed = False
                     new_text = text
+                    sha_before = sha_after = None
         results.append({"path": name, "text_before": text,
                         "text_after": new_text, "records": records,
-                        "changed": changed})
+                        "changed": changed,
+                        "sha_before": sha_before, "sha_after": sha_after})
     return results, errors
+
+
+def write_shuffle_map(project, results):
+    """落盘打乱血缘台账 .pd/shuffle-map.json（apply 模式专用）。
+
+    语义审读记录（.pd/semantic/<sec>.json）绑定的是打乱前的候选摘要；
+    本台账记录 <sec> 的打乱前后摘要迁移，使 check_semantic.py 能验证
+    "当前切片 == 被审读候选经唯一确定性打乱得到"（血缘有效），
+    而不是把语义中性的选项重排误判为候选被篡改（SEMANTIC_STALE）。
+    """
+    transitions = {}
+    for res in results:
+        if not res.get("changed"):
+            continue
+        stem = os.path.splitext(res["path"])[0]
+        if not (res.get("sha_before") and res.get("sha_after")):
+            continue
+        transitions.setdefault(stem, []).append(
+            [res["sha_before"], res["sha_after"]])
+    if not transitions:
+        return None
+    out = os.path.join(project, ".pd", "shuffle-map.json")
+    payload = {"schema_version": 1, "transitions": transitions}
+    try:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        tmp = "%s.tmp.%d" % (out, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, out)
+    except OSError:
+        return None
+    return out
 
 
 def verify_project(project, salt=SEED_SALT, issues=None):
@@ -427,6 +467,11 @@ def main(argv=None):
     mode = "verify" if args.verify else "apply"
     results, errors = scan_project(project, salt=args.salt,
                                    apply_changes=not args.verify)
+    shuffle_map_path = None
+    if not args.verify:
+        # 打乱血缘台账：语义审读摘要绑定打乱前候选，本台账证明当前切片
+        # 是"被审读候选经确定性选项重排"得到（check_semantic 血缘校验）。
+        shuffle_map_path = write_shuffle_map(project, results)
 
     issues = []          # evidence issues：[{category, severity, message}]
     for e in errors:

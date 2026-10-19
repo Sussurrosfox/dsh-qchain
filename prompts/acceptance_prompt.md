@@ -4,6 +4,10 @@
 
 这里的"独立"指：未参与本次规划与写作、使用新上下文、凭学生实际可见内容作判断，并能退回有实质问题的产物。在原写作对话中追加"现在你是验收专家"，或把规划者的自评交给另一个 Agent 背书，均不满足独立性要求。
 
+**证据链强制约束（host-subagent-v1 / INV-2 创审分离）**：本次验收由宿主 `qchain_dispatch` 工具派发独立子 Agent 完成，产物 `.pd/acceptance/<scope>.json` 只能以 JSON `{"files": {...}}` 返回、由宿主原子落盘并登记证据台账 `.pd/agent-calls/<dispatch_id>.json`。T4 验收节点的证据 `worker` 会与全量写作阶段（T1/T2）证据的 `worker` 集合比对：**验收者与写作者同体（同一 worker 身份）一律判 `reviewer_identity_violation`、按失败处理**（q_audit.md INV-2）。因此 `reviewer_role` 必须如实声明本次验收的子 Agent 身份，严禁复用写作阶段的路由身份冒充独立验收者。
+
+**F3 来源对照职责（audit §18.6）**：验收 Agent 必须直接阅读 Phase 0 冻结的原文片段（source manifest/inventory 定位），而不能只审查 Agent 生成的映射表——coverage map 本身可能是错误来源。每个 scope 的验收除 `<scope>.json` 外，还必须产出 `source-vs-output.md`，至少逐行列出：`source_id`、输出位置（section/qid）、动作（PRESERVE/EXPLAIN/BRIDGE/EXTEND）、是否改变命题、是否新增对象与结论。凡正文单元无 source 锚点、或 faithful 模式出现未批准 EXTEND，判 REVISE。
+
 ---
 
 ## 角色与触发时机
@@ -121,6 +125,7 @@ dialogue-dependency-gap / dialogue-redundancy 分类，并单独核对：
 - 阶段一：读者前置假设 {{PREREQUISITES}}、学生可见正文 {{STUDENT_VISIBLE_TEXT}}（按阅读顺序，已剥离教师内容）。
 - 阶段二：学习目标 {{OBJECTIVES}}、原文锚点 {{SOURCE_ANCHORS}}、教师答案 {{TEACHER_ANSWERS}}、映射表摘录 {{MAP_EXCERPTS}}、素材核验依据 {{EVIDENCE}}。
 - 所审版本标识：{{VERSION_HASHES}}（所审文件的内容哈希或版本号）。
+- 派发身份：本次派发协议 `host-subagent-v1`，宿主按 `config.yaml` 的 `agent_dispatch.model_map.T4` 路由独立子 Agent；产物以 JSON `{"files": {".pd/acceptance/<scope>.json": "<完整内容>"}}` 返回，由宿主原子落盘并登记证据台账（验收者身份进入 INV-2 创审分离比对）。
 
 ---
 

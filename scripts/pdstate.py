@@ -175,7 +175,7 @@ def project_slices(pdir):
     if not os.path.exists(main):
         return []
     with open(main, encoding="utf-8", errors="replace") as f:
-        text = f.read()
+        text = evidence._strip_comments(f.read())
     out = []
     for m in INPUT_RE.finditer(text):
         name = norm_task(m.group(1))

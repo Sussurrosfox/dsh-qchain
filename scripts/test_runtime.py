@@ -31,6 +31,8 @@ import evidence  # noqa: E402
 import gen_config  # noqa: E402
 import deliver  # noqa: E402
 import build  # noqa: E402
+from workflow import contracts  # noqa: E402
+import source_inventory  # noqa: E402
 
 TEMPLATES = os.path.join(HERE, "..", "templates")
 QIDS = ["sec1-entry", "sec2-entry"]
@@ -38,6 +40,7 @@ QIDS = ["sec1-entry", "sec2-entry"]
 SEC1 = r"""\section*{I 第一节}
 \begin{probchain}
 % qid: sec1-entry
+% source: SRC-001
 % card: CARD-01
 \item \qtype{进入题} 计算 $1+1=$\fillin[$2$]{15mm}[1/2/3/4]。
 \ansspace{1cm}
@@ -48,6 +51,7 @@ $2$。
 观察加法。
 \end{teacherNote}
 \end{probchain}
+% source: SRC-001
 \begin{knowledgebox}[本节结论]
 加法事实。
 \end{knowledgebox}
@@ -56,6 +60,7 @@ $2$。
 SEC2 = r"""\section*{II 第二节}
 \begin{probchain}
 % qid: sec2-entry
+% source: SRC-002
 \item \qtype{进入题} 判断 $2+2=4$。\fillin[成立]{15mm}[成立/不成立/无法判定]
 \ansspace{1cm}
 \begin{solution}
@@ -117,6 +122,44 @@ def make_project(d):
             "<html><body>fake-%s</body></html>" % f)
     for sub in ("reports", "acceptance"):
         os.makedirs(os.path.join(d, ".pd", sub), exist_ok=True)
+    # F0-F3：合成工程必须自带来源契约链，否则 check_fidelity 门禁会
+    # 按 FIDELITY_MANIFEST_MISSING 正确阻断（那是预期行为，不是缺陷）。
+    open(os.path.join(d, "source.md"), "w",
+         encoding="utf-8", newline="").write(
+             "# 原材料\n\n计算 $1+1$。\n\n判断 $2+2=4$。\n")
+    manifest = contracts.build_source_manifest(
+        project_root=d, source_files=["source.md"], title="合成学案")
+    intent = contracts.build_intent_contract(
+        user_spec={"main_title": "合成学案", "delivery_profile": "self_study",
+                   "lesson_minutes": None, "core_task_limit": 12,
+                   "max_student_pages": 6, "content_policy": "faithful"})
+    contracts.write_contracts(d, manifest, intent)
+    inventory = source_inventory.build_inventory(manifest, d)
+    source_inventory.write_inventory(d, inventory)
+    unit_ids = [u["source_id"] for u in inventory["units"]]
+    open(os.path.join(d, "source-map.md"), "w",
+         encoding="utf-8", newline="").write(
+             "# source-map\n\n```text\n"
+             + "\n".join(
+                 "%s -> %s -> PRESERVE -> PRESERVED -> 仅改排版保留原文"
+                 % (sid, "sec1" if i == 0 else "sec2")
+                 for i, sid in enumerate(unit_ids))
+             + "\n```\n")
+    # §6：语义审读硬前置——合成工程须自带与当前候选匹配的 PASS 审读记录，
+    # 否则 check_semantic 门禁会按 SEMANTIC_MISSING 正确阻断交付。
+    # （打乱后摘要变更由 shuffle-map.json 血缘台账桥接，见
+    #   scripts/check_semantic.py 的 shuffle_bound）
+    os.makedirs(os.path.join(d, ".pd", "semantic"), exist_ok=True)
+    for sec in ("sec1", "sec2"):
+        with open(os.path.join(d, sec + ".tex"), "rb") as f:
+            sec_digest = hashlib.sha256(f.read()).hexdigest()
+        with open(os.path.join(d, ".pd", "semantic", sec + ".json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"schema_version": 1, "scope": sec,
+                       "section_digest": sec_digest,
+                       "conclusion": "PASS", "issues": [],
+                       "input_digest": "", "checked_at": "synthetic"},
+                      f, ensure_ascii=False)
     return d
 
 
@@ -131,7 +174,7 @@ def run_cli(script, pdir, *argv):
 
 
 def seed_reports(d, compare_status="pass"):
-    """按当前实际状态预置六份有效报告（供 --skip-checks 验证路径）。
+    """按当前实际状态预置全部有效报告（供 --skip-checks 验证路径）。
 
     注意：deliver.py 的 CHECKS 自 BUG #2 修复起纳入 check_pedagogy.json
     （教学语义与自足性门禁），预置证据链必须同步包含该报告，否则
@@ -144,9 +187,20 @@ def seed_reports(d, compare_status="pass"):
              "check_numbering.json": ("check_numbering.py", "2.2"),
              "check_pedagogy.json": ("check_pedagogy.py", "1.1"),
              "check_dialogue.json": ("check_dialogue.py", "1.2"),
+              # F3 来源忠实性门禁：合成工程自带契约链（见 make_project），
+              # 预置 PASS 报告使 --skip-checks 路径继续验证其余阻断逻辑。
+              "check_fidelity.json": ("check_fidelity.py", "1.0"),
+             # §6 语义审读门禁：合成工程自带 PASS 审读记录（见 make_project）
+             "check_semantic.json": ("check_semantic.py", "1.0"),
+             # §7 scope_gate / provenance_gate：合成工程自带 Phase 0 契约链
+             # 与 PASS 审读记录（血缘链可完整回溯）
+             "check_scope.json": ("check_scope.py", "1.0"),
+             "check_provenance.json": ("check_provenance.py", "1.0"),
              "check_budget.json": ("check_budget.py", "1.0"),
              "build.json": ("build.py", "3.0"),
-             "compare.json": ("compare_versions.py", "3.0")}
+             "compare.json": ("compare_versions.py", "3.0"),
+             # q_audit.md 多 Agent 证据链门禁：无派发单时对账 0/0 通过
+             "check_agent_audit.json": ("check_agent_audit.py", "1.0")}
     cmp_issues = []
     for fn, (tool, ver) in tools.items():
         rep = {"schema_version": 2, "tool": tool, "tool_version": ver,
@@ -574,6 +628,85 @@ class T13_T16_Release(unittest.TestCase):
             self.assertEqual(eh["reports"]["build.json"],
                              sha(os.path.join(d, ".pd", "reports",
                                               "build.json")))
+
+
+class T17_AgentEvidenceGate(unittest.TestCase):
+    """q_audit.md 多 Agent 证据链：交付门禁对账派发单与证据台账。"""
+
+    def _write_dispatch_request(self, d, dispatch_id, scope="sec1"):
+        """造一份 T2 派发单（.pd/agent-requests/<dispatch_id>.json）。"""
+        req = {"dispatch_id": dispatch_id, "batch_id": "bat-t2-test",
+               "stage": "T2_SEC1", "scope": scope, "role": "切片制作专员",
+               "prompt_file": "subagent_prompt.md", "artifacts": ["sec1.tex"],
+               "instruction": "写 sec1", "command": "", "context": {},
+               "run_id": "t", "status": "pending", "attempt": 0,
+               "before": {"sec1.tex": sha(os.path.join(d, "sec1.tex"))},
+               "input_digest": digest_of(d), "timeout_seconds": 900,
+               "max_retries": 2, "retry_class": "transient"}
+        os.makedirs(os.path.join(d, ".pd", "agent-requests"), exist_ok=True)
+        with open(os.path.join(d, ".pd", "agent-requests",
+                               dispatch_id + ".json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(req, f, ensure_ascii=False)
+
+    def test_t17_missing_evidence_fails_audit(self):
+        """派发单在案但无证据台账（主 Agent 直写嫌疑）→ EVIDENCE_MISSING。"""
+        with tempfile.TemporaryDirectory() as d:
+            make_project(d)
+            seed_all(d)
+            self._write_dispatch_request(d, "dsp-t2-sec1-aaa111bbb2")
+            r = run_cli("check_agent_audit.py", d)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("EVIDENCE_MISSING", r.stdout)
+
+    def test_t17b_attested_evidence_passes_audit(self):
+        """派发单 + 证据台账吻合 → AGENT AUDIT PASS。"""
+        with tempfile.TemporaryDirectory() as d:
+            make_project(d)
+            seed_all(d)
+            did = "dsp-t2-sec1-ccc333ddd4"
+            self._write_dispatch_request(d, did)
+            os.makedirs(os.path.join(d, ".pd", "agent-calls"), exist_ok=True)
+            ev = {"schema_version": 1, "dispatch_id": did,
+                  "batch_id": "bat-t2-test", "worker": "subagent:test-slicer",
+                  "provider": "test", "model": "test-model",
+                  "started_at": "2026-10-18T00:00:00Z",
+                  "finished_at": "2026-10-18T00:01:00Z",
+                  "duration_ms": 60000, "artifacts_written": ["sec1.tex"],
+                  "output_digests": {"sec1.tex":
+                                     sha(os.path.join(d, "sec1.tex"))},
+                  "status": "ok"}
+            with open(os.path.join(d, ".pd", "agent-calls",
+                                   did + ".json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(ev, f, ensure_ascii=False)
+            r = run_cli("check_agent_audit.py", d)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("AGENT AUDIT PASS", r.stdout)
+
+    def test_t17c_stale_evidence_fails_audit(self):
+        """证据台账产物哈希与盘面不符（事后篡改）→ EVIDENCE_STALE。"""
+        with tempfile.TemporaryDirectory() as d:
+            make_project(d)
+            seed_all(d)
+            did = "dsp-t2-sec1-eee555fff6"
+            self._write_dispatch_request(d, did)
+            os.makedirs(os.path.join(d, ".pd", "agent-calls"), exist_ok=True)
+            ev = {"schema_version": 1, "dispatch_id": did,
+                  "batch_id": "bat-t2-test", "worker": "subagent:test-slicer",
+                  "provider": "test", "model": "test-model",
+                  "started_at": "2026-10-18T00:00:00Z",
+                  "finished_at": "2026-10-18T00:01:00Z",
+                  "duration_ms": 60000, "artifacts_written": ["sec1.tex"],
+                  "output_digests": {"sec1.tex": "0" * 64},
+                  "status": "ok"}
+            with open(os.path.join(d, ".pd", "agent-calls",
+                                   did + ".json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(ev, f, ensure_ascii=False)
+            r = run_cli("check_agent_audit.py", d)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("EVIDENCE_STALE", r.stdout)
 
 
 if __name__ == "__main__":

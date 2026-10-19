@@ -71,11 +71,18 @@ class ScriptRunner:
         except Exception as exc:
             return 1, "", f"Execution failed: {exc}"
 
-    def _quarantine_report(self, full_report_path: str) -> Optional[str]:
-        """Archive existing stale report before running a new check."""
+    def _quarantine_report(self, full_report_path: str,
+                           run_id: Optional[str] = None) -> Optional[str]:
+        """Archive existing stale report before running a new check.
+
+        run_id 提供时归档到 .stale/<run_id>/ 不可变子目录（audit §12.6：
+        按 run 归档，避免不同轮次的旧报告互相覆盖）；缺省保持旧布局。
+        """
         if not os.path.isfile(full_report_path):
             return None
         stale_dir = os.path.join(os.path.dirname(full_report_path), STALE_DIRNAME)
+        if run_id:
+            stale_dir = os.path.join(stale_dir, str(run_id))
         try:
             os.makedirs(stale_dir, exist_ok=True)
             stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime())
@@ -120,7 +127,7 @@ class ScriptRunner:
         if report_dir:
             os.makedirs(report_dir, exist_ok=True)
 
-        self._quarantine_report(full_report_path)
+        self._quarantine_report(full_report_path, run_id=run_id)
         t_before = time.time()
 
         # Inject --json argument
@@ -129,8 +136,25 @@ class ScriptRunner:
             cmd_args.extend(["--json", full_report_path])
 
         code, stdout, stderr = self.run_script(script_name, cmd_args, timeout=timeout)
-        t_after = time.time()
+        return self._synthesize_gate_report(
+            gate_name, code, stdout, stderr, full_report_path, t_before, run_id
+        )
 
+    def _synthesize_gate_report(
+        self,
+        gate_name: str,
+        code: int,
+        stdout: str,
+        stderr: str,
+        full_report_path: str,
+        t_before: float,
+        run_id: Optional[str] = None
+    ) -> GateReport:
+        """把一次门禁执行（子进程或进程内）收敛为 GateReport。
+
+        GateRunner 进程内批量执行复用本方法，保证两种执行路径的
+        隔离/新鲜度/状态合成语义逐字一致（audit §12.6）。
+        """
         report_data: Dict[str, Any] = {}
         report_mtime: Optional[float] = None
         is_fresh = False

@@ -124,12 +124,22 @@ def run_pipeline(
         except Exception:
             pass
 
+    # 任务1：工作集字段随 user_spec 进入初始 state（Phase 0 会再次规范化，
+    # 非法 run_scope 在断点确认时 HALT，不静默回退 full）。
+    from .scope_selection import RUN_SCOPES, normalize_targets
+    spec = user_spec or {}
+    run_scope = str(spec.get("run_scope") or "full").strip()
+    if run_scope not in RUN_SCOPES:
+        run_scope = "full"  # 初始装载宽容；Phase 0 确认时严格校验并 HALT
     init_state: ShrinkCoursewareState = {
         "project_root": os.path.abspath(base_dir),
         "self_dir": os.path.abspath(self_dir),
         "input_path": os.path.abspath(input_path) if input_path else "",
         "stage": "INIT",
         "user_spec": user_spec,
+        "run_scope": run_scope,
+        "target_sections": normalize_targets(spec.get("target_sections")),
+        "target_qids": normalize_targets(spec.get("target_qids")),
         "history": [f"Runner: 启动题链流水线 (工作区强制锁定于: {self_dir})..."]
     }
 

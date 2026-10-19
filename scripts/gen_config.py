@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-TOOL_VERSION = "2.2"
+TOOL_VERSION = "2.3"
 r"""
 gen_config.py — 由项目目录的 config.yaml 生成 LaTeX 参数文件
   输出: <project>/config-class.tex  (\PassOptionsToClass，须在 \documentclass 前 \input)
@@ -51,6 +51,45 @@ FIELDS = {
     "lesson_minutes": ("int", None),
     "core_task_limit": ("int", None),
     "max_student_pages": ("int", None),
+    # T2 并行写作派发档位（workflow/nodes/section_batch_nodes.py 读取；
+    # 这些键只影响派发节奏，不进入 config.tex 版面输出）
+    # agent_dispatch 多态兼容：标量档位（旧）或映射块
+    # {profile, allow_unattested, model_map, max_concurrency}（新，q_audit.md
+    # 多 Agent 证据链改造；映射嵌套键见 _validate_dispatch_map）
+    # 档位语义（audit §12.1）：interactive=并发1 交互微调默认；safe=并发1
+    # 调试/provider 不稳定；fast=并发4 完整生成默认；budget=并发2 限流。
+    "agent_dispatch": ("enum", ("interactive", "safe", "fast", "budget")),
+    "agent_max_concurrency": ("int0", None),
+    "agent_batch_window": ("int", None),
+    "agent_timeout_seconds": ("int", None),
+    "agent_max_retries": ("int", None),
+    # 证据链逃生阀（扁平形态；等价于 agent_dispatch.allow_unattested）
+    "agent_allow_unattested": ("bool", None),
+    # F0 内容契约（audit §18.3；这些键只进入 Phase 0 冻结的
+    # source-manifest.json / intent-contract.json，不进入 config.tex 版面输出）
+    "content_policy": ("enum", ("faithful", "authoring")),
+    "source_files": ("text", None),
+    "excluded_sources": ("text", None),
+    "allowed_extensions": ("text", None),
+    "reorder_allowed": ("bool", None),
+    "must_cover": ("text", None),
+    "student_level": ("text", None),
+    # 任务1（audit §17 任务1 / §12.4 工作集选择）：Phase 0 让用户选
+    # full=全量 / focused=只做目标节 / edit=只重生成已存在节。
+    # target_sections/target_qids 在配置层保持逗号分隔字符串，进 state 时
+    # 规范化为 list[str]（见 workflow/scope_selection.py）；这些键不进入
+    # config.tex 版面输出，只影响派发范围。
+    "run_scope": ("enum", ("full", "focused", "edit")),
+    "target_sections": ("text", None),
+    "target_qids": ("text", None),
+}
+
+#: agent_dispatch 映射块允许的嵌套键及其校验类型（q_audit.md §1.4）
+DISPATCH_MAP_FIELDS = {
+    "profile": ("enum", ("interactive", "safe", "fast", "budget")),
+    "allow_unattested": ("bool", None),
+    "max_concurrency": ("int0", None),
+    "model_map": ("map", None),
 }
 DIM_RE = re.compile(r"^\d+(\.\d+)?(mm|cm|in|pt|em|ex|bp|pc)$")
 DLG_ENABLE_RE = re.compile(r"^(true|false|sec\d+(,sec\d+)*)$")
@@ -71,6 +110,8 @@ def parse_flat_yaml(text):
     """
     data = {}
     for lineno, line in enumerate(text.splitlines(), 1):
+        if line[:1] in (" ", "\t"):
+            continue  # 缩进行=嵌套块内容（如 agent_dispatch 映射块），扁平解析器不识别
         s = line.strip()
         if not s or s.startswith("#") or ":" not in s:
             continue
@@ -98,9 +139,57 @@ def load_config(path):
     except ImportError:
         return parse_flat_yaml(text)
     data = yaml.safe_load(text)
-    # PyYAML 会把 true/false 解析为 Python 布尔值，统一回小写字符串
-    return {k: (str(v).lower() if isinstance(v, bool) else str(v))
-            for k, v in (data or {}).items()}
+    # PyYAML 会把 true/false 解析为 Python 布尔值，统一回小写字符串；
+    # 映射/列表（如 agent_dispatch 嵌套块）原样保留，交由 validate 分支校验。
+    out = {}
+    for k, v in (data or {}).items():
+        if isinstance(v, bool):
+            out[k] = str(v).lower()
+        elif isinstance(v, (dict, list)):
+            out[k] = v
+        else:
+            out[k] = str(v)
+    return out
+
+
+def _validate_dispatch_map(dispatch):
+    """校验 agent_dispatch 映射块的嵌套键（q_audit.md §1.4 形态）。"""
+    errors = []
+    for key, value in dispatch.items():
+        if value is None:
+            continue  # 键存在但未配置值（YAML `key:` 空值）= 未设置，跳过
+        spec = DISPATCH_MAP_FIELDS.get(str(key))
+        if spec is None:
+            errors.append("agent_dispatch 含未知嵌套键 “%s”（已知键: %s）"
+                          % (key, ", ".join(sorted(DISPATCH_MAP_FIELDS))))
+            continue
+        kind, enum = spec
+        v_str = str(value).strip()
+        if kind == "enum" and v_str not in enum:
+            errors.append("agent_dispatch.%s 取值 “%s” 非法，只能是: %s"
+                          % (key, value, " / ".join(enum)))
+        elif kind == "bool" and v_str.lower() not in ("true", "false"):
+            errors.append("agent_dispatch.%s 取值 “%s” 非法，只能是: true / false"
+                          % (key, value))
+        elif kind == "int0":
+            try:
+                num = int(v_str)
+                if num < 0:
+                    errors.append("agent_dispatch.%s 必须是非负整数（收到 “%s”）"
+                                  % (key, value))
+            except (TypeError, ValueError):
+                errors.append("agent_dispatch.%s 必须是非负整数（收到 “%s”）"
+                              % (key, value))
+        elif kind == "map":
+            if not isinstance(value, dict) or not value:
+                errors.append("agent_dispatch.%s 必须是非空映射（如 {T2: {provider: ..., model: ...}}）"
+                              % key)
+                continue
+            for stage, route in value.items():
+                if not isinstance(route, dict) or not route.get("provider") or not route.get("model"):
+                    errors.append("agent_dispatch.%s[%s] 必须同时提供 provider 与 model"
+                                  % (key, stage))
+    return errors
 
 
 def validate(cfg):
@@ -110,6 +199,13 @@ def validate(cfg):
         if k not in FIELDS:
             errors.append("未知配置键 “%s”（已知键: %s）"
                           % (k, ", ".join(sorted(FIELDS))))
+            continue
+        # agent_dispatch 映射块（q_audit.md 证据链改造新增形态）：分支校验嵌套键；
+        # 空值（扁平解析器遇嵌套块时的退化形态）= 未设置档位，回落默认 safe
+        if k == "agent_dispatch" and isinstance(v, dict):
+            errors.extend(_validate_dispatch_map(v))
+            continue
+        if k == "agent_dispatch" and v == "":
             continue
         kind, enum = FIELDS[k]
         v_str = str(v).strip()
@@ -121,6 +217,15 @@ def validate(cfg):
         elif kind == "dlg_enable" and not DLG_ENABLE_RE.match(v_str):
             errors.append("%s 取值 “%s” 非法，只能是 true / false / "
                           "逗号分隔的小节列表（如 sec0,sec1）" % (k, v))
+        elif kind == "int0":
+            try:
+                val = int(v_str)
+                if val < 0:
+                    errors.append("%s 必须是非负整数（收到 “%s”）" % (k, v))
+                elif k in INT_MAX_BOUNDS and val > INT_MAX_BOUNDS[k]:
+                    errors.append("%s (%d) 超过最大允许上限 %d" % (k, val, INT_MAX_BOUNDS[k]))
+            except (ValueError, TypeError):
+                errors.append("%s 必须是非负整数（收到 “%s”）" % (k, v))
         elif kind == "int":
             try:
                 val = int(v_str)

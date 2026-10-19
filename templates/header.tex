@@ -90,8 +90,12 @@
   \if\relax\detokenize{#1}\relax
     \PackageWarning{problem-driven}{\protect\fillin\space 未配置选项（第 \thepdFillinCount\space 处，选择题化填空须提供 [选项1/选项2/选项3]）}%
   \else
-    \ {\small\color{black!65}（#1）}%
-  \fi}
+    \ifmmode
+      \text{\ {\small\color{black!65}（\ensuremath{#1}）}}%
+    \else
+      \ {\small\color{black!65}（\ensuremath{#1}）}%
+    \fi
+  \fi}%
 
 \ifdefined\TeacherVersion
   % ============================ 教师版环境配置 ============================
@@ -158,18 +162,18 @@
          \underline{\hspace{#2}}%
        \else
          \ifmmode
-           \settowidth{\fillinwidth}{$\bm{#1}$}%
+           \settowidth{\fillinwidth}{\mbox{\boldmath$#1$}}%
            \ifdim\fillinwidth>#2
-             \underline{\hspace{0.5em}{\color{blue!85!black}\bm{#1}}\hspace{0.5em}}%
+             \underline{\hspace{0.5em}{\color{blue!85!black}\mbox{\boldmath$#1$}}\hspace{0.5em}}%
            \else
-             \underline{\makebox[#2][c]{$\color{blue!85!black}\bm{#1}$}}%
+             \underline{\makebox[#2][c]{\color{blue!85!black}\mbox{\boldmath$#1$}}}%
            \fi
          \else
-           \settowidth{\fillinwidth}{\bfseries#1}%
+           \settowidth{\fillinwidth}{\bfseries\ensuremath{#1}}%
            \ifdim\fillinwidth>#2
-             \underline{\hspace{0.5em}\textbf{\color{blue!85!black}#1}\hspace{0.5em}}%
+             \underline{\hspace{0.5em}\textbf{\color{blue!85!black}\ensuremath{#1}}\hspace{0.5em}}%
            \else
-             \underline{\makebox[#2][c]{\bfseries\color{blue!85!black}#1}}%
+             \underline{\makebox[#2][c]{\bfseries\color{blue!85!black}\ensuremath{#1}}}%
            \fi
          \fi
        \fi}%

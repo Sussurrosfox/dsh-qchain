@@ -19,6 +19,8 @@
 8. 独占输出路径、提交格式、必要自查。
 ```
 
+派发协议 `host-subagent-v1`（q_audit.md 多 Agent 证据链）：本切片由宿主 `qchain_dispatch` 工具派发独立子 Agent 完成；子 Agent **只以 JSON 返回产物内容**，由宿主按白名单原子落盘并登记证据台账 `.pd/agent-calls/<dispatch_id>.json`（含 worker 身份与产物 sha256）。子 Agent 不得自行写盘目标产物，也不得要求主 Agent 代写——凡无证据台账的产物变更，磁盘重推导一律判 `ok_unattested`（main-thread 直写嫌疑）进入返修环，交付门禁 `check_agent_audit.py` 拒绝发布。
+
 ---
 
 ## 子 Agent 派发参数配置（成本约束）
@@ -27,6 +29,30 @@
 - `TypeName`: `"self"`
 - `Model`: `<由宿主已配置映射提供的低成本模型名>`（必须显式指定）
 - `Role`: `"§X.X 切片制作专员"`
+
+---
+
+## F3 来源锚点契约（T2 写作者必读；audit §18.5/§18.6）
+
+来源忠实性门禁 `scripts/check_fidelity.py` 会在装配前对本节做确定性校验，写作者必须满足：
+
+1. **只写本 scope**：只使用任务包中本节 scope 的原文片段与 material-pack，不得引用其他节的规划结论。
+2. **逐块锚点**：每个知识卡（`microknowledge`/`knowledgebox`）、每道题目（`% qid:` 注释块）、每个 `solution`/证明与结论，都必须带 `% source: SRC-xxx`（`SRC-xxx` 取自任务包给出的 source_inventory 单元）。
+3. **BRIDGE 双标记**：经批准的最小前置补充必须带 `% bridge: BR-xxx`，并在教师元数据（`teacherNote`）中说明补充理由；`BR-xxx` 必须存在于 `.pd/approvals.json` 批准台账。
+4. **无锚点即拒收**：没有来源标记或批准 bridge 的段落在门禁判 `UNGROUNDED` 被拒收（`REJECTED`），且不得由 writer 事后补标记掩盖。
+5. **禁止新增**：不得新增例题、练习、定理、改变顺序或引入前置知识；确有必要只能提出 `extension_request` 交人工批准，faithful 模式未经批准不得写入正文。
+6. **排除内容**：用户排除的单元（`EXCLUDED_BY_USER`）不得被引用或改写进正文。
+
+---
+
+## 派发协议与证据台账（host-subagent-v1）
+
+本次派发由宿主工具 `qchain_dispatch`（协议标识 `host-subagent-v1`）执行，子 Agent 是**独立的认知上下文**，不是主会话的分身。证据链规则（q_audit.md 根因治理）：
+
+1. **只返回、不直写**：子 Agent 的最终回复必须是且只能是一个 JSON 对象 `{"files": {"<相对路径>": "<完整文件内容>"}}`，路径仅限于任务包声明的产物清单。宿主据此原子写入（tmp + rename）并立即计算 sha256。
+2. **证据台账**：宿主为每次派发落盘 `.pd/agent-calls/<dispatch_id>.json`（schema_version=1，字段含 dispatch_id/batch_id/worker/provider/model/started_at/finished_at/duration_ms/artifacts_written/output_digests/status）。没有该台账的产物变更无法通过磁盘重推导与交付门禁。
+3. **禁止事项**：严禁主 Agent 直接写 artifacts、严禁在同一会话内自行撰写产物内容冒充子 Agent 产出。派发中断载荷携带 `dispatch_protocol`/`required_tool`/`forbidden` 三个协议字段，恢复侧校验；伪造协议（非 `host-subagent-v1`）的响应会被丢弃并 HALT（错误码 `BAD_DISPATCH_PROTOCOL`）。
+4. **失败语义**：子 Agent 失败或返回不含 files 时，宿主按 `request.max_retries`（默认 2）重试；仍失败则该派发单判 `worker_error`，状态机进入返修环，严禁主 Agent 接手代写。
 
 ---
 
@@ -227,7 +253,7 @@ REQUIRED_OUTPUTS: dialogue-brief, dialogue-script, TeX diff（候选切片）, d
 11. 题链整体性与自然衔接：注重题链前后逻辑承接。若需说明研究目的或与前题联系，必须使用自然流畅的现代数学语言直接融入题干叙述中。
 12. 知识点陈列与列表规范：同一层级的多条定义、性质、推论陈列时，必须使用 LaTeX enumerate 环境分条展开。
 13. 每节末必须有 `\begin{knowledgebox}[本节结论]...\end{knowledgebox}` 总结本节结论。
-14. 将切片代码写入 {{OUTPUT_FILE}}...
+14. 将切片代码写入 {{OUTPUT_FILE}}（按派发协议以 JSON `{"files": {...}}` 返回完整内容，由宿主原子落盘并登记证据台账；不得自行写盘）。
 
 主 Agent 在所有子 Agent 完成后，先核验内容再核验切片文件（按切片职责适用检查；开篇切片以叙述为主、可无完整题链，不强加普通题链要求）：
 1. 每个题目的原文锚点是否明确，顺序是否保持；

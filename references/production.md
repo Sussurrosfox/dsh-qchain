@@ -178,6 +178,99 @@ $$ \text{est\_minutes} = \text{base\_reading} + 2 \times \text{sub\_items} + 1 \
 3. 只要新增关键转折、反例边界、证明负担、表示法或迁移对象，就标为 guided；只有题干自足且满足第 2 条时才可标为 unprompted。
 4. 每个知识点保留至少 1 道 guided 示范题；其余题目逐题按上述条件判定，不能因题量或时间改变状态，也不能用 unprompted 隐藏题量问题。
 
+## 三-B、控制平面契约链（Phase 0 → 冻结 → 派发 → 门禁 → 交付）
+
+本节是 audit 改造后新增的**强制契约链**权威文本。核心立场：质量不来自 Agent 数量，而来自控制平面强制执行的合同与可验证证据；任何 Agent 不得自行扩大范围、改写目标或以旧产物冒充新结果。产物未冻结不得进入下一步。
+
+### B0 Phase 0 输入清单与目标合同（冻结）
+
+`node_phase0_breakpoint` 在真人确认后由 `workflow/contracts.py` 确定性冻结两个文件（`ContractError` → `HALTED`，不静默回退）：
+
+- `.pd/source-manifest.json`：每个输入一项 `{path, role(source-baseline|optional-problem), digest(sha256), include, reason}`。排除项同样登记（`include: false` + reason）。拒绝：source-baseline 指向生成稿/中间稿（`generated_reason` 启发式）；同一文件既标 source 又标 generated；下游 digest 与冻结清单不一致（`SOURCE_DIGEST_MISMATCH`）。
+- `.pd/intent-contract.json`：`{title, delivery_profile, lesson_minutes, must_cover, must_not_expand_without_confirmation, allowed_extensions, student_level, content_policy, source_files, excluded_sources, reorder_allowed}`。`self_study`/课时/节数等值**不得由 Agent 推断覆盖**；想扩展必须产生 `scope_change` 状态并停在人工确认点。
+- `content_policy`：`faithful`（默认，忠实转换）或 `authoring`（允许创作）。`reorder_allowed` 默认 false。
+
+### B1 来源清单与 T1 映射契约（忠实性）
+
+1. T1 前由 `scripts/source_inventory.py` 确定性生成 `.pd/source-inventory.json`：每个单元 `{source_id(SRC-%03d), source_file, locator, kind, text_digest, source_order, disposition}`（ATX 标题/列表项/段落/围栏四类切分，零幻觉）。
+2. `source-map.md` 每行必须填 `source_id → output_scope → action → status → reason`；`action ∈ {PRESERVE, EXPLAIN, BRIDGE, EXTEND}`；`status ∈ {PRESERVED, EXPLAINED, BRIDGED, EXCLUDED_BY_USER, PENDING_APPROVAL}`。无 `source_id` 的主线内容不得进入 faithful 正文；`EXTEND` 在 faithful 模式一律转 `PENDING_APPROVAL` 并停在人工确认点。
+3. T2 每个知识卡/题目/证明/结论必须带 `% source: SRC-xxx` 锚点；`BRIDGE` 带 `% bridge: BR-xxx` 且 id 必须登记于 `.pd/approvals.json`；无来源标记的内容 `REJECTED`。
+4. `scripts/check_fidelity.py`（交付门禁必过项）执行 7 项确定性检查：source coverage / output grounding / order / novelty / extension（faithful 有 EXTEND 立即 FAIL）/ exclusion / approval。
+5. T4 每 scope 必须同时交付 `.pd/acceptance/<sec>-source-vs-output.md`（| source_id | 输出位置 | 动作 | 改变命题 | 新增对象 |），直接对照原文片段。
+
+### B2 工作集选择（单节微调不全量重跑）
+
+Phase 0 可选配置（`scripts/gen_config.py` 校验，配置层保留字符串）：
+
+- `run_scope: full|focused|edit`；`target_sections`、`target_qids`（逗号分隔字符串）。
+- `workflow/scope_selection.py::select_scopes(run_scope, target_sections, target_qids, expected_sections, existing_sections=None)` 是纯函数：`full` 返回全部；`focused` 返回目标 ∩ expected（按 expected 稳定排序；仅给 qid 时按 `qid.split("-")[0]` 反推小节）；`edit` 额外要求目标 ⊆ existing_sections。非法值报 `ScopeSelectionError`（`BAD_RUN_SCOPE/EMPTY_TARGETS/UNKNOWN_TARGET/TARGET_NOT_EXISTING`），Phase 0 直接 HALTED，**不静默回退 full**。
+- 未选中且有既有文件的节标 `reused`，无文件标 `skipped`（不伪装 ok）；装配仍 `\input` 全部 expected_sections，缺文件时构建明确失败。
+
+### B3 派发契约与写域（真 fan-out / fan-in）
+
+- 每个 request 固定含 `dispatch_id, scope, role, input_digest, artifacts, timeout_seconds, max_retries, status, attempt`；`input_digest` 缺省由 (stage, role, scope, instruction, command, context, artifacts, prompt_file) 确定性 sha256 推导。
+- worker 只能写自己 scope 的候选目录，不能写 `main.tex/student.tex/teacher.tex`、其他 section、`run.json`、`release/`。
+- T2 拓扑：`t2_plan_section_batch → t2_dispatch_section_batch → t2_await_section_batch → t2_join_section_batch → assemble`。**dispatch 节点只做校验/submit/记录，唯一允许 `pool.join` 的是 join 节点**（重复 join 会把异步流水线劣化成近 15 分钟无反馈的串行等待）。
+- `scripts/check_dispatch.py` R1–R9 硬门禁（计划存在/键齐全/请求数 ≥ scope 数/无重复 dispatch_id/scope-role 合法/digest 64 位/artifacts 非空/batch 一致/并发不超限），不满足即 HALTED。
+- `scripts/check_scope.py`、`scripts/check_provenance.py` 提供 scope/预算/模式/映射一致性与回溯校验。
+
+### B4 派发池与 worker 能力声明（真实并发与取消）
+
+- 档位：`interactive`(1) / `safe`(1) / `fast`(4) / `budget`(2)。未显式配置 `agent_dispatch` 时按 run_scope 推导缺省（full→fast，focused/edit→interactive）；显式配置永远优先（向后兼容）。
+- `worker_registry.set(fn, name, capabilities)` 的能力声明：`{sync, async, cancellable, max_concurrency}`。**未声明能力一律按「同步、不可取消、最大并发 1」处理**；只有声明 `max_concurrency > 1` 的 worker 才真正获得并行派发（不得让多线程共享未确认线程安全的同步 worker）。
+- 真实并行度 = `min(档位并发, 声明并发)`，落盘于 dispatch-plan 的 `effective_concurrency`；`min_parallelism` 按真实并行度承诺（串行 worker 只承诺 1）。
+- 超时分流：声明 `cancellable` → 请求取消记 `cancelled`；未声明 → 线程不可抢占，记 `timeout_deferred` 并进 orphans，调用方**只重派失败 scope，不得复用旧产物**。
+- 度量十一键：`submitted/completed/ok/failed/timeout/no_change/deferred/retried/max_in_flight/orphans/cancelled`。
+
+### B5 派生物缓存（相同输入不重复烧 LLM）
+
+`workflow/adapters/artifact_cache.py`：cache key = `sha256("v1|stage|scope|input_digest|config_digest|prompt_version")`。命中前先校验全部缓存副本 digest 与 artifacts 清单，任一失效即丢弃；命中后原子还原并记 `dispatch_metrics.reused`。T1 三张映射表与 T2 各节切片共用同一套 key 规则；相同输入跑第二次，T1/T2 worker submit 为 0。
+
+### B6 T4 验收的 scope 级复用
+
+旧规则用全局 digest + 构建产物 sha 校验，任何变更作废全部旧记录。新规则三重绑定：`scope_content_digest`（本节 sha256）+ `chapter_digest`（dependency-map + main.tex + 节序 + 跨节引用指纹）+ `review_rule_version`。三者全匹配且旧结论 `PASS` 才复用（`reused`）；章节级变更（依赖图/编号拓扑/装配/跨节引用）升级全量 chapter-review。绑定字段由主控 `_stamp_review_provenance` 确定性盖章，不信 LLM 自填。
+
+### B7 进程内门禁批处理（GateRunner）
+
+`workflow/adapters/gate_runner.py` 对纯 Python 门禁（check_dialogue/check_numbering/check_budget/check_pedagogy/check_fidelity/check_dispatch/check_semantic/check_scope/check_provenance）进程内批量执行，共享一次 `batch_input_digest`；XeLaTeX/HTML/外部构建仍走子进程。每份报告保留原 gate 名与 PASS/FAIL 语义，附 `execution_mode`（in-process/subprocess/subprocess-fallback）与 `fallback_reason`；进程内崩溃收敛为 REJECT + `EXECUTION_FAILURE`，不上抛。旧报告按 `run_id` 归档到 `.stale/<run_id>/` 不可变子目录；**不以文件存在/mtime/旧 PASS 代替 digest+attempt 校验**。
+
+### B8 语义审读轮（Writer → Checker → Gate，audit §6）
+
+写作轮完成后，每个 staged 小节在**串行提交前**必须经过独立语义审读轮：
+
+- 三节点 `t2_plan_check → t2_dispatch_check → t2_join_check`（`workflow/nodes/semantic_nodes.py`），审读产物 `.pd/semantic/<sec>.json`，派发计划独立落 `.pd/dispatch-plan-semantic.json`（不覆盖写作轮计划）。
+- 审读员（`prompts/semantic_check_prompt.md`）**只读一个小节、只写自己的 JSON，绝不修改候选**；结论 `PASS | REVISE | NEEDS_EVIDENCE`，问题带 `{code, line, claim, evidence, severity}`。检查码：`MISSING_CONDITION / UNJUSTIFIED_GENERALIZATION / PREREQUISITE_GAP / PROOF_DIVISION_BY_ZERO / CONTRADICTORY_NOTATION / OVERSTRONG_CLAIM / TEMPLATE_CONTAMINATION / BUDGET_OVERFLOW`。
+- **审读结果是提交硬前置**：缺结果/摘要过期/schema 非法 → `semantic_gate_verdict` 判 BLOCK，`node_t2_submit_and_check_sections` 拒绝提交并补派审读；`REVISE`（blocking issue）→ 重派写作者返修，`repair_reason` 携带父子链 `parent_dispatch_id`（作者 attempt ↔ 审读 attempt）。`semantic_check_rounds > 3` 熔断 HALTED。
+- 打乱血缘：`node_t2_shuffle_options` 的确定性选项重排会改写切片，`scripts/shuffle_options.py` apply 时记录 `.pd/shuffle-map.json`（sha_before→sha_after），审读绑定经血缘可达即不判过期（BFS，上限 32 跳）；无血缘的改动一律 stale 重审。
+- 门禁：`scripts/check_semantic.py`（报告 schema_version 2 + input_digest）接入 T3 批量门禁与交付 MUST_PASS。
+
+### B9 一致性门禁四件套（audit §7）
+
+- **source_gate** = `scripts/check_fidelity.py`（B1：source coverage / output grounding / order / novelty / extension / exclusion / approval 七项）。
+- **scope_gate** = `scripts/check_scope.py`：生效配置 vs Phase 0 冻结合同零漂移——`SCOPE_CONTRACT_MISSING/BAD_JSON/TAMPERED/PROFILE_DRIFT/MINUTES_DRIFT/UNAUTHORIZED_DOWNGRADE/POLICY_DRIFT/CHANGE_UNAPPROVED/UNPLANNED_SECTION/CORE_BUDGET_OVERFLOW`。**生效口径**：仅 teaching/classroom 取 `lesson_minutes`，self_study 一律视作无预算（配置里的 90 分钟不生效，与合同 None 匹配）。合同 digest 本地重算对账（排除 digest/frozen_at），被改写即阻断。
+- **semantic_gate** = `scripts/check_semantic.py`（B8）。
+- **provenance_gate** = `scripts/check_provenance.py`：每节可回溯「source claim → planner request → writer attempt → checker result」；writer 证据台账必须认证**当前切片摘要**（或打乱血缘）；写域白名单（`.pd/` + 自己的 `secN.tex`；禁 `main.tex/student.tex/teacher.tex/run.json`、绝对路径、`..`）；qid 必须登记于 coverage-map.md。无派发单工程只警告 `PROV_NO_DISPATCH_CHAIN` 跳过 writer/写域核对。
+- 四件套全部接入 `scripts/deliver.py` 的 CHECKS/MUST_PASS（一票否决）与 `qchain_gate` 工具（enum: scope/provenance）。
+
+### B10 T1 三角色拆分与 barrier（audit §5.1）
+
+原单 Agent 一次生成三张映射表（职责/缓存边界不清）拆为串行三角色，每个 request 节点只写自己的产物，await 节点是唯一等待/校验点（链本身即 barrier）：
+
+`t1_request_source_audit（source-map.md）→ t1_await_source_audit → t1_request_dependency_plan（dependency-map.md）→ t1_await_dependency_plan → t1_request_coverage_plan（coverage-map.md）→ t1_await_coverage_plan → t1_verify_mapping`
+
+- round 2/3 开派前校验上游产物在盘（barrier，缺失即 HALTED），context 绑定 `source_map_digest`；三张表分键缓存（`stage=T1_SOURCE_AUDIT/T1_DEPENDENCY_PLAN/T1_COVERAGE_PLAN`），上游命中不影响下游失效。
+- **REPLAN 阻断缓存**：`dispatch_blocklist`（state）记录已知不合格的 input_digest，同 digest 不得再命中派生物缓存（audit §10：不反复还原同一份不合格产物）。
+
+### B11 进度快照（audit §14）
+
+`scripts/progress.py`（工具 `qchain_progress`）只读盘面证据输出确定性进度：阶段（写作轮/语义审读轮/T4 验收轮）、scope 完成度（total/queued/running/done/reused）、队列深度、运行中数、缓存条目、按证据台账平均耗时与真实并发度估算的预计剩余秒数。可每 1-2 秒轮询，零副作用。
+
+### B12 回归基线
+
+`python -m unittest discover scripts -p "test_*.py"` 全绿（394 tests）。新增测试文件：`test_contracts.py`、`test_source_inventory.py`、`test_mapping_contract.py`、`test_check_fidelity.py`、`test_scope_selection.py`、`test_artifact_cache.py`、`test_gate_runner.py`、`test_worker_registry.py`、`test_semantic_nodes.py`、`test_scope.py`、`test_provenance.py`、`test_progress.py`。
+
+**四道真题（`2023.0.8-*.md`）被排除是用户明确设计**：Phase 0 以 `include=false` + reason 登记进 source-manifest（可验证的输入决策），check_fidelity 的 exclusion check 核对排除项未进正文。
+
 ## 四、 多智能体并发处理流程（Multi-Agent Pipeline）
 
 当教材材料较长（如整章教材）时，按以下固定流程切片；材料较短时也执行相同顺序。

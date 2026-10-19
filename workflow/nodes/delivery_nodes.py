@@ -9,7 +9,6 @@ import sys
 from typing import Dict, Any, List, Optional
 from ..state import ShrinkCoursewareState, GateReport
 from ..adapters.script_runner import ScriptRunner
-from .agent_nodes import build_request, write_request_file, run_dispatch
 
 _SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 if _SCRIPTS_DIR not in sys.path:
@@ -45,55 +44,6 @@ def node_t4_make_review_pack(state: ShrinkCoursewareState) -> Dict[str, Any]:
         "routing_action": "PROCEED",
         "history": history
     }
-
-
-def node_t4_request_acceptance(state: ShrinkCoursewareState) -> Dict[str, Any]:
-    """T4: Dispatch request for independent pedagogical acceptance."""
-    self_dir = state.get("self_dir") or state.get("project_root", ".")
-    artifacts = [".pd/acceptance/chapter.json"]
-
-    # B4: 向验收专员提供当前 run_id 与内容摘要，供其回填 chapter.json 绑定字段
-    current_digest = evidence.content_digest(evidence.collect_inputs(self_dir))
-
-    req = build_request(
-        state,
-        stage="T4_ACCEPTANCE",
-        role="独立教学验收专员",
-        prompt_file="acceptance_prompt.md",
-        artifacts=artifacts,
-        instruction="请从学生实际可见内容审读学案，验证依赖闭合、无偷步泄露，并出具 .pd/acceptance/chapter.json 验收报告。",
-        # B4: 验收为只读复核，严禁代跑交付脚本（deliver.py 由流水线终检统一执行）
-        command="只读复核（禁止执行 deliver.py）：阅读学生版产物与 .pd/review/ 审读包，"
-                "将验收结论与 context 中的 content_digest 绑定后写入 .pd/acceptance/chapter.json",
-        context={
-            "run_id": state.get("run_id"),
-            "expected_sections": state.get("expected_sections", []),
-            "content_digest": current_digest
-        }
-    )
-    req_ref = write_request_file(self_dir, req)
-    history = list(state.get("history", []))
-    history.append(f"T4: 派发独立教学验收任务 (派发单: {req_ref})")
-
-    return {
-        "pending_dispatch": req,
-        "stage": "T4_ACCEPTANCE_PENDING",
-        "history": history
-    }
-
-
-def node_t4_await_acceptance(state: ShrinkCoursewareState) -> Dict[str, Any]:
-    """T4: Wait for acceptance report to be filed."""
-    req = state.get("pending_dispatch")
-    if not req:
-        return {"stage": "T4_ACCEPTED", "routing_action": "PROCEED"}
-
-    return run_dispatch(
-        state,
-        req,
-        success_stage="T4_ACCEPTED",
-        success_history="T4: 独立教学验收报告已提交"
-    )
 
 
 def node_t4_verify_acceptance(state: ShrinkCoursewareState) -> Dict[str, Any]:

@@ -12,6 +12,12 @@ from ..adapters.script_runner import ScriptRunner
 from .agent_nodes import build_request, write_request_file, run_dispatch
 
 
+#: 任务3（audit §17 任务3）：工作集外小节的终态标记。reused=本轮复用
+#: 已有产物，skipped=本轮跳过（未生成也不伪装完成）；两者都不是 pending，
+#: 不得再进入派发/提交路径（否则 focused/edit 选择会被串行路径覆盖）。
+SKIPPED_STATUSES = ("reused", "skipped")
+
+
 def _get_next_pending_section(
     expected_sections: List[str],
     section_statuses: Dict[str, str]
@@ -19,7 +25,7 @@ def _get_next_pending_section(
     """Find the first section that is not yet 'checked' or 'accepted'."""
     for sec in expected_sections:
         status = section_statuses.get(sec, "planned")
-        if status not in ("checked", "accepted"):
+        if status not in ("checked", "accepted") and status not in SKIPPED_STATUSES:
             return sec
     return None
 
@@ -189,8 +195,8 @@ def _import_direct_candidate(self_dir: str, active_sec: str, runner: ScriptRunne
         aid = task.get("current_attempt")
         if not aid:
             return False
-        adir = os.path.join(self_dir, ".pd", "candidates", active_sec,
-                            "attempt-%04d" % aid)
+        aid_dir_name = ("attempt-%04d" % aid) if isinstance(aid, int) else str(aid)
+        adir = os.path.join(self_dir, ".pd", "candidates", active_sec, aid_dir_name)
         tj_path = os.path.join(adir, "task.json")
         if not os.path.isfile(tj_path):
             return False
@@ -222,7 +228,7 @@ def _import_direct_candidate(self_dir: str, active_sec: str, runner: ScriptRunne
             json.dump(result_doc, f, ensure_ascii=False, indent=2)
         os.replace(rj_tmp, os.path.join(adir, "result.json"))
         history.append(
-            f"T2: 已将直接落盘的 {out_name} 纳管为 attempt-{aid:04d} 候选（待 submit 契约校验）"
+            f"T2: 已将直接落盘的 {out_name} 纳管为 {aid_dir_name} 候选（待 submit 契约校验）"
         )
         return True
     except Exception as e:
@@ -239,44 +245,96 @@ def node_t2_submit_and_check_sections(state: ShrinkCoursewareState) -> Dict[str,
     history = list(state.get("history", []))
     runner = ScriptRunner(self_dir)
 
-    if active_sec:
-        # 1. Try submit
-        code_sub, out_sub, err_sub = runner.run_script("pdstate.py", [self_dir, "submit", active_sec])
-        if code_sub == 0:
-            history.append(f"T2: pdstate.py submit {active_sec} 成功提升正式切片")
-        else:
-            # B3+: 契约旁路（直接就绪模式）已移除。写作者直接把 <sec>.tex
-            # 落在 self/ 根目录是 interrupt 模式的常态路径——将其正式纳管为
-            # 当前 attempt 候选后重试 submit；契约校验（身份/新鲜度/结构）
-            # 仍由 pdstate 完整执行，纳管失败或重试失败一律定点返修。
-            if _import_direct_candidate(self_dir, active_sec, runner, history):
-                code_sub, out_sub, err_sub = runner.run_script(
-                    "pdstate.py", [self_dir, "submit", active_sec])
-                if code_sub == 0:
-                    history.append(f"T2: pdstate.py submit {active_sec} 纳管后成功提升正式切片")
-            if code_sub != 0:
-                err_msg = (err_sub or out_sub or "submit failed").strip()
-                history.append(f"T2: 切片 {active_sec} 提交失败: {err_msg}")
-                return {
-                    "stage": "REPAIR_LOOP",
-                    "routing_action": "REPAIR_SECTION",
-                    "repair_target": active_sec,
-                    "repair_reason": f"切片提交失败: {err_msg}",
-                    "history": history
-                }
+    if active_sec and active_sec not in expected_sections:
+        history.append(f"T2: {active_sec} 为全局文件（非切片任务），跳过切片提交")
+        active_sec = None
 
-        # 2. Mark checked（B3：退出码必须检查，非 0 一律返修，不得继续置 checked）
-        code_mark, out_mark, err_mark = runner.run_script("pdstate.py", [self_dir, "mark", active_sec, "checked"])
-        if code_mark != 0:
-            err_msg = (err_mark or out_mark or "mark checked failed").strip()
-            history.append(f"T2: 切片 {active_sec} 标记 checked 失败 (exit {code_mark}): {err_msg}")
+    if active_sec:
+        # §6：语义审读硬闸门——checker 结果是 submit 的硬前置。
+        # 缺结果 / 候选摘要过期 / schema 非法 → 补派审读（semantic_repair_target）；
+        # REVISE / NEEDS_EVIDENCE → 重派写作者返修。任何情形不得静默提交。
+        # （惰性 import：semantic_nodes → section_batch_nodes → section_nodes
+        #   构成环，模块级 import 会在 workflow 包初始化时断裂）
+        from .semantic_nodes import semantic_gate_verdict
+
+        sec_tex = os.path.join(self_dir, f"{active_sec}.tex")
+        if not os.path.isfile(sec_tex):
+            history.append(f"T2: 切片 {active_sec}.tex 缺失，无法进入语义审读")
             return {
                 "stage": "REPAIR_LOOP",
                 "routing_action": "REPAIR_SECTION",
                 "repair_target": active_sec,
-                "repair_reason": f"pdstate mark checked 失败 (exit {code_mark}): {err_msg}",
+                "semantic_repair_target": None,
+                "repair_reason": f"切片 {active_sec}.tex 缺失，需重新生成后才能提交",
                 "history": history
             }
+        verdict, reason = semantic_gate_verdict(self_dir, active_sec)
+        if verdict != "PASS":
+            history.append(f"T2: 切片 {active_sec} 语义审读硬闸门未通过: {reason}")
+            return {
+                "stage": "REPAIR_LOOP",
+                "routing_action": "REPAIR_SECTION",
+                "repair_target": active_sec,
+                # BLOCK=补派审读（写作者无过错）；REVISE=写作者返修
+                "semantic_repair_target": active_sec if verdict == "BLOCK" else None,
+                "repair_reason": reason,
+                "history": history
+            }
+        run_json_path = os.path.join(self_dir, ".pd", "run.json")
+        cur_status = None
+        if os.path.isfile(run_json_path):
+            try:
+                with open(run_json_path, "r", encoding="utf-8-sig") as f:
+                    rdata = json.load(f)
+                cur_status = ((rdata.get("tasks") or {}).get(active_sec) or {}).get("status")
+            except Exception:
+                pass
+
+        if cur_status in ("produced", "checked"):
+            code_sub = 0
+            history.append(f"T2: 切片 {active_sec} 状态已为 {cur_status}，跳过重复 submit")
+        else:
+            # 1. Try submit
+            code_sub, out_sub, err_sub = runner.run_script("pdstate.py", [self_dir, "submit", active_sec])
+            if code_sub == 0:
+                history.append(f"T2: pdstate.py submit {active_sec} 成功提升正式切片")
+            else:
+                # B3+: 契约旁路（直接就绪模式）已移除。写作者直接把 <sec>.tex
+                # 落在 self/ 根目录是 interrupt 模式的常态路径——将其正式纳管为
+                # 当前 attempt 候选后重试 submit；契约校验（身份/新鲜度/结构）
+                # 仍由 pdstate 完整执行，纳管失败或重试失败一律定点返修。
+                if _import_direct_candidate(self_dir, active_sec, runner, history):
+                    code_sub, out_sub, err_sub = runner.run_script(
+                        "pdstate.py", [self_dir, "submit", active_sec])
+                    if code_sub == 0:
+                        history.append(f"T2: pdstate.py submit {active_sec} 纳管后成功提升正式切片")
+                if code_sub != 0:
+                    err_msg = (err_sub or out_sub or "submit failed").strip()
+                    history.append(f"T2: 切片 {active_sec} 提交失败: {err_msg}")
+                    return {
+                        "stage": "REPAIR_LOOP",
+                        "routing_action": "REPAIR_SECTION",
+                        "repair_target": active_sec,
+                        "repair_reason": f"切片提交失败: {err_msg}",
+                        "history": history
+                    }
+
+        # 2. Mark checked（B3：退出码必须检查，非 0 一律返修，不得继续置 checked）
+        if cur_status == "checked":
+            code_mark = 0
+            history.append(f"T2: 切片 {active_sec} 状态已为 checked，跳过重复 mark checked")
+        else:
+            code_mark, out_mark, err_mark = runner.run_script("pdstate.py", [self_dir, "mark", active_sec, "checked"])
+            if code_mark != 0:
+                err_msg = (err_mark or out_mark or "mark checked failed").strip()
+                history.append(f"T2: 切片 {active_sec} 标记 checked 失败 (exit {code_mark}): {err_msg}")
+                return {
+                    "stage": "REPAIR_LOOP",
+                    "routing_action": "REPAIR_SECTION",
+                    "repair_target": active_sec,
+                    "repair_reason": f"pdstate mark checked 失败 (exit {code_mark}): {err_msg}",
+                    "history": history
+                }
         statuses[active_sec] = "checked"
         history.append(f"T2: 切片 {active_sec} 已标记为 checked")
 
@@ -286,7 +344,8 @@ def node_t2_submit_and_check_sections(state: ShrinkCoursewareState) -> Dict[str,
     return {
         "section_statuses": statuses,
         # B1: submit/check 节点不再重置 retry_count；计数器仅由
-        # node_t2_request_sections 在推进到新切片时清零，保证熔断可触发。
+        # node_t2_plan_dispatch（P1 fan-out 主控）在规划新批次时清零，
+        # 保证熔断可触发。
         "stage": "T2_SECTIONS_STAGED",
         "routing_action": "PROCEED",
         "history": history

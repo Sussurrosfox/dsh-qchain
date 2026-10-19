@@ -9,11 +9,16 @@ from .state import ShrinkCoursewareState
 from .nodes import (
     node_phase0_breakpoint,
     node_t0_init_scaffold,
-    node_t1_request_mapping,
-    node_t1_await_mapping,
+    node_t1_request_source_audit,
+    node_t1_await_source_audit,
+    node_t1_request_dependency_plan,
+    node_t1_await_dependency_plan,
+    node_t1_request_coverage_plan,
+    node_t1_await_coverage_plan,
     node_t1_verify_mapping,
-    node_t2_request_sections,
-    node_t2_await_sections,
+    node_t2_plan_dispatch,
+    node_t2_dispatch_sections,
+    node_t2_join_sections,
     node_t2_submit_and_check_sections,
     node_t2_assemble_main,
     node_t2_shuffle_options,
@@ -21,20 +26,30 @@ from .nodes import (
     node_t3_build,
     node_t3_compare,
     node_t4_make_review_pack,
-    node_t4_request_acceptance,
-    node_t4_await_acceptance,
+    node_t4_plan_review,
+    node_t4_dispatch_review,
+    node_t4_join_review,
     node_t4_verify_acceptance,
     node_t4_promote_and_deliver,
     node_repair_section,
-    node_repair_await
+    node_repair_await,
+    node_t2_plan_check,
+    node_t2_dispatch_check,
+    node_t2_join_check
 )
 from .edges import (
     route_after_phase0,
     route_after_init,
+    route_after_t1_request_source,
+    route_after_t1_await_source,
+    route_after_t1_request_dependency,
+    route_after_t1_await_dependency,
+    route_after_t1_request_coverage,
     route_after_mapping_await,
     route_after_mapping_verify,
-    route_after_section_request,
-    route_after_section_await,
+    route_after_t2_plan,
+    route_after_t2_dispatch,
+    route_after_t2_join,
     route_after_section_check,
     route_after_assemble,
     route_after_shuffle,
@@ -42,10 +57,15 @@ from .edges import (
     route_after_build,
     route_after_compare,
     route_after_review_pack,
-    route_after_acceptance_await,
+    route_after_t4_review_plan,
+    route_after_t4_review_dispatch,
+    route_after_t4_review_join,
     route_after_acceptance_verify,
     route_after_repair_dispatch,
-    route_after_repair_await
+    route_after_repair_await,
+    route_after_t2_plan_check,
+    route_after_t2_dispatch_check,
+    route_after_t2_join_check
 )
 
 
@@ -58,13 +78,22 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
     workflow.add_node("t0_init_scaffold", node_t0_init_scaffold)
 
     # T1: Mapping
-    workflow.add_node("t1_request_mapping", node_t1_request_mapping)
-    workflow.add_node("t1_await_mapping", node_t1_await_mapping)
+    workflow.add_node("t1_request_source_audit", node_t1_request_source_audit)
+    workflow.add_node("t1_await_source_audit", node_t1_await_source_audit)
+    workflow.add_node("t1_request_dependency_plan", node_t1_request_dependency_plan)
+    workflow.add_node("t1_await_dependency_plan", node_t1_await_dependency_plan)
+    workflow.add_node("t1_request_coverage_plan", node_t1_request_coverage_plan)
+    workflow.add_node("t1_await_coverage_plan", node_t1_await_coverage_plan)
     workflow.add_node("t1_verify_mapping", node_t1_verify_mapping)
 
-    # T2: Sections & Assembly
-    workflow.add_node("t2_request_sections", node_t2_request_sections)
-    workflow.add_node("t2_await_sections", node_t2_await_sections)
+    # T2: Sections & Assembly（P1：fan-out 派发链替换原串行首次写作链；
+    # §6：写作轮之后是语义审读轮 Writer → Checker → Gate）
+    workflow.add_node("t2_plan_dispatch", node_t2_plan_dispatch)
+    workflow.add_node("t2_dispatch_sections", node_t2_dispatch_sections)
+    workflow.add_node("t2_join_sections", node_t2_join_sections)
+    workflow.add_node("t2_plan_check", node_t2_plan_check)
+    workflow.add_node("t2_dispatch_check", node_t2_dispatch_check)
+    workflow.add_node("t2_join_check", node_t2_join_check)
     workflow.add_node("t2_submit_and_check_sections", node_t2_submit_and_check_sections)
     workflow.add_node("t2_assemble_main", node_t2_assemble_main)
     workflow.add_node("t2_shuffle_options", node_t2_shuffle_options)
@@ -74,10 +103,11 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
     workflow.add_node("t3_build", node_t3_build)
     workflow.add_node("t3_compare", node_t3_compare)
 
-    # T4: Review, Acceptance & Deliver
+    # T4: Review, Acceptance & Deliver（P2：验收 fan-out 派发链替换原单请求验收链）
     workflow.add_node("t4_make_review_pack", node_t4_make_review_pack)
-    workflow.add_node("t4_request_acceptance", node_t4_request_acceptance)
-    workflow.add_node("t4_await_acceptance", node_t4_await_acceptance)
+    workflow.add_node("t4_plan_review", node_t4_plan_review)
+    workflow.add_node("t4_dispatch_review", node_t4_dispatch_review)
+    workflow.add_node("t4_join_review", node_t4_join_review)
     workflow.add_node("t4_verify_acceptance", node_t4_verify_acceptance)
     workflow.add_node("t4_promote_and_deliver", node_t4_promote_and_deliver)
 
@@ -104,14 +134,56 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
         "t0_init_scaffold",
         route_after_init,
         {
-            "t1_request_mapping": "t1_request_mapping",
+            "t1_request_source_audit": "t1_request_source_audit",
             END: END
         }
     )
 
-    workflow.add_edge("t1_request_mapping", "t1_await_mapping")
+    # §5.1 三角色串行 barrier：source-auditor → dependency-planner →
+    # coverage-planner → verify。每个 request 节点只写自己的产物，await
+    # 节点是唯一等待/校验点（round 内无并发，链本身即 barrier）。
     workflow.add_conditional_edges(
-        "t1_await_mapping",
+        "t1_request_source_audit",
+        route_after_t1_request_source,
+        {
+            "t1_await_source_audit": "t1_await_source_audit",
+            END: END
+        }
+    )
+    workflow.add_conditional_edges(
+        "t1_await_source_audit",
+        route_after_t1_await_source,
+        {
+            "t1_request_dependency_plan": "t1_request_dependency_plan",
+            END: END
+        }
+    )
+    workflow.add_conditional_edges(
+        "t1_request_dependency_plan",
+        route_after_t1_request_dependency,
+        {
+            "t1_await_dependency_plan": "t1_await_dependency_plan",
+            END: END
+        }
+    )
+    workflow.add_conditional_edges(
+        "t1_await_dependency_plan",
+        route_after_t1_await_dependency,
+        {
+            "t1_request_coverage_plan": "t1_request_coverage_plan",
+            END: END
+        }
+    )
+    workflow.add_conditional_edges(
+        "t1_request_coverage_plan",
+        route_after_t1_request_coverage,
+        {
+            "t1_await_coverage_plan": "t1_await_coverage_plan",
+            END: END
+        }
+    )
+    workflow.add_conditional_edges(
+        "t1_await_coverage_plan",
         route_after_mapping_await,
         {
             "t1_verify_mapping": "t1_verify_mapping",
@@ -123,26 +195,76 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
         "t1_verify_mapping",
         route_after_mapping_verify,
         {
-            "t2_request_sections": "t2_request_sections",
-            "t1_request_mapping": "t1_request_mapping",
+            "t2_plan_dispatch": "t2_plan_dispatch",
+            "t1_request_source_audit": "t1_request_source_audit",
+            "t1_request_coverage_plan": "t1_request_coverage_plan",
             END: END
         }
     )
 
     workflow.add_conditional_edges(
-        "t2_request_sections",
-        route_after_section_request,
+        "t2_plan_dispatch",
+        route_after_t2_plan,
         {
-            "t2_await_sections": "t2_await_sections",
+            "t2_dispatch_sections": "t2_dispatch_sections",
+            "t2_submit_and_check_sections": "t2_submit_and_check_sections",
             "t2_assemble_main": "t2_assemble_main",
             END: END
         }
     )
 
     workflow.add_conditional_edges(
-        "t2_await_sections",
-        route_after_section_await,
+        "t2_dispatch_sections",
+        route_after_t2_dispatch,
         {
+            "t2_join_sections": "t2_join_sections",
+            END: END
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "t2_join_sections",
+        route_after_t2_join,
+        {
+            # manual 模式 interrupt 后自环回本节点，从磁盘重推导结果
+            # （单节点多次 interrupt 再挂起不可靠，须图级自环）
+            "t2_join_sections": "t2_join_sections",
+            "repair_section": "repair_section",
+            # §6：写作轮全部暂存后进入语义审读轮（Writer → Checker → Gate）
+            "t2_plan_check": "t2_plan_check",
+            END: END
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "t2_plan_check",
+        route_after_t2_plan_check,
+        {
+            "t2_dispatch_check": "t2_dispatch_check",
+            "t2_submit_and_check_sections": "t2_submit_and_check_sections",
+            END: END
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "t2_dispatch_check",
+        route_after_t2_dispatch_check,
+        {
+            "t2_join_check": "t2_join_check",
+            END: END
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "t2_join_check",
+        route_after_t2_join_check,
+        {
+            # manual 模式 interrupt 后自环回本节点，从磁盘重推导审读结果
+            "t2_join_check": "t2_join_check",
+            # 缺结果/摘要过期 → 补派审读（写作者无过错）
+            "t2_plan_check": "t2_plan_check",
+            # REVISE/NEEDS_EVIDENCE → 重派写作者返修
+            "repair_section": "repair_section",
             "t2_submit_and_check_sections": "t2_submit_and_check_sections",
             END: END
         }
@@ -152,7 +274,9 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
         "t2_submit_and_check_sections",
         route_after_section_check,
         {
-            "t2_request_sections": "t2_request_sections",
+            "t2_plan_dispatch": "t2_plan_dispatch",
+            # §6：提交时语义硬闸门要求补派审读
+            "t2_plan_check": "t2_plan_check",
             "t2_assemble_main": "t2_assemble_main",
             "repair_section": "repair_section",
             END: END
@@ -184,7 +308,7 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
         {
             "t3_build": "t3_build",
             "repair_section": "repair_section",
-            "t1_request_mapping": "t1_request_mapping",
+            "t1_request_source_audit": "t1_request_source_audit",
             END: END
         }
     )
@@ -213,16 +337,36 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
         "t4_make_review_pack",
         route_after_review_pack,
         {
-            "t4_request_acceptance": "t4_request_acceptance",
+            "t4_plan_review": "t4_plan_review",
             END: END
         }
     )
 
-    workflow.add_edge("t4_request_acceptance", "t4_await_acceptance")
     workflow.add_conditional_edges(
-        "t4_await_acceptance",
-        route_after_acceptance_await,
+        "t4_plan_review",
+        route_after_t4_review_plan,
         {
+            "t4_dispatch_review": "t4_dispatch_review",
+            END: END
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "t4_dispatch_review",
+        route_after_t4_review_dispatch,
+        {
+            "t4_join_review": "t4_join_review",
+            END: END
+        }
+    )
+
+    workflow.add_conditional_edges(
+        "t4_join_review",
+        route_after_t4_review_join,
+        {
+            # manual 模式 interrupt 后自环回本节点，从磁盘重推导结果
+            # （单节点多次 interrupt 再挂起不可靠，须图级自环）
+            "t4_join_review": "t4_join_review",
             "t4_verify_acceptance": "t4_verify_acceptance",
             END: END
         }
@@ -233,7 +377,7 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
         route_after_acceptance_verify,
         {
             "t4_promote_and_deliver": "t4_promote_and_deliver",
-            "t4_request_acceptance": "t4_request_acceptance",
+            "t4_plan_review": "t4_plan_review",
             "repair_section": "repair_section",
             END: END
         }
@@ -253,6 +397,7 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
         route_after_repair_await,
         {
             "t2_submit_and_check_sections": "t2_submit_and_check_sections",
+            "t3_checks": "t3_checks",
             END: END
         }
     )

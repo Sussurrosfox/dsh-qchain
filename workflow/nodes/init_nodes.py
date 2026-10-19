@@ -27,7 +27,9 @@ ALLOWED_CONFIG_KEYS = {
     "font_size", "paperwidth", "paperheight", "orientation", "columns",
     "margin_top", "margin_bottom", "margin_left", "margin_right", "headheight",
     "teacher_head_left",
-    "lesson_minutes", "core_task_limit", "max_student_pages"
+    "lesson_minutes", "core_task_limit", "max_student_pages",
+    # 任务1：工作集选择（配置层字符串，gen_config FIELDS 校验枚举/文本）
+    "run_scope", "target_sections", "target_qids",
 }
 
 

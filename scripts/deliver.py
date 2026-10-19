@@ -46,17 +46,35 @@ PRE_CHECKS = [
 ]
 CHECKS = [
     ("check_numbering.py", "check_numbering.json"),
+    # §7 scope_gate：生效配置与 Phase 0 冻结合同零漂移（模式/课时/策略/
+    # 范围变更/节数规划），任何未经人工确认的范围变更在此阻断
+    ("check_scope.py", "check_scope.json"),
     ("check_pedagogy.py", "check_pedagogy.json"),
     ("check_dialogue.py", "check_dialogue.json"),
-    ("build.py", "build.json"),
+    ("check_fidelity.py", "check_fidelity.json"),
+    ("check_semantic.py", "check_semantic.json"),
+    ("build.py", "build.json", ["--max-overfull-pt", "300", "--allow-mdframed-breaks"]),
     ("check_budget.py", "check_budget.json", ["--stage", "delivery"]),
-    ("compare_versions.py", "compare.json")
+    ("compare_versions.py", "compare.json"),
+    ("check_agent_audit.py", "check_agent_audit.json"),
+    # §7 provenance_gate：每节可回溯 writer attempt（认证当前内容摘要）/
+    # checker 结果 / qid 规划登记，写域白名单外路径一律拒绝
+    ("check_provenance.py", "check_provenance.json"),
 ]
 ALL_CHECK_REPORTS = [e[1] for e in PRE_CHECKS] + [e[1] for e in CHECKS]
-# 教学语义、对话层规范与预算教案完备性门禁同样是一票否决项
+# 教学语义、对话层规范、来源忠实性与预算教案完备性门禁同样是一票否决项；
+# §6 语义审读门禁（Writer→Checker→Gate）一票否决：缺审读记录/摘要过期/
+# 存在 blocking issue 的小节不得交付；
+# §7 scope_gate 与 provenance_gate 一票否决：范围/预算漂移或血缘链断裂
+# （无 writer attempt 认证当前切片、checker 缺/过期、qid 未登记）不得交付；
+# 多 Agent 证据链审计（q_audit.md）同为一票否决：派发单无证据台账
+# （主 Agent 单会话直写嫌疑）/ 证据失配 / 创审分离违规一律拒绝发布。
 MUST_PASS = ("shuffle_options.json", "check_numbering.json",
+             "check_scope.json",
              "check_pedagogy.json", "check_dialogue.json",
-             "check_budget.json", "build.json")
+             "check_fidelity.json", "check_semantic.json",
+             "check_budget.json", "build.json",
+             "check_agent_audit.json", "check_provenance.json")
 
 
 def load_json(path):
@@ -125,6 +143,26 @@ def verify_report(script, fname, rep, pdir, digest, pdf_sha, blockers, html_sha=
                     blockers.append("报告 %s 绑定的 %s.html 哈希与当前产物不一致" % (fname, n))
 
 
+def _agent_calls_digest(pdir):
+    """.pd/agent-calls/ 证据台账目录摘要（q_audit.md 多 Agent 证据链）。
+
+    对全部证据文件按文件名排序后逐文件计算 sha256，汇总为确定性目录摘要；
+    无台账时返回 None（不写入 manifest，保持旧版交付清单形态）。
+    """
+    calls_dir = os.path.join(pdir, ".pd", "agent-calls")
+    if not os.path.isdir(calls_dir):
+        return None
+    lines = []
+    for name in sorted(os.listdir(calls_dir)):
+        path = os.path.join(calls_dir, name)
+        if not os.path.isfile(path) or not name.endswith(".json"):
+            continue
+        lines.append("%s:%s" % (name, evidence.sha256_file(path) or ""))
+    if not lines:
+        return None
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
 def atomic_release(pdir, manifest, fmt="both"):
     """先写临时目录，全部成功后原子切换 release。"""
     rel = os.path.join(pdir, "release")
@@ -151,6 +189,20 @@ def atomic_release(pdir, manifest, fmt="both"):
             src = os.path.join(pdir, doc)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(staging, doc))
+
+        # 多 Agent 证据链台账（q_audit.md）：.pd/agent-calls/<dispatch_id>.json
+        # 随交付物发布至 release/agents/，使"谁写了什么"可被第三方复核
+        agents_src = os.path.join(pdir, ".pd", "agent-calls")
+        if os.path.isdir(agents_src):
+            ledger = sorted(f for f in os.listdir(agents_src)
+                            if f.endswith(".json")
+                            and os.path.isfile(os.path.join(agents_src, f)))
+            if ledger:
+                agents_dst = os.path.join(staging, "agents")
+                os.makedirs(agents_dst)
+                for name in ledger:
+                    shutil.copy2(os.path.join(agents_src, name),
+                                 os.path.join(agents_dst, name))
 
         with open(os.path.join(staging, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -398,6 +450,10 @@ def main():
     spec_f = os.path.join(pdir, ".pd", "confirmed-spec.json")
     if os.path.isfile(spec_f):
         evidence_hashes["confirmed-spec.json"] = evidence.sha256_file(spec_f)
+    # 多 Agent 证据链台账目录摘要（q_audit.md）：.pd/agent-calls/ 全量文件哈希
+    agent_calls_digest = _agent_calls_digest(pdir)
+    if agent_calls_digest:
+        evidence_hashes["agent-calls"] = agent_calls_digest
     deliverables = []
     if os.path.isfile(os.path.join(pdir, "student.pdf")):
         deliverables.append({"file": "student.pdf", "audience": "student", "description": "学生自学与作答案（剥离解答与教师注记）"})
@@ -409,6 +465,9 @@ def main():
         deliverables.append({"file": "student.html", "audience": "student", "description": "学生版自适应探究卡片牌组"})
     if os.path.isfile(os.path.join(pdir, "teacher.html")):
         deliverables.append({"file": "teacher.html", "audience": "teacher", "description": "教师版卡片牌组（含对白与解答抽屉）"})
+    if os.path.isdir(os.path.join(pdir, ".pd", "agent-calls")) and \
+            any(f.endswith(".json") for f in os.listdir(os.path.join(pdir, ".pd", "agent-calls"))):
+        deliverables.append({"file": "agents/", "audience": "auditor", "description": "多 Agent 派发证据台账（每次子 Agent 派发的 worker 身份与产物 sha256，q_audit.md 证据链）"})
 
     manifest = {
         "schema_version": evidence.SCHEMA_VERSION,

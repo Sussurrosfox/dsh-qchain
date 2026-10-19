@@ -33,7 +33,10 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
             "history": history
         }
 
-    tex_filename = f"{target_sec}.tex"
+    if any(target_sec.endswith(ext) for ext in (".md", ".tex", ".json", ".yaml")):
+        tex_filename = target_sec
+    else:
+        tex_filename = f"{target_sec}.tex"
     req = build_request(
         state,
         stage="REPAIR",
@@ -60,6 +63,7 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
 def node_repair_await(state: ShrinkCoursewareState) -> Dict[str, Any]:
     """Wait for repaired artifacts to be produced and modified."""
     req = state.get("pending_dispatch")
+    expected_sections = state.get("expected_sections") or []
     target_sec = state.get("repair_target") or state.get("active_section") or "sec1"
     if not req:
         return {"stage": "T2_SECTIONS_STAGED", "active_section": target_sec, "routing_action": "PROCEED"}
@@ -68,7 +72,14 @@ def node_repair_await(state: ShrinkCoursewareState) -> Dict[str, Any]:
         state,
         req,
         success_stage="T2_SECTIONS_STAGED",
-        success_history=f"Repair: 切片 {target_sec} 已完成定点修改"
+        success_history=f"Repair: 产物 {target_sec} 已完成定点修改"
     )
-    res["active_section"] = target_sec
+    if res.get("stage") != "HALTED":
+        res["retry_count"] = 0
+        if target_sec in expected_sections:
+            res["active_section"] = target_sec
+        else:
+            res["active_section"] = None
+            res["repair_target"] = None
+            res["stage"] = "T3_CHECKS_PENDING"
     return res

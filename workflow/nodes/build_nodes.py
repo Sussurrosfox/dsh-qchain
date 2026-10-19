@@ -6,85 +6,353 @@ import os
 import sys
 import json
 import hashlib
-from typing import Dict, Any, List
+import re
+from typing import Dict, Any, List, Optional
 from ..state import ShrinkCoursewareState, GateReport
 from ..adapters.script_runner import ScriptRunner
+from ..adapters.gate_runner import GateRunner
+
+
+def _extract_target_sec(report: Dict[str, Any], self_dir: str = None) -> str:
+    if report:
+        for iss in report.get("issues", []):
+            if iss.get("severity") == "error":
+                m = re.search(r'(sec\w+)\.tex', iss.get("message", ""))
+                if m:
+                    return m.group(1)
+        for iss in report.get("issues", []):
+            m = re.search(r'(sec\w+)\.tex', iss.get("message", ""))
+            if m:
+                return m.group(1)
+    if self_dir:
+        failed_targets = []
+        if report:
+            for iss in report.get("issues", []):
+                if iss.get("severity") == "error" and iss.get("target"):
+                    failed_targets.append(iss.get("target"))
+        target_logs = [f"{t}.log" for t in failed_targets if t in ("student", "teacher")]
+        if not target_logs:
+            target_logs = ["teacher.log", "student.log"]
+        for log_name in target_logs:
+            log_path = os.path.join(self_dir, log_name)
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                    err_pos = content.rfind("\n!")
+                    if err_pos == -1:
+                        m_over = re.search(r'Overfull \\hbox \(([3-9]\d{2}|\d{4,})', content)
+                        if m_over:
+                            err_pos = m_over.start()
+                    search_content = content[:err_pos] if err_pos != -1 else content
+                    secs = re.findall(r'\((sec\w+)\.tex', search_content)
+                    if secs:
+                        return secs[-1]
+                except Exception:
+                    pass
+    return None
+
+
+def _fidelity_codes(report: Dict[str, Any]) -> List[str]:
+    """从 GateReport 提取 check_fidelity 的错误码（errors[].code）。"""
+    raw = report.get("raw_report") or {}
+    codes = [str(e.get("code", "")) for e in (raw.get("errors") or [])]
+    if codes:
+        return sorted({c for c in codes if c})
+    text = str(report.get("status") or "")
+    found = re.findall(r"FIDELITY_[A-Z_]+", text)
+    return sorted(set(found))
+
+
+def _fidelity_repair_section(report: Dict[str, Any]) -> Optional[str]:
+    """正文级忠实性违规 → 返回需 REPAIR_SECTION 的切片名，否则 None。"""
+    raw = report.get("raw_report") or {}
+    details = [str(e.get("detail", "")) for e in (raw.get("errors") or [])]
+    section_codes = ("FIDELITY_UNGROUNDED_QID", "FIDELITY_UNGROUNDED_BLOCK",
+                     "FIDELITY_EXCLUDED_REFERENCED",
+                     "FIDELITY_BRIDGE_UNAPPROVED")
+    codes = [str(e.get("code", "")) for e in (raw.get("errors") or [])]
+    for code, detail in zip(codes, details):
+        if code in section_codes:
+            m = re.match(r"(sec[0-9A-Za-z_-]+)", detail)
+            return m.group(1) if m else None
+    return None
+
+
+def _semantic_repair_section(report: Dict[str, Any]) -> tuple:
+    """语义审读门禁违规 → (错误码列表, 需返修的切片名或 None)。
+
+    check_semantic.py 的 detail 均以“小节 <sec> …”开头，与
+    _fidelity_repair_section 同一解析口径。
+    """
+    raw = report.get("raw_report") or {}
+    errors = raw.get("errors") or []
+    codes = [str(e.get("code", "")) for e in errors if isinstance(e, dict)]
+    for e in errors:
+        detail = str(e.get("detail", "")) if isinstance(e, dict) else ""
+        m = re.match(r"(sec[0-9A-Za-z_-]+)", detail)
+        if m:
+            return codes, m.group(1)
+    return codes, None
+
+
+def _provenance_repair_section(report: Dict[str, Any]) -> Optional[str]:
+    """血缘链违规 → 返回需重派写作者的切片名，否则 None。
+
+    check_provenance.py 的 detail 均以“切片 <sec> …”开头
+    （PROV_WRITER_DIGEST / PROV_CHECKER_* / PROV_MISSING_QID /
+    PROV_PATH_ESCAPE）；解析不出切片时返回 None（由调用方按
+    HALTED 处理，不放行无主血缘断裂）。
+    """
+    raw = report.get("raw_report") or {}
+    for e in (raw.get("errors") or []):
+        detail = str(e.get("detail", "")) if isinstance(e, dict) else ""
+        m = re.match(r"(?:切片\s*)?(sec[0-9A-Za-z_-]+)", detail)
+        if m:
+            return m.group(1)
+    return None
 
 
 def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
     """T3: Run pedagogy, numbering, and structure gates."""
     self_dir = state.get("self_dir") or state.get("project_root", ".")
-    runner = ScriptRunner(self_dir)
     history = list(state.get("history", []))
 
+    # 任务7（audit §12.6）：八个纯 Python 门禁合并为一次进程内批量执行
+    # （GateRunner），省去每脚本一个子进程的固定成本，并共享一份输入快照
+    # （batch_input_digest 附在各报告上作 provenance）。
+    # 级联判定顺序保持 pedagogy → numbering → dialogue → scope → fidelity
+    # → semantic → provenance → budget；XeLaTeX 编译与版本比对仍在后续
+    # 节点走子进程（进程不内联编译器）。
+    gate_runner = GateRunner(self_dir)
+    reports = gate_runner.run_gates([
+        {
+            "gate_name": "check_pedagogy",
+            "script_name": "check_pedagogy.py",
+            "args": [self_dir],
+            "report_rel_path": ".pd/reports/check_pedagogy.json",
+        },
+        {
+            "gate_name": "check_numbering",
+            "script_name": "check_numbering.py",
+            "args": [self_dir],
+            "report_rel_path": ".pd/reports/check_numbering.json",
+        },
+        {
+            "gate_name": "check_dialogue",
+            "script_name": "check_dialogue.py",
+            "args": [self_dir],
+            "report_rel_path": ".pd/reports/check_dialogue.json",
+        },
+        {
+            # §7 scope_gate：Phase 0 冻结合约（source-manifest /
+            # intent-contract）与生效配置的零漂移对账——模式降级、课时/
+            # 节数/策略篡改、未经确认的范围变更一律阻断（契约级问题无法
+            # 靠重派切片修复，走 HALTED 交人工）。
+            "gate_name": "check_scope",
+            "script_name": "check_scope.py",
+            "args": [self_dir],
+            "report_rel_path": ".pd/reports/check_scope.json",
+        },
+        {
+            "gate_name": "check_fidelity",
+            "script_name": "check_fidelity.py",
+            "args": [self_dir],
+            "report_rel_path": ".pd/reports/check_fidelity.json",
+        },
+        {
+            # §6/§7 semantic_gate：语义审读一致性（缺审读记录/候选摘要过期/
+            # blocking issue 一律不放行）。T2 审读轮已逐节通过，此处是装配后
+            # 的确定性复核（同一脚本、同一摘要口径）。
+            "gate_name": "check_semantic",
+            "script_name": "check_semantic.py",
+            "args": [self_dir],
+            "report_rel_path": ".pd/reports/check_semantic.json",
+        },
+        {
+            # §7 provenance_gate：writer attempt → checker 结果 → qid 规划的
+            # 血缘链与写域白名单复核（check_provenance.py）。血缘链断裂
+            # （切片被改写但无 writer attempt 认证）→ 重派该节写作者。
+            "gate_name": "check_provenance",
+            "script_name": "check_provenance.py",
+            "args": [self_dir],
+            "report_rel_path": ".pd/reports/check_provenance.json",
+        },
+        {
+            "gate_name": "check_budget",
+            "script_name": "check_budget.py",
+            "args": [self_dir, "--stage", "delivery"],
+            "report_rel_path": ".pd/reports/check_budget.json",
+        },
+    ], run_id=state.get("run_id"))
+
+    # 八份报告一并进入 state（批量执行后逐个门禁都已完成，早失败时也保留
+    # 全量证据，便于 UI/修复回路定位；级联顺序只决定路由判定优先级）。
+    gate_patch = {
+        "pedagogy_gate": reports["check_pedagogy"],
+        "check_numbering_gate": reports["check_numbering"],
+        "dialogue_gate": reports["check_dialogue"],
+        "scope_gate": reports["check_scope"],
+        "fidelity_gate": reports["check_fidelity"],
+        "semantic_gate": reports["check_semantic"],
+        "provenance_gate": reports["check_provenance"],
+        "budget_gate": reports["check_budget"],
+    }
+
     # 1. Pedagogy gate (knowledgebox, microknowledge, cognitive stride, anti-spoiler)
-    ped_report = runner.run_gate_script(
-        gate_name="check_pedagogy",
-        script_name="check_pedagogy.py",
-        args=[self_dir],
-        report_rel_path=".pd/reports/check_pedagogy.json",
-        run_id=state.get("run_id")
-    )
+    ped_report = reports["check_pedagogy"]
     history.append(f"T3: check_pedagogy 状态: {ped_report['status']} (退出 {ped_report['exit_code']})")
 
     if not ped_report["passed"]:
         return {
-            "pedagogy_gate": ped_report,
+            **gate_patch,
             "stage": "REPAIR_LOOP",
             "routing_action": "REPAIR_SECTION",
+            "repair_target": _extract_target_sec(ped_report),
             "repair_reason": f"教学语义与自足性门禁未通过: {ped_report['status']}",
             "history": history
         }
 
     # 2. Numbering gate
-    num_report = runner.run_gate_script(
-        gate_name="check_numbering",
-        script_name="check_numbering.py",
-        args=[self_dir],
-        report_rel_path=".pd/reports/check_numbering.json",
-        run_id=state.get("run_id")
-    )
+    num_report = reports["check_numbering"]
     history.append(f"T3: check_numbering 状态: {num_report['status']} (退出 {num_report['exit_code']})")
 
     if not num_report["passed"]:
         return {
-            "pedagogy_gate": ped_report,
-            "check_numbering_gate": num_report,
+            **gate_patch,
             "stage": "REPAIR_LOOP",
             "routing_action": "REPAIR_SECTION",
+            "repair_target": _extract_target_sec(num_report),
             "repair_reason": f"编号结构检查未通过: {num_report['status']}",
             "history": history
         }
 
     # 3. Dialogue gate (课堂对话层结构与防泄露硬门禁)
-    dia_report = runner.run_gate_script(
-        gate_name="check_dialogue",
-        script_name="check_dialogue.py",
-        args=[self_dir],
-        report_rel_path=".pd/reports/check_dialogue.json",
-        run_id=state.get("run_id")
-    )
+    dia_report = reports["check_dialogue"]
     history.append(f"T3: check_dialogue 状态: {dia_report['status']} (退出 {dia_report['exit_code']})")
 
     if not dia_report["passed"]:
         return {
-            "pedagogy_gate": ped_report,
-            "check_numbering_gate": num_report,
-            "dialogue_gate": dia_report,
+            **gate_patch,
             "stage": "REPAIR_LOOP",
             "routing_action": "REPAIR_SECTION",
+            "repair_target": _extract_target_sec(dia_report),
             "repair_reason": f"对话层结构或泄露检查未通过: {dia_report['status']}",
             "history": history
         }
 
-    # 4. Budget & classroom plan delivery gate (教学预算与翻转教案完备性门禁)
-    bud_report = runner.run_gate_script(
-        gate_name="check_budget",
-        script_name="check_budget.py",
-        args=[self_dir, "--stage", "delivery"],
-        report_rel_path=".pd/reports/check_budget.json",
-        run_id=state.get("run_id")
-    )
+    # 4. §7 scope_gate：Phase 0 冻结合约 vs 生效配置零漂移。契约级违规
+    #    （模式降级/课时策略篡改/范围变更未经人工确认）无法靠重派切片修复，
+    #    直接 HALTED 交人工重新确认目标合同。
+    scope_report = reports["check_scope"]
+    history.append(f"T3: check_scope 状态: {scope_report['status']} (退出 {scope_report['exit_code']})")
+
+    if not scope_report["passed"]:
+        return {
+            **gate_patch,
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": f"目标合同/配置范围漂移（scope_gate 未通过）: {scope_report['status']}",
+            "history": history
+        }
+
+    # 5. 来源忠实性门禁（audit §18.6：check_fidelity.py，T2 锚点/映射/
+    #    批准台账的确定性校验；契约级违规回退 T1 重规划，正文级违规修节）
+    fid_report = reports["check_fidelity"]
+    history.append(f"T3: check_fidelity 状态: {fid_report['status']} (退出 {fid_report['exit_code']})")
+
+    if not fid_report["passed"]:
+        fid_codes = _fidelity_codes(fid_report)
+        sec_hit = _fidelity_repair_section(fid_report)
+        if sec_hit:
+            return {
+                **gate_patch,
+                "stage": "REPAIR_LOOP",
+                "routing_action": "REPAIR_SECTION",
+                "repair_target": sec_hit,
+                "repair_reason": f"来源忠实性门禁未通过 ({','.join(fid_codes)}): {fid_report['status']}",
+                "history": history
+            }
+        replan_count = state.get("replan_count", 0) + 1
+        if replan_count > 3:
+            history.append(f"T3: 忠实性重规划次数超限 ({replan_count} > 3)，熔断停止")
+            return {
+                **gate_patch,
+                "replan_count": replan_count,
+                "stage": "HALTED",
+                "routing_action": "HALT",
+                "error_message": f"来源忠实性重规划次数超限: {fid_report['status']}",
+                "history": history
+            }
+        return {
+            **gate_patch,
+            "replan_count": replan_count,
+            "stage": "REPAIR_LOOP",
+            "routing_action": "REPLAN",
+            "repair_target": "source-map.md",
+            "repair_reason": f"来源映射/扩展契约违规 ({','.join(fid_codes)}): {fid_report['status']}",
+            "history": history
+        }
+
+    # 5.5 语义审读门禁（audit §6/§7 semantic_gate：Writer→Checker→Gate 的
+    #     Gate 层复核）。缺审读记录/候选摘要过期/schema 非法 → 补派审读
+    #     （semantic_repair_target，写作者无过错）；REVISE/NEEDS_EVIDENCE →
+    #     重派写作者返修。任何情形不得静默放行装配后的内容。
+    sem_report = reports["check_semantic"]
+    history.append(f"T3: check_semantic 状态: {sem_report['status']} (退出 {sem_report['exit_code']})")
+
+    if not sem_report["passed"]:
+        sem_codes, sec_hit = _semantic_repair_section(sem_report)
+        # 审读证据类违规（缺记录/过期/非法）→ 补派审读；语义阻断类 → 返修作者
+        evidence_codes = ("SEMANTIC_MISSING", "SEMANTIC_STALE",
+                          "SEMANTIC_INVALID", "SEMANTIC_SECTION_MISSING")
+        need_checker = any(c in evidence_codes for c in sem_codes)
+        if sec_hit:
+            return {
+                **gate_patch,
+                "stage": "REPAIR_LOOP",
+                "routing_action": "REPAIR_SECTION",
+                "repair_target": sec_hit,
+                "semantic_repair_target": sec_hit if need_checker else None,
+                "repair_reason": f"语义审读门禁未通过 ({','.join(sem_codes)}): {sem_report['status']}",
+                "history": history
+            }
+        return {
+            **gate_patch,
+            "stage": "REPAIR_LOOP",
+            "routing_action": "REPAIR_SECTION",
+            "repair_target": None,
+            "repair_reason": f"语义审读门禁未通过 ({','.join(sem_codes)}): {sem_report['status']}",
+            "history": history
+        }
+
+    # 5.6 §7 provenance_gate：血缘链（writer attempt 认证当前切片内容 /
+    #     checker 结果未过期 / qid 规划登记）与写域白名单。可定位到切片的
+    #     断裂 → 重派该节写作者；定位不到 → HALTED（不放行无主篡改）。
+    prov_report = reports["check_provenance"]
+    history.append(f"T3: check_provenance 状态: {prov_report['status']} (退出 {prov_report['exit_code']})")
+
+    if not prov_report["passed"]:
+        sec_hit = _provenance_repair_section(prov_report)
+        if sec_hit:
+            return {
+                **gate_patch,
+                "stage": "REPAIR_LOOP",
+                "routing_action": "REPAIR_SECTION",
+                "repair_target": sec_hit,
+                "repair_reason": f"产物血缘链断裂（provenance_gate 未通过）: {prov_report['status']}",
+                "history": history
+            }
+        return {
+            **gate_patch,
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": f"产物血缘链断裂且无法定位切片（provenance_gate 未通过）: {prov_report['status']}",
+            "history": history
+        }
+
+    # 6. Budget & classroom plan delivery gate (教学预算与翻转教案完备性门禁)
+    bud_report = reports["check_budget"]
     history.append(f"T3: check_budget (delivery) 状态: {bud_report['status']} (退出 {bud_report['exit_code']})")
 
     if not bud_report["passed"]:
@@ -99,10 +367,7 @@ def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
             if replan_count > 3:
                 history.append(f"T3: 重规划次数超限 ({replan_count} > 3)，熔断停止")
                 return {
-                    "pedagogy_gate": ped_report,
-                    "check_numbering_gate": num_report,
-                    "dialogue_gate": dia_report,
-                    "budget_gate": bud_report,
+                    **gate_patch,
                     "replan_count": replan_count,
                     "stage": "HALTED",
                     "routing_action": "HALT",
@@ -110,10 +375,7 @@ def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
                     "history": history
                 }
             return {
-                "pedagogy_gate": ped_report,
-                "check_numbering_gate": num_report,
-                "dialogue_gate": dia_report,
-                "budget_gate": bud_report,
+                **gate_patch,
                 "replan_count": replan_count,
                 "stage": "REPAIR_LOOP",
                 "routing_action": "REPLAN",
@@ -124,10 +386,7 @@ def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
         elif category in ("section", "artifact"):
             repair_target = "classroom-plan.md" if category == "artifact" else None
             return {
-                "pedagogy_gate": ped_report,
-                "check_numbering_gate": num_report,
-                "dialogue_gate": dia_report,
-                "budget_gate": bud_report,
+                **gate_patch,
                 "replan_count": state.get("replan_count", 0),
                 "stage": "REPAIR_LOOP",
                 "routing_action": "REPAIR_SECTION",
@@ -138,10 +397,7 @@ def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
         elif category == "config":
             history.append(f"T3: 触发配置安全告警 (category=config): {bud_report['status']}")
             return {
-                "pedagogy_gate": ped_report,
-                "check_numbering_gate": num_report,
-                "dialogue_gate": dia_report,
-                "budget_gate": bud_report,
+                **gate_patch,
                 "replan_count": state.get("replan_count", 0),
                 "stage": "HALTED",
                 "routing_action": "HALT",
@@ -155,10 +411,7 @@ def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
             if is_cov_issue and replan_count > 3:
                 history.append(f"T3: 重规划次数超限 ({replan_count} > 3)，熔断停止")
                 return {
-                    "pedagogy_gate": ped_report,
-                    "check_numbering_gate": num_report,
-                    "dialogue_gate": dia_report,
-                    "budget_gate": bud_report,
+                    **gate_patch,
                     "replan_count": replan_count,
                     "stage": "HALTED",
                     "routing_action": "HALT",
@@ -166,10 +419,7 @@ def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
                     "history": history
                 }
             return {
-                "pedagogy_gate": ped_report,
-                "check_numbering_gate": num_report,
-                "dialogue_gate": dia_report,
-                "budget_gate": bud_report,
+                **gate_patch,
                 "replan_count": replan_count,
                 "stage": "REPAIR_LOOP",
                 "routing_action": "REPLAN" if is_cov_issue else "REPAIR_SECTION",
@@ -179,10 +429,7 @@ def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
             }
 
     return {
-        "pedagogy_gate": ped_report,
-        "check_numbering_gate": num_report,
-        "dialogue_gate": dia_report,
-        "budget_gate": bud_report,
+        **gate_patch,
         "stage": "T3_CHECKED",
         "routing_action": "PROCEED",
         "history": history
@@ -200,19 +447,21 @@ def node_t3_build(state: ShrinkCoursewareState) -> Dict[str, Any]:
     build_report = runner.run_gate_script(
         gate_name="build",
         script_name="build.py",
-        args=["--format", fmt, self_dir],
+        args=["--format", fmt, "--max-overfull-pt", "300", "--allow-mdframed-breaks", self_dir],
         report_rel_path=".pd/reports/build.json",
         run_id=state.get("run_id")
     )
     history.append(f"T3: 构建状态 [{fmt}]: {build_report['status']} (退出 {build_report['exit_code']})")
 
     if not build_report["passed"]:
+        target_sec = _extract_target_sec(build_report, self_dir) or "sec2"
         return {
             "build_gate": build_report,
             "build_passed": False,
             "stage": "REPAIR_LOOP",
             "routing_action": "REPAIR_SECTION",
-            "repair_reason": f"构建排版未通过: {build_report['status']}",
+            "repair_target": target_sec,
+            "repair_reason": f"构建排版未通过: LaTeX 编译失败在 {target_sec}，原因: 请修复 probchain 列表中 \\item 语法（如 \\textbf{{证明策略：}}必须包裹在 \\item \\qtype{{...}} 之后，不能在 \\item 之前直接输出普通文本段落，否则 LaTeX 报 missing \\item 致命错误）。",
             "history": history
         }
 

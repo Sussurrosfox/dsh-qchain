@@ -4,6 +4,23 @@
 
 ---
 
+## F2 来源映射契约（T1 映射 Agent 必读；audit §18.4/§18.5）
+
+T1 规划 Agent 收到的输入包含 Phase 0 冻结的 `source-inventory.json`（每单元带 `source_id`/`source_file`/`locator`/`kind`/`source_order`/`disposition`）。映射不得退化为“本节对应某主题”，必须逐条来源对账：
+
+1. **source-map.md 逐行格式**：`source_id -> output_scope -> action -> status -> reason`。
+   - `action` 只能是 `PRESERVE`（仅改排版）/ `EXPLAIN`（更清楚解释，不加新断言）/ `BRIDGE`（补最小前置，须登记依赖表）/ `EXTEND`（新增定理、例题、练习、章节或改主线）。
+   - `status` 只能是 `PRESERVED` / `EXPLAINED` / `BRIDGED` / `EXCLUDED_BY_USER` / `PENDING_APPROVAL`。
+2. **coverage-map.md**：每个输出 section/qid 必须列出 `source_ids`、`action`、`new_objects` 和 `reason`；`new_objects` 非空时只能生成 `BRIDGE` 或 `EXTEND` 请求，不得直接写入 coverage map。
+3. **faithful 模式（默认）**：`EXTEND` 自动判为 `PENDING_APPROVAL` 并停在人工确认点，不得交给 T2 继续生成；没有 `source_id` 的主线内容不能进入正文；必须保持 `source_order`，除非合同显式 `reorder_allowed=true`。
+4. **禁止扩写授权**：不得以 `self_study`、知识密度或“认知链完整”为理由新增未批准内容；原材料是提纲时只允许 `EXPLAIN` 与少量 `BRIDGE`。
+5. **authoring 模式**：只有列入 `allowed_extensions` 的扩展才可登记为 `EXTEND`，清单外扩展仍判 `PENDING_APPROVAL`。
+6. `EXCLUDED_BY_USER` 的单元不计入覆盖缺口，但不得被正文偷偷引用。
+
+上述契约与下文任何“自足体系/密度规划”表述冲突时，以来源契约为准；结构建议只决定**怎么讲**，不决定**讲什么**。
+
+---
+
 ## 角色与成本约束
 
 - `TypeName`: `"self"`
