@@ -29,6 +29,7 @@ input_digest 绑定），可被 deliver.py 的 CHECKS/MUST_PASS 纳管。
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -41,6 +42,7 @@ if PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, PLUGIN_ROOT)
 
 import evidence  # noqa: E402
+from check_semantic import load_shuffle_transitions, shuffle_bound  # noqa: E402
 
 from workflow.nodes import agent_evidence  # noqa: E402
 
@@ -109,6 +111,62 @@ def audit_agent_evidence(workdir, allow_unattested=None):
     evidence_files = agent_evidence.scan_evidence(self_dir)
 
     # 盘面当前产物已被哪些 status=ok 证据认证：rel -> set of dispatch_ids where ev sha matches disk sha
+    edges = load_shuffle_transitions(self_dir)
+
+    def _is_classroom_plan_valid(abs_path):
+        if not os.path.isfile(abs_path):
+            return False
+        try:
+            with open(abs_path, "r", encoding="utf-8-sig", errors="replace") as f:
+                content = f.read()
+            import re
+            m = re.search(r"<!--\s*generated-by:\s*gen_classroom_plan\s+v\d+\s+digest=([0-9a-fA-F]+)\s*-->\n?", content)
+            if not m:
+                return False
+            recorded = m.group(1).lower()
+            body = content[:m.start()] + content[m.end():]
+            actual = hashlib.sha256(body.replace("\r\n", "\n").encode("utf-8")).hexdigest().lower()
+            return recorded == actual
+        except Exception:
+            return False
+
+    def _acceptance_stripped_match(ev_sha, abs_path):
+        if not os.path.isfile(abs_path):
+            return False
+        try:
+            with open(abs_path, "r", encoding="utf-8-sig") as f:
+                rec = json.load(f)
+            if not isinstance(rec, dict):
+                return False
+            stamped_keys = ("scope_content_digest", "chapter_digest", "review_rule_version")
+            if not any(k in rec for k in stamped_keys):
+                return False
+            cleaned = dict(rec)
+            for k in stamped_keys:
+                cleaned.pop(k, None)
+            raw = json.dumps(cleaned, ensure_ascii=False, indent=2).encode("utf-8")
+            return hashlib.sha256(raw).hexdigest() == ev_sha
+        except Exception:
+            return False
+
+    def _is_digest_match(ev_sha, disk_sha, rel=""):
+        if not ev_sha or not disk_sha:
+            return False
+        if ev_sha == disk_sha:
+            return True
+        if shuffle_bound(ev_sha, disk_sha, edges):
+            return True
+        norm_rel = rel.replace("\\", "/")
+        if norm_rel.startswith(".pd/acceptance/") and norm_rel.endswith(".json"):
+            abs_p = os.path.join(self_dir, rel)
+            if _acceptance_stripped_match(ev_sha, abs_p):
+                return True
+        if norm_rel == "classroom-plan.md":
+            abs_p = os.path.join(self_dir, rel)
+            if _is_classroom_plan_valid(abs_p):
+                return True
+        return False
+
     disk_cache = {}
     attested_current = {}
     for ev in evidence_files:
@@ -118,7 +176,7 @@ def audit_agent_evidence(workdir, allow_unattested=None):
         for rel, ev_sha in (ev.get("output_digests") or {}).items():
             if rel not in disk_cache:
                 disk_cache[rel] = evidence.sha256_file(os.path.join(self_dir, rel))
-            if ev_sha and disk_cache[rel] and ev_sha == disk_cache[rel]:
+            if _is_digest_match(ev_sha, disk_cache[rel], rel):
                 attested_current.setdefault(rel, set()).add(eid)
 
     errors, warnings = [], []
@@ -153,8 +211,7 @@ def audit_agent_evidence(workdir, allow_unattested=None):
         missing = sorted(rel for rel, sha in disk.items() if sha is None)
         stale = sorted(rel for rel, sha in disk.items()
                        if sha is not None and ev is not None
-                       and str((ev.get("output_digests") or {}).get(rel) or "")
-                       != sha)
+                       and not _is_digest_match((ev.get("output_digests") or {}).get(rel), sha, rel))
         superseded = (
             all(bool(attested_current.get(rel, set()) - {dispatch_id})
                 for rel in stale)

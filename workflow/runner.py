@@ -126,7 +126,13 @@ def run_pipeline(
 
     # 任务1：工作集字段随 user_spec 进入初始 state（Phase 0 会再次规范化，
     # 非法 run_scope 在断点确认时 HALT，不静默回退 full）。
-    from .scope_selection import RUN_SCOPES, normalize_targets
+    if __package__:
+        from .scope_selection import RUN_SCOPES, normalize_targets
+    else:
+        try:
+            from workflow.scope_selection import RUN_SCOPES, normalize_targets
+        except ImportError:
+            from scope_selection import RUN_SCOPES, normalize_targets
     spec = user_spec or {}
     run_scope = str(spec.get("run_scope") or "full").strip()
     if run_scope not in RUN_SCOPES:

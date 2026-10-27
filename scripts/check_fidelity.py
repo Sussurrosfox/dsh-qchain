@@ -214,7 +214,7 @@ def parse_anchors(self_dir):
     if not os.path.isdir(self_dir):
         return result
     for name in sorted(os.listdir(self_dir)):
-        if not RE_SEC_TEX.match(name):
+        if not RE_SEC_TEX.match(name) or name == "sec_template.tex":
             continue
         path = os.path.join(self_dir, name)
         with open(path, encoding="utf-8", errors="replace") as f:

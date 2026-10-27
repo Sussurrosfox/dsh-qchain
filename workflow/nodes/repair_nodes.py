@@ -45,7 +45,8 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
         artifacts=[tex_filename],
         instruction=f"【定点返修】原因: {reason}。请修改 {tex_filename} 并修复违规项。",
         command=f"python scripts/pdstate.py self/ submit {target_sec}",
-        context={"repair_reason": reason, "target_section": target_sec}
+        context={"repair_reason": reason, "target_section": target_sec},
+        scope=target_sec
     )
     req_ref = write_request_file(self_dir, req)
     history.append(f"Repair: 已派发 {target_sec} 返修任务 (第 {retry_count} 次，派发单: {req_ref})")
@@ -78,6 +79,7 @@ def node_repair_await(state: ShrinkCoursewareState) -> Dict[str, Any]:
         res["retry_count"] = 0
         if target_sec in expected_sections:
             res["active_section"] = target_sec
+            res["semantic_check_rounds"] = 0
         else:
             res["active_section"] = None
             res["repair_target"] = None

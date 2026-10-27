@@ -222,6 +222,8 @@ def node_phase0_breakpoint(state: ShrinkCoursewareState) -> Dict[str, Any]:
     # 任何契约拒绝（生成稿伪装源、重复登记、文件缺失、策略非法）一律 HALT，
     # 不静默放行到下游 Agent。
     self_dir = state.get("self_dir") or os.path.join(project_root, "self")
+    if not spec.get("source_files") and state.get("input_path"):
+        spec["source_files"] = state.get("input_path")
     try:
         manifest = contracts.build_source_manifest(
             project_root=project_root,

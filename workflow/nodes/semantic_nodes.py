@@ -310,13 +310,14 @@ def node_t2_plan_check(state: ShrinkCoursewareState) -> Dict[str, Any]:
     history = list(state.get("history", []))
     repair_target = state.get("semantic_repair_target")
 
-    staged = [sec for sec in expected_sections if statuses.get(sec) == "staged"]
     batch: List[str] = []
-    for sec in staged:
-        if sec == repair_target or needs_check(self_dir, sec):
+    for sec in expected_sections:
+        if statuses.get(sec) == "staged" or sec == repair_target or needs_check(self_dir, sec):
             batch.append(sec)
-    if repair_target and repair_target in staged and repair_target not in batch:
+    if repair_target and repair_target in expected_sections and repair_target not in batch:
         batch.insert(0, repair_target)
+    for sec in batch:
+        statuses[sec] = "staged"
 
     if not batch:
         active = next(
@@ -406,6 +407,7 @@ def node_t2_plan_check(state: ShrinkCoursewareState) -> Dict[str, Any]:
         % (batch_id, len(batch), cfg["profile"], cfg["max_concurrency"]))
 
     return {
+        "section_statuses": statuses,
         "dispatch_plan": state_plan,
         "batch_id": batch_id,
         "pending_dispatch": None,

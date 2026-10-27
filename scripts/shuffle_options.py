@@ -343,10 +343,26 @@ def write_shuffle_map(project, results):
             continue
         transitions.setdefault(stem, []).append(
             [res["sha_before"], res["sha_after"]])
-    if not transitions:
-        return None
     out = os.path.join(project, ".pd", "shuffle-map.json")
-    payload = {"schema_version": 1, "transitions": transitions}
+    existing_transitions = {}
+    if os.path.isfile(out):
+        try:
+            with open(out, "r", encoding="utf-8-sig") as f:
+                old_data = json.load(f)
+            if isinstance(old_data, dict) and isinstance(old_data.get("transitions"), dict):
+                existing_transitions = old_data.get("transitions")
+        except Exception:
+            pass
+
+    for stem, pairs in transitions.items():
+        cur_list = existing_transitions.setdefault(stem, [])
+        for p in pairs:
+            if p not in cur_list:
+                cur_list.append(p)
+
+    if not existing_transitions:
+        return None
+    payload = {"schema_version": 1, "transitions": existing_transitions}
     try:
         os.makedirs(os.path.dirname(out), exist_ok=True)
         tmp = "%s.tmp.%d" % (out, os.getpid())

@@ -27,6 +27,9 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+PLUGIN_ROOT = os.path.abspath(os.path.join(HERE, ".."))
+if PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, PLUGIN_ROOT)
 import evidence  # noqa: E402
 import gen_config  # noqa: E402
 import deliver  # noqa: E402

@@ -303,6 +303,8 @@ def node_t2_submit_and_check_sections(state: ShrinkCoursewareState) -> Dict[str,
                 # 落在 self/ 根目录是 interrupt 模式的常态路径——将其正式纳管为
                 # 当前 attempt 候选后重试 submit；契约校验（身份/新鲜度/结构）
                 # 仍由 pdstate 完整执行，纳管失败或重试失败一律定点返修。
+                if cur_status is None or cur_status in ("stale", "failed", "blocked", "planned"):
+                    _ensure_task_ready_and_start(self_dir, active_sec, runner)
                 if _import_direct_candidate(self_dir, active_sec, runner, history):
                     code_sub, out_sub, err_sub = runner.run_script(
                         "pdstate.py", [self_dir, "submit", active_sec])

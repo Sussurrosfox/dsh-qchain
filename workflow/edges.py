@@ -174,8 +174,10 @@ def route_after_checks(state: ShrinkCoursewareState) -> str:
     if state.get("stage") == "HALTED":
         return END
     if state.get("routing_action") == "REPLAN":
-        return "t1_request_mapping"
+        return "t1_request_source_audit"
     if state.get("routing_action") == "REPAIR_SECTION":
+        if state.get("semantic_repair_target"):
+            return "t2_plan_check"
         return "repair_section"
     return "t3_build"
 

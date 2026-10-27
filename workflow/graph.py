@@ -308,6 +308,7 @@ def create_shrink_courseware_graph(checkpointer: Optional[Any] = None) -> Any:
         {
             "t3_build": "t3_build",
             "repair_section": "repair_section",
+            "t2_plan_check": "t2_plan_check",
             "t1_request_source_audit": "t1_request_source_audit",
             END: END
         }

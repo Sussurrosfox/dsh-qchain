@@ -155,7 +155,8 @@ def _writer_certifies(self_dir, sec, requests, current_digest, edges):
     for req in requests:
         artifacts = [a for a in (req.get("artifacts") or [])
                      if isinstance(a, str)]
-        if str(req.get("scope") or "") != sec or (sec + ".tex") not in artifacts:
+        req_scope = str(req.get("scope") or (req.get("context") or {}).get("target_section") or "")
+        if req_scope != sec or (sec + ".tex") not in artifacts:
             continue
         ledger = _load_ledger(self_dir, req.get("dispatch_id"))
         if not isinstance(ledger, dict):

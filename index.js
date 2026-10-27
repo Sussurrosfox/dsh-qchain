@@ -128,6 +128,10 @@ function qdSha256File(absPath) {
 }
 
 function qdAtomicWrite(absPath, content) {
+  const dir = path.dirname(absPath);
+  if (dir && !fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
   const tmp = `${absPath}.tmp-${crypto.randomBytes(4).toString('hex')}`;
   fs.writeFileSync(tmp, content, 'utf8');
   fs.renameSync(tmp, absPath);

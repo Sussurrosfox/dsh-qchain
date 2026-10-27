@@ -74,7 +74,7 @@ def _fidelity_repair_section(report: Dict[str, Any]) -> Optional[str]:
     codes = [str(e.get("code", "")) for e in (raw.get("errors") or [])]
     for code, detail in zip(codes, details):
         if code in section_codes:
-            m = re.match(r"(sec[0-9A-Za-z_-]+)", detail)
+            m = re.search(r"\b(sec[0-9A-Za-z_-]+)\b", detail)
             return m.group(1) if m else None
     return None
 
@@ -90,7 +90,7 @@ def _semantic_repair_section(report: Dict[str, Any]) -> tuple:
     codes = [str(e.get("code", "")) for e in errors if isinstance(e, dict)]
     for e in errors:
         detail = str(e.get("detail", "")) if isinstance(e, dict) else ""
-        m = re.match(r"(sec[0-9A-Za-z_-]+)", detail)
+        m = re.search(r"\b(sec[0-9A-Za-z_-]+)\b", detail)
         if m:
             return codes, m.group(1)
     return codes, None
