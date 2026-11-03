@@ -40,6 +40,9 @@ from workflow.adapters.gate_runner import (  # noqa: E402
 
 DIGEST = "a" * 64
 
+# R10 源资产清单夹具值（§4.3.3；T2 计划请求必须携带）
+SOURCE_ASSETS = {"figure": 0, "table": 0, "tikz": 0, "available": True}
+
 
 def make_plan(**overrides):
     plan = {
@@ -53,13 +56,17 @@ def make_plan(**overrides):
         "requests": [
             {"dispatch_id": "dsp-t2-sec0-0000000001", "scope": "sec0",
              "role": "writer", "input_digest": DIGEST,
-             "artifacts": ["sec0.tex"], "status": "pending"},
+             "artifacts": ["sec0.tex"], "status": "pending",
+             # R10（§4.3.3 源资产清单）：T2 计划请求必须携带 source_assets
+             "source_assets": SOURCE_ASSETS},
             {"dispatch_id": "dsp-t2-sec1-0000000002", "scope": "sec1",
              "role": "writer", "input_digest": DIGEST,
-             "artifacts": ["sec1.tex"], "status": "pending"},
+             "artifacts": ["sec1.tex"], "status": "pending",
+             "source_assets": SOURCE_ASSETS},
             {"dispatch_id": "dsp-t2-sec2-0000000003", "scope": "sec2",
              "role": "writer", "input_digest": DIGEST,
-             "artifacts": ["sec2.tex"], "status": "pending"},
+             "artifacts": ["sec2.tex"], "status": "pending",
+             "source_assets": SOURCE_ASSETS},
         ],
     }
     plan.update(overrides)

@@ -50,7 +50,7 @@
 
 只提供：读者前置与用途、按实际阅读顺序排列的**学生可见内容**。不提供教师答案、作者自评、三张映射表或预期缺陷清单。
 
-- 学生可见内容应取自 `scripts/make_review_pack.py` 生成的学生审读包（`.pd/review/`，含按页文本与所审版本摘要）；**不得把含 `\fillin[答案]{宽度}[选项...]`、`solution`、`teacherNote` 的 TeX 原样当作学生输入**。选择题化填空渲染后，学生版合法可见下划线与整个选项序列（含正确项）；核对答案是否出现在**选项序列之外**（对白、叙述、前置示例或其他题目），不得仅因选项含答案判泄露。`pdftotext` 抽取的阅读顺序存疑时（双栏、图文混排），直接审读渲染页，不依据可能错序的文本补猜任务结构。
+- 学生可见内容应取自 `scripts/make_review_pack.py` 生成的学生审读包（`.pd/review/`，含按页文本、所审版本摘要与 `smoke/` 冒烟截图）；**不得把含 `\fillin[答案]{宽度}[选项...]`、`solution`、`teacherNote` 的 TeX 原样当作学生输入**。选择题化填空渲染后，学生版合法可见下划线与整个选项序列（含正确项）；核对答案是否出现在**选项序列之外**（对白、叙述、前置示例或其他题目），不得仅因选项含答案判泄露。`pdftotext` 抽取的阅读顺序存疑时（双栏、图文混排），直接审读渲染页（`student.pdf` 或 `.pd/review/smoke/` 截图），不依据可能错序的文本补猜任务结构。
 - 逐任务记录：完成该任务所需的动作、结果可依据的材料、尚缺的信息。先提交此记录。
 - 不得用自己掌握的后续理论替学生补齐依赖。
 
@@ -70,11 +70,23 @@
   5. **防剧透检查**：题干叙述严禁在填空前紧邻语境中直接写出待填答案。
   6. **代数选项排版合规**：选项中包含商群、商环或分式等斜杠记号时，必须使用 `{}` 花括号保护、`\/` 转义或 `\quotgrp` / `\quotring` 专用宏，严禁裸露 `/` 引发选项切分破坏。
   7. **课时预算审核**：验收专员审核课时预算时，直接核对 `.pd/reports/estimate.json` 与 `.pd/reports/check_budget.json` 的结构化报告（由流水线基于切片内部结构特征确定性估算生成），无需人工比对生硬的手填分钟数；核对 core 任务总时长是否符合课程配置要求。
+   8. **源资产对账（零静默丢弃核查）**：核对源文档中的图/表/TikZ（`tikzcd`/`tikzpicture`）/公式环境数量与切片 sec*.tex 中实际保留数量一致（含经 `tikz_rasterize.py` 预栅格化后以 `\includegraphics` 保留的图）；切片产物附带的 gap 清单必须为空，或每一项均给出源行号、环境名与显式豁免理由；发现"丢了不说"（源资产减少且无 gap 记录）一律判 `REVISE`，验收不予通过。
 - 启用对话层时追加检查：对白是否构成隐性提示（学生版可见台词是否缩小了搜索空间或暗示算法）；是否有孤立对白（对白留下的问题没有后续题目承接）；对白是否促进真实数学动作而非装饰性戏剧；反例是否明确说明破坏了哪个猜想/条件（不得把局部反例误写成主命题反例）。问题按 `dialogue-answer-leak` / `dialogue-orphan` / `dialogue-dependency-gap` / `dialogue-redundancy` 分类。
 - 规划、三张映射表和 `approved` 标签同样可以被质疑；`approved` 只是待核对记录，不充当验收结论。
 - 报告必须引用正文位置或可核对来源，不接受"总体良好"式结论。
 
 返修后的再次学生试读若确有必要，应使用新的上下文；已读过完整材料的验收者可核查修复，但不能声称自己再次未见答案。
+
+### 渲染冒烟过目（DoD 硬条款，复盘 §4.4.1）
+
+出具验收 `PASS` 前，必须实际过目 `.pd/review/smoke/` 下的冒烟截图——由 `scripts/render_smoke.py` 渲染的**首页 + 首个含 `\fillin` 选项组的页面**（清单与页码见 `.pd/review/smoke/smoke-manifest.json`；PDF 缺字形/整段空白、HTML 乱码/双重转义在这两页上一眼可辨）：
+
+1. **PDF 侧一眼可辨的失败**：缺字形（方块或空白字符）、整段空白（尤其选项括号内无字）、`\fillin` / `\textbackslash` 等宏字面泄漏、图片缺失占位或排版坍塌；
+2. **HTML 侧一眼可辨的失败**：乱码、双重转义（如字面 `&amp;lt;`、裸露的 `\fillin`）、KaTeX 未渲染的源码外泄（HTML 侧冒烟另论，不在本次范围；但审读包 `manifest.json` 的 `smoke.status` 非 `pass` 时，必须在结论中说明原因）；
+3. **smoke 缺失或未过目不得判 `PASS`**：`.pd/review/smoke/` 不存在、`smoke-manifest.json` 缺失、`png_count` 为 0，或 `smoke.status != "pass"`（按其 `note` 判断是工具缺失还是渲染失败），一律判 `NEEDS_EVIDENCE` 而非 `PASS`——缺的是证据，不是事实错误；
+4. **截图优先于文本视图**：`student-pages.txt`（`pdftotext` 抽取）的阅读顺序存疑时（双栏、图文混排），必须以渲染页截图为准，不得依据可能错序的文本补猜任务结构。
+
+该条款与确定性门禁**并列**：门禁全绿不代表排版正确，冒烟未过目同样不得放行。
 
 ---
 
@@ -120,9 +132,11 @@ dialogue-dependency-gap / dialogue-redundancy 分类，并单独核对：
 区分事实错误、证据不足、规则冲突和可选建议。不设找错数量指标。
 不直接改写正文，不推断未观察到的学生表现或生成过程。**验收标准：核心可在预算内完成（直接核对 .pd/reports/estimate.json 与 .pd/reports/check_budget.json 结构化报告，无需人工比对生硬手填分钟数）；自学题没有被误当课堂必做**。
 
+**渲染冒烟 DoD（出具 PASS 前强制）**：必须过目 `.pd/review/smoke/` 冒烟截图（首页 + 首个含 `\fillin` 选项组的页面）：PDF 缺字形/整段空白、HTML 乱码/双重转义一眼可辨；smoke 缺失、`png_count` 为 0 或未过目不得判 `PASS`（判 `NEEDS_EVIDENCE`）；`student-pages.txt` 阅读顺序存疑时以渲染页截图为准。
+
 ### 输入约束（主 Agent 派发时提供）
 
-- 阶段一：读者前置假设 {{PREREQUISITES}}、学生可见正文 {{STUDENT_VISIBLE_TEXT}}（按阅读顺序，已剥离教师内容）。
+- 阶段一：读者前置假设 {{PREREQUISITES}}、学生可见正文 {{STUDENT_VISIBLE_TEXT}}（按阅读顺序，已剥离教师内容）、冒烟截图目录 `.pd/review/smoke/`（须过目）。
 - 阶段二：学习目标 {{OBJECTIVES}}、原文锚点 {{SOURCE_ANCHORS}}、教师答案 {{TEACHER_ANSWERS}}、映射表摘录 {{MAP_EXCERPTS}}、素材核验依据 {{EVIDENCE}}。
 - 所审版本标识：{{VERSION_HASHES}}（所审文件的内容哈希或版本号）。
 - 派发身份：本次派发协议 `host-subagent-v1`，宿主按 `config.yaml` 的 `agent_dispatch.model_map.T4` 路由独立子 Agent；产物以 JSON `{"files": {".pd/acceptance/<scope>.json": "<完整内容>"}}` 返回，由宿主原子落盘并登记证据台账（验收者身份进入 INV-2 创审分离比对）。

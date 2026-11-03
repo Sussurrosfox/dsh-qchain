@@ -23,6 +23,8 @@ from typing import Dict, Any
 from langgraph.types import interrupt
 
 from .. import contracts
+from .. import dispatch_policy
+from .. import execution_policy
 from ..scope_selection import (
     RUN_SCOPES,
     ScopeSelectionError,
@@ -120,15 +122,22 @@ def node_phase0_breakpoint(state: ShrinkCoursewareState) -> Dict[str, Any]:
     """Phase 0 断点：强制挂起等待真人确认学案主标题、交付模式、输出格式与令牌。"""
     history = list(state.get("history", []))
     project_root = state.get("project_root") or "."
+    self_dir = state.get("self_dir") or os.path.join(project_root, "self")
+    config_path = os.path.join(self_dir, "config.yaml")
 
     if not state.get("phase0_confirmed"):
         token = _ensure_token(project_root)
         token_digest = _calc_token_digest(token)
+        # 任务10（C1 规则4）：Phase 0 必须展示"有效执行策略"，且与内容策略分离——
+        # content_policy=faithful 只是"建议 faithful_fast"，绝不自动换图。
+        execution_view = execution_policy.describe_for_phase0(
+            state.get("user_spec") or {}, config_path=config_path)
         payload = {
             "type": "PHASE0_SPEC",
-            "description": "请确认学案主标题、交付模式(self_study 默认无时长上限/teaching 教学模式保留课时上限)、输出格式(pdf/html/both)、内容策略(faithful 忠实转换默认 / authoring 显式扩写)、工作集(full 全量 / focused 只做目标小节 / edit 只重生成已存在小节，focused 与 edit 需给 target_sections 或 target_qids)与原材料清单(source_files / excluded_sources，排除项也将登记)。",
+            "description": "请确认学案主标题、交付模式(self_study 默认无时长上限/teaching 教学模式保留课时上限)、输出格式(pdf/html/both)、内容策略(faithful 忠实转换默认 / authoring 显式扩写)、工作集(full 全量 / focused 只做目标小节 / edit 只重生成已存在小节，focused 与 edit 需给 target_sections 或 target_qids)与原材料清单(source_files / excluded_sources，排除项也将登记)。执行策略(execution_profile：legacy 旧图默认 / faithful_fast 轻量图)与内容策略无关，确认后与内容契约一并冻结。",
             "defaults": DEFAULT_SPEC,
             "current_spec": state.get("user_spec") or {},
+            "execution": execution_view,
             "token_file": TOKEN_REL_PATH.replace(os.sep, "/"),
             "token_digest": token_digest,
             "instructions": (
@@ -218,10 +227,59 @@ def node_phase0_breakpoint(state: ShrinkCoursewareState) -> Dict[str, Any]:
             "Phase 0: 工作集已锁定 — run_scope=%s, 目标节: %s, 目标题: %s"
             % (run_scope, ",".join(target_sections) or "-", ",".join(target_qids) or "-"))
 
+    # 任务10（C1 规则4/5）：执行契约在 Phase 0 与内容契约同批冻结。
+    # 解析优先级：本次确认值 > config.yaml > legacy（旧工程缺字段即按旧默认）。
+    # 解析失败（未知枚举/布尔误用/非正整数）一律 HALT，绝不按猜测值冻结。
+    try:
+        execution_frozen = execution_policy.resolve_new_run(spec, config_path=config_path)
+    except execution_policy.ExecutionPolicyError as exc:
+        history.append(f"Phase 0: 执行契约被拒绝 [{exc.code}] {exc.detail}")
+        return {
+            "user_spec": spec,
+            "phase0_confirmed": True,
+            "phase0_token_digest": token_digest,
+            "token_digest": token_digest,
+            "output_format": fmt,
+            "human_interrupted": False,
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": "Phase 0 执行契约冻结失败 [%s]: %s" % (exc.code, exc.detail),
+            "history": history,
+        }
+    spec["execution_profile"] = execution_frozen["execution_profile"]
+
+    # 任务19（C12）：派发契约与执行契约同批冻结。记录 dispatch_contract_version、
+    # 实际档位、配置原值与生效来源，使 resume / 配置漂移都不能把已开始的批次
+    # 悄悄放大或串行化；解析失败（版本未知/并发值非法/嵌套与扁平冲突）一律 HALT，
+    # 绝不退回「猜一个 2」。
+    try:
+        dispatch_inputs = dispatch_policy.read_dispatch_inputs(
+            self_dir, run_scope=run_scope)
+        disp_pol = dispatch_policy.resolve_dispatch_policy(
+            config=dispatch_inputs.get("config"),
+            run_scope=run_scope or dispatch_inputs.get("run_scope", ""),
+            execution_profile=execution_frozen["execution_profile"],
+        )
+    except dispatch_policy.DispatchPolicyError as exc:
+        history.append(f"Phase 0: 派发契约被拒绝 [{exc.code}] {exc.detail}")
+        return {
+            "user_spec": spec,
+            "phase0_confirmed": True,
+            "phase0_token_digest": token_digest,
+            "token_digest": token_digest,
+            "output_format": fmt,
+            "human_interrupted": False,
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": "Phase 0 派发契约冻结失败 [%s]: %s"
+                             % (exc.code, exc.detail),
+            "history": history,
+        }
+    spec["agent_dispatch_profile"] = disp_pol["profile"]
+
     # F0：冻结 source-manifest 与 intent-contract（audit §4.1/§4.2）。
     # 任何契约拒绝（生成稿伪装源、重复登记、文件缺失、策略非法）一律 HALT，
     # 不静默放行到下游 Agent。
-    self_dir = state.get("self_dir") or os.path.join(project_root, "self")
     if not spec.get("source_files") and state.get("input_path"):
         spec["source_files"] = state.get("input_path")
     try:
@@ -232,7 +290,9 @@ def node_phase0_breakpoint(state: ShrinkCoursewareState) -> Dict[str, Any]:
             excluded_sources=spec.get("excluded_sources"),
             title=spec.get("main_title"),
         )
-        intent_contract = contracts.build_intent_contract(user_spec=spec)
+        intent_contract = contracts.build_intent_contract(
+            user_spec=spec, execution=execution_frozen,
+            **{"dispatch": disp_pol})
     except contracts.ContractError as exc:
         history.append(f"Phase 0: 契约冻结被拒绝 [{exc.code}] {exc.detail}")
         return {
@@ -255,6 +315,10 @@ def node_phase0_breakpoint(state: ShrinkCoursewareState) -> Dict[str, Any]:
         % contracts.scope_summary(manifest, intent_contract))
     history.append(
         "Phase 0: 契约落盘 %s / %s" % (manifest_path, contract_path))
+    history.append(
+        "Phase 0: 执行契约已冻结 — profile=%s / graph=%s / digest=%s"
+        % (execution_frozen["execution_profile"], execution_frozen["graph_version"],
+           execution_frozen["policy_digest"]))
 
     return {
         "user_spec": spec,
@@ -268,6 +332,15 @@ def node_phase0_breakpoint(state: ShrinkCoursewareState) -> Dict[str, Any]:
         "source_manifest_digest": manifest.get("digest", ""),
         "contract_digest": intent_contract.get("digest", ""),
         "content_policy": intent_contract.get("content_policy"),
+        "execution_schema_version": execution_frozen["execution_schema_version"],
+        "execution_profile": execution_frozen["execution_profile"],
+        "graph_version": execution_frozen["graph_version"],
+        "policy_digest": execution_frozen["policy_digest"],
+        "execution_config": execution_frozen["execution_config"],
+        # 任务19（C12）：派发契约冻结结果（与 intent-contract.dispatch 同源）
+        "dispatch_contract_version": disp_pol["dispatch_contract_version"],
+        "agent_dispatch_profile": disp_pol["profile"],
+        "dispatch_config": dict(disp_pol),
         "source_files": list(intent_contract.get("source_files") or []),
         "excluded_sources": list(intent_contract.get("excluded_sources") or []),
         "run_scope": run_scope,

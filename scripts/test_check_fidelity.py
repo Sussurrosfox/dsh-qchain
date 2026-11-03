@@ -8,6 +8,7 @@ PASS / 输入 digest 篡改 FAIL。
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -352,6 +353,172 @@ class FidelityFixture(unittest.TestCase):
         self.assertEqual(rep["tool"], "check_fidelity.py")
         self.assertEqual(rep["status"], "fail")
         self.assertTrue(rep["errors"])
+
+
+# ===================== 第 8 项：资产守恒对账回归 =====================
+
+# 源文档：2 图形（1 includegraphics + 1 tikzcd）+ 1 表格（tabular）
+TEX_2FIG_1TAB = """第一章 内容。
+
+\\includegraphics[width=0.5\\linewidth]{fig_a.png}
+
+\\begin{tikzcd}
+A \\arrow[r] & B
+\\end{tikzcd}
+
+\\begin{tabular}{cc}
+a & b \\\\
+\\end{tabular}
+
+结尾段落。
+"""
+
+# 源文档：仅 1 个 tikzcd
+TEX_ONE_TIKZ = """前置段落。
+
+\\begin{tikzcd}
+X \\arrow[r] & Y
+\\end{tikzcd}
+
+收尾段落。
+"""
+
+# 产物：2 图形 + 1 表格全保留
+SEC_ASSETS_FULL = """% qid: sec1-q1 | 题型: 进入题
+% source: {sid}
+\\item 看图计算。
+\\includegraphics[width=0.5\\linewidth]{{fig_a.png}}
+\\begin{{tikzcd}} A \\ar[r] & B \\end{{tikzcd}}
+\\begin{{tabular}}{{cc}} a & b \\\\ \\end{{tabular}}
+\\begin{{solution}}
+解答。
+\\end{{solution}}
+"""
+
+# 产物：无任何资产（仅锚点，供 FAIL 用例）
+SEC_NO_ASSETS = """% qid: sec1-q1 | 题型: 进入题
+% source: {sid}
+\\item 纯文本题。
+\\begin{{solution}}
+解答。
+\\end{{solution}}
+"""
+
+# 产物：tikz 栅格化为 PNG（1 includegraphics）
+SEC_RASTERIZED = """% qid: sec1-q1 | 题型: 进入题
+% source: {sid}
+\\item 看图。
+\\includegraphics[width=0.5\\linewidth]{{fig_tikz.png}}
+\\begin{{solution}}
+解答。
+\\end{{solution}}
+"""
+
+
+class AssetConservationFixture(FidelityFixture):
+    """第 8 项资产守恒对账（TOOL_VERSION 1.1）回归。"""
+
+    def _build_tex_contracts(self, tex_text):
+        """用含 TeX 资产的正文重写 8.md 并重建 manifest/inventory。"""
+        with open(os.path.join(self.root, "8.md"), "w",
+                  encoding="utf-8") as f:
+            f.write(tex_text)
+        return self._build_contracts()
+
+    def _write_full_map(self, inv_data):
+        """全量 source-map：preserve→EXPLAIN，excluded→EXCLUDED_BY_USER。"""
+        lines = []
+        for u in inv_data["units"]:
+            if u["disposition"] == "excluded":
+                lines.append("%s -> - -> PRESERVE -> EXCLUDED_BY_USER -> "
+                             "用户排除" % u["source_id"])
+            else:
+                lines.append("%s -> sec1 -> EXPLAIN -> EXPLAINED -> 讲解"
+                             % u["source_id"])
+        self._write("source-map.md", "\n".join(lines) + "\n")
+
+    def _first_preserve_id(self, inv_data):
+        return next(u["source_id"] for u in inv_data["units"]
+                    if u["disposition"] == "preserve")
+
+    # ---- T16: 源 2 图 1 表、产物全保留 → 资产检查 PASS ----
+    def test_t16_assets_all_kept_pass(self):
+        _, _, inv_data = self._build_tex_contracts(TEX_2FIG_1TAB)
+        self._write_full_map(inv_data)
+        sid = self._first_preserve_id(inv_data)
+        self._write("sec1.tex", SEC_ASSETS_FULL.format(sid=sid))
+        res = cf.check_fidelity_project(self.self_dir)
+        self.assertNotIn("FIDELITY_ASSET_LOST", _codes(res),
+                         msg=str(res["errors"]))
+        stats = res["checked"]["assets"]
+        self.assertEqual(stats["source_kept"], {"figure": 2, "table": 1})
+        self.assertEqual(stats["output"], {"figure": 2, "table": 1})
+        self.assertEqual(cf.TOOL_VERSION, "1.1")
+
+    # ---- T17: 源 1 个 tikzcd、产物无 → FAIL 且 code 正确 ----
+    def test_t17_tikz_lost_fails(self):
+        _, _, inv_data = self._build_tex_contracts(TEX_ONE_TIKZ)
+        self._write_full_map(inv_data)
+        sid = self._first_preserve_id(inv_data)
+        self._write("sec1.tex", SEC_NO_ASSETS.format(sid=sid))
+        res = cf.check_fidelity_project(self.self_dir)
+        codes = [e["code"] for e in res["errors"]]
+        self.assertIn("FIDELITY_ASSET_LOST", codes)
+        lost = [e for e in res["errors"]
+                if e["code"] == "FIDELITY_ASSET_LOST"]
+        self.assertTrue(any("图形" in e["detail"] and "1" in e["detail"]
+                            for e in lost), msg=str(lost))
+
+    # ---- T18: tikz 栅格化（源 1 tikzcd → 产物 1 includegraphics）合法 ----
+    def test_t18_rasterized_tikz_pass(self):
+        _, _, inv_data = self._build_tex_contracts(TEX_ONE_TIKZ)
+        self._write_full_map(inv_data)
+        sid = self._first_preserve_id(inv_data)
+        self._write("sec1.tex", SEC_RASTERIZED.format(sid=sid))
+        res = cf.check_fidelity_project(self.self_dir)
+        self.assertNotIn("FIDELITY_ASSET_LOST", _codes(res),
+                         msg=str(res["errors"]))
+
+    # ---- T19: excluded 单元内的资产丢失 → PASS（不计入）----
+    def test_t19_excluded_unit_asset_ignored(self):
+        _, _, inv_data = self._build_tex_contracts(TEX_ONE_TIKZ)
+        # 把含 tikzcd 的单元标记为 excluded 并落盘
+        tikz_line = TEX_ONE_TIKZ.splitlines().index("\\begin{tikzcd}") + 1
+        target = None
+        for u in inv_data["units"]:
+            m = re.search(r"L(\d+)-(\d+)", u["locator"])
+            if m and int(m.group(1)) <= tikz_line <= int(m.group(2)):
+                target = u
+                break
+        self.assertIsNotNone(target, "测试夹具：tikzcd 必须落在某单元内")
+        target["disposition"] = "excluded"
+        inv.write_inventory(self.self_dir, inv_data)
+        self._write_full_map(inv_data)
+        sid = next(u["source_id"] for u in inv_data["units"]
+                   if u["disposition"] == "preserve")
+        self._write("sec1.tex", SEC_NO_ASSETS.format(sid=sid))
+        res = cf.check_fidelity_project(self.self_dir)
+        self.assertNotIn("FIDELITY_ASSET_LOST", _codes(res),
+                         msg=str(res["errors"]))
+        stats = res["checked"]["assets"]
+        self.assertEqual(stats["source_kept"]["figure"], 0)
+
+    # ---- T20: locator 解析失败降级 → warning 不 FAIL，资产仍计入 ----
+    def test_t20_locator_unknown_degrades_with_warning(self):
+        _, _, inv_data = self._build_tex_contracts(TEX_ONE_TIKZ)
+        for u in inv_data["units"]:
+            if u["disposition"] != "excluded":
+                u["locator"] = "(root) 无行号"
+                break
+        inv.write_inventory(self.self_dir, inv_data)
+        self._write_full_map(inv_data)
+        sid = self._first_preserve_id(inv_data)
+        self._write("sec1.tex", SEC_NO_ASSETS.format(sid=sid))
+        res = cf.check_fidelity_project(self.self_dir)
+        warn_codes = {w["code"] for w in res["warnings"]}
+        self.assertIn("FIDELITY_ASSET_LOCATOR_UNKNOWN", warn_codes)
+        # 降级为整文件非 excluded：tikzcd 仍计入应保留 → 资产丢失 FAIL
+        self.assertIn("FIDELITY_ASSET_LOST", _codes(res))
 
 
 if __name__ == "__main__":

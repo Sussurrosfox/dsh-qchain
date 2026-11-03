@@ -20,15 +20,17 @@
        {GENERATED_AT}   生成时间
        {TOC_HTML}       目录抽屉条目（按节分组）
        {CARDS_HTML}     全部卡片（一张卡 = 一页）
+       {MATH_CONFIG_JSON} 共享数学配置（内嵌 JSON；浏览器与 check_render 共用）
 
      交互契约：
        - 翻页：底部/顶部按钮、目录跳转、键盘 ←/→/PgUp/PgDn/Home/End、URL #/
        - 答案：顶部「显示答案」按钮切换本页 .qc-reveal；教师版默认展开
        - 选择题：点击 .qc-option 即时红/绿判定（data-correct 标记），
                  同组选项仅判定一次；卡片内「重置本页」可重做
-       - 数学公式：KaTeX CDN 渲染；离线时退化为 $...$ 源码文本，不影响交互
+       - 数学公式：随包 KaTeX 逐节点严格渲染（失败标记 data-math-status=error）；
+                   离线时退化为 $...$ 源码文本，不影响交互
      ========================================================================== -->
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+" crossorigin="anonymous">
+<link rel="stylesheet" href="katex/katex.min.css" onerror="document.documentElement.classList.add('qc-nokatex')">
 <style>
 :root{
   --qc-primary:#0f5cc0; --qc-primary-dark:#0b47a0;
@@ -46,8 +48,16 @@ body{
   background:var(--qc-bg); color:var(--qc-ink);
   font-size:17px; line-height:1.85;
 }
-.qc-math{font-family:"KaTeX_Main","Times New Roman",serif; white-space:normal}
+/* 行内公式：KaTeX 的 .katex .base 是 nowrap，无法在公式内部断行，超宽公式只能
+   由自身容器横向滚动（DATA-CONTRACTS C8：长公式可自身横向滚动，禁止用
+   overflow:hidden 裁切）。inline-block + max-width:100% + overflow-x:auto 让
+   公式盒最宽不超过包含块，超出部分在公式内部滚动；vertical-align:middle 修正
+   滚动容器的基线（滚动容器的 baseline 退化为底边，不修正会整体下沉）。
+   display 公式由 .qc-math-display 覆盖为 block（源序在后，同特异性后者生效）。 */
+.qc-math{font-family:"KaTeX_Main","Times New Roman",serif; white-space:normal;
+  display:inline-block; max-width:100%; overflow-x:auto; vertical-align:middle}
 .qc-math-display{display:block; text-align:center; margin:.6em 0; overflow-x:auto}
+.qc-math-error{color:var(--qc-wrong); background:var(--qc-wrong-bg); border-bottom:1px dashed var(--qc-wrong)}
 html.qc-nokatex-css .qc-math{background:#f8fafc; border-radius:3px; padding:0 .15em}
 
 /* ---------- 顶栏 ---------- */
@@ -94,23 +104,31 @@ body[data-version="student"] .qc-version-chip{background:#eff6ff; color:var(--qc
 .qc-card-meta .qc-tag{border:1px solid #99f6e4; background:var(--qc-teacher-bg); border-radius:6px; padding:0 8px; margin-left:6px}
 .qc-page-no{font-size:12px; color:var(--qc-ink-3)}
 .qc-card-title{font-size:23px; font-weight:700; margin:2px 0 12px; color:var(--qc-ink)}
-.qc-card-body{font-size:17px}
+/* 窄屏/长内容的换行与收缩纪律（NAV-02）：
+   flex/grid 子项默认 min-width:auto 会拒绝收缩到 min-content 以下，
+   这是长串文本把整页撑宽的根因；overflow-wrap:anywhere 让不可断长串
+   在容器内断行，数学段仍由 .katex .base 的 nowrap 保持完整，超宽时
+   退回"自身容器横向滚动"（.qc-math-display / .qc-option）。 */
+.qc-card-body{font-size:17px; min-width:0; overflow-wrap:anywhere}
 .qc-lead{color:var(--qc-ink-2); border-left:3px solid var(--qc-line); padding-left:12px; margin:0 0 12px}
 .qc-stem{margin:0 0 10px}
 .qc-parts{margin:6px 0 4px; padding-left:0; list-style:none}
-.qc-parts>li{display:flex; gap:10px; margin:10px 0}
+.qc-parts>li{display:flex; gap:10px; margin:10px 0; min-width:0}
+/* li 是 flex 容器，正文项（.qc-part-html）是 flex 子项：默认 min-width:auto
+   会拒绝收缩到 min-content 以下，长公式/长串把整行撑出卡片（NAV-02）。 */
+.qc-parts>li>*{min-width:0}
 .qc-part-label{font-weight:700; color:var(--qc-primary-dark); flex:none; min-width:2.2em}
 .qc-sublist{margin:6px 0 6px 1.4em; padding-left:1em}
 .qc-hintline{display:block; border-left:3px dashed #f59e0b; padding-left:10px; color:#92400e; margin:8px 0}
 
 /* ---------- 对话卡 ---------- */
-.qc-speaker{display:flex; gap:12px; margin:10px 0; align-items:flex-start}
+.qc-speaker{display:flex; gap:12px; margin:10px 0; align-items:flex-start; min-width:0}
 .qc-speaker .qc-role{
   flex:none; font-weight:700; color:var(--qc-primary-dark);
   background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px;
   min-width:3.2em; text-align:center; padding:1px 8px;
 }
-.qc-speaker .qc-line{flex:1}
+.qc-speaker .qc-line{flex:1 1 auto; min-width:0; overflow-wrap:anywhere}
 .qc-speaker[data-teacher-only="1"] .qc-role{background:var(--qc-teacher-bg); border-color:#99f6e4; color:var(--qc-teacher)}
 .qc-speaker[data-teacher-only="1"] .qc-line{color:var(--qc-ink-2)}
 .qc-dlgteacher{color:var(--qc-ink-2)}
@@ -125,13 +143,20 @@ body[data-version="student"] .qc-version-chip{background:#eff6ff; color:var(--qc
 }
 
 /* ---------- 选择题化填空（交互槽位） ---------- */
-.qc-slot{display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; margin:2px 4px; vertical-align:middle}
+/* 槽位是行内 flex 容器。\fillin{w} 会给出固定像素宽（如 15mm≈57px、大留白
+   310px），该宽度由内联 style="min-width:..." 给出；CSS 规范里 min-width 优先于
+   max-width，所以只写 max-width:100% 夹不住它，超宽留白会顶出卡片右边界
+   （NAV-02 真实卡 sec2-09）。这里不改写内联宽度（改写会缩掉学生书写区），而是让
+   槽位自身在内容超宽时横向滚动：内容完整可达、不裁切、也不撑破卡片。 */
+.qc-slot{display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; margin:2px 4px; vertical-align:middle; max-width:100%; min-width:0; overflow-x:auto}
 .qc-blank{display:inline-block; border-bottom:2px solid var(--qc-ink-2); height:1.7em; min-width:3em}
-.qc-options{display:inline-flex; gap:6px; flex-wrap:wrap}
+.qc-slot .qc-blank{max-width:100%}
+.qc-options{display:inline-flex; gap:6px; flex-wrap:wrap; max-width:100%; min-width:0}
 .qc-option{
   appearance:none; border:1.5px solid var(--qc-line); background:#fff; color:var(--qc-ink);
   border-radius:999px; padding:2px 14px; font-size:15px; cursor:pointer; line-height:1.6;
   transition:all .12s ease;
+  max-width:100%; min-width:0; overflow-wrap:anywhere; overflow-x:auto;
 }
 .qc-option:hover{border-color:var(--qc-primary); color:var(--qc-primary)}
 .qc-option.qc-correct{border-color:var(--qc-correct); background:var(--qc-correct-bg); color:var(--qc-correct); font-weight:700}
@@ -157,6 +182,13 @@ body[data-version="teacher"] .qc-ansspace{background:transparent; border-bottom:
 .qc-teacher-note{margin-top:12px; border-radius:10px; border:1px solid #99f6e4; background:var(--qc-teacher-bg); padding:12px 18px; color:var(--qc-teacher)}
 .qc-teacher-note-title{font-weight:700; font-size:14px; letter-spacing:1px; margin-bottom:4px}
 .qc-img{max-width:100%; height:auto; border:1px solid var(--qc-line); border-radius:8px; margin:8px 0; background:#fff}
+
+/* ---------- 教材表格（由 tabular 环境机械转换而来） ---------- */
+.qc-table-wrap{overflow-x:auto; margin:10px 0}
+.qc-table{border-collapse:collapse; margin:2px auto; font-size:.95em; background:#fff}
+.qc-table td{padding:3px 12px; text-align:center; border-bottom:1px solid var(--qc-line); white-space:nowrap}
+.qc-table tr.qc-tr-head td{font-weight:700; background:#eff6ff; border-bottom:1.5px solid var(--qc-primary)}
+.qc-table tr.qc-tr-rule td{padding:0; height:0; line-height:0; border-bottom:1.5px solid #52525b}
 
 /* ---------- 卡片底栏 ---------- */
 .qc-card-foot{display:flex; align-items:center; gap:10px; margin-top:18px; padding-top:12px; border-top:1px dashed var(--qc-line); font-size:13px; color:var(--qc-ink-3)}
@@ -203,6 +235,10 @@ body[data-version="teacher"] .qc-ansspace{background:transparent; border-bottom:
   .qc-card{padding:20px 16px 18px}
   .qc-card-title{font-size:20px}
   .qc-nav{gap:6px; padding:6px 10px}
+  /* 窄屏下把"填空 + 选项"槽位降为整行块级：行内 flex 的 shrink-to-fit 以包含块
+     宽度为基准，槽位落在行尾剩余空间时仍按整行宽度铺开，会把空格线与选项顶出
+     卡片右边界（NAV-02）。整行块级后起点固定在行首，宽度不超过卡片内容宽。 */
+  .qc-slot{display:flex; max-width:100%}
 }
 </style>
 </head>
@@ -220,6 +256,8 @@ body[data-version="teacher"] .qc-ansspace{background:transparent; border-bottom:
 <main id="qc-stage" aria-live="polite">
 {{CARDS_HTML}}
 </main>
+
+<script type="application/json" id="qc-math-config">{{MATH_CONFIG_JSON}}</script>
 
 <nav class="qc-nav" aria-label="翻页导航">
   <button type="button" class="qc-btn" id="qc-btn-prev" title="上一页（←）">‹ 上一页</button>
@@ -393,33 +431,97 @@ body[data-version="teacher"] .qc-ansspace{background:transparent; border-bottom:
   document.querySelectorAll('.qc-card').forEach(updateScore);
   show(start, false);
 
-  // ---- KaTeX 渲染（CDN 失败时保留 $...$ 源码文本，交互不受影响） ----
-  function renderMath(){
-    if (typeof window.renderMathInElement !== 'function') return;
-    try {
-      window.renderMathInElement(document.body, {
-        delimiters: [
-          {left: '$$', right: '$$', display: true},
-          {left: '$', right: '$', display: false}
-        ],
-        macros: {
-          "\\linf": "\\ell_\\infty",
-          "\\bm": "\\boldsymbol"
-        },
-        throwOnError: false,
-        ignoredTags: ['script','noscript','style','textarea','pre','code']
-      });
-    } catch(e){ /* 数学渲染失败不影响翻页与交互 */ }
+  // ---- KaTeX 严格逐节点渲染 ----
+  // 与服务端 check_render 的严格校验共用同一份数学配置（内嵌于
+  // #qc-math-config，file:// 下无需 fetch）：每个最外层 .qc-math 节点单独
+  // katex.render(throwOnError: true, trust: false)，成功/失败写入
+  // data-math-status=ok|error（失败原因在 data-math-error），每节点只渲染一次。
+  // 失败节点保留 $...$ 源码文本并加 .qc-math-error，不再静默吞错。
+  var mathCfg = null;
+  try {
+    var cfgEl = document.getElementById('qc-math-config');
+    mathCfg = JSON.parse(cfgEl ? cfgEl.textContent : '');
+  } catch (e) { mathCfg = null; }
+  window.__qcMath = {total: 0, ok: 0, error: 0, errors: [], engine: null};
+
+  function outerMathNodes(){
+    var all = Array.prototype.slice.call(document.querySelectorAll('.qc-math'));
+    return all.filter(function(el){
+      return !(el.parentElement && el.parentElement.closest('.qc-math'));
+    });
+  }
+  // 只剥最外层成对的 $$..$$ / $..$（与 math_fragments.strip_math_delimiters 一致）
+  function stripDelims(text, classDisplay){
+    var s = text.replace(/^\s+|\s+$/g, '');
+    var body, display;
+    if (s.length >= 4 && s.slice(0, 2) === '$$' && s.slice(-2) === '$$'){
+      body = s.slice(2, -2); display = true;
+    } else if (s.length >= 2 && s.charAt(0) === '$' && s.charAt(s.length - 1) === '$'){
+      body = s.slice(1, -1); display = false;
+    } else {
+      return {error: '数学段缺少成对的最外层 $ 定界符'};
+    }
+    if (!body.replace(/\s+/g, '')) return {error: '数学段为空'};
+    return {body: body, display: display || !!classDisplay};
+  }
+  function markMath(el, status, reason){
+    el.setAttribute('data-math-status', status);
+    if (status === 'error'){
+      el.setAttribute('data-math-error', reason || '');
+      el.classList.add('qc-math-error');
+      window.__qcMath.error++;
+      window.__qcMath.errors.push({id: el.getAttribute('data-math-id'), message: reason || ''});
+    } else {
+      window.__qcMath.ok++;
+    }
+  }
+  function renderMath(finalPass){
+    var nodes = outerMathNodes();
+    window.__qcMath.total = nodes.length;
+    var haveKatex = window.katex && typeof window.katex.render === 'function';
+    if (!haveKatex && !finalPass) return;       // 引擎尚未就绪：等 load 再判定
+    if (haveKatex) window.__qcMath.engine = String(window.katex.version || '');
+    nodes.forEach(function(el, i){
+      if (!el.hasAttribute('data-math-id')) el.setAttribute('data-math-id', 'qcm-' + (i + 1));
+      if (el.hasAttribute('data-math-status')) return;   // 每节点只渲染一次
+      if (!haveKatex) { markMath(el, 'error', 'KaTeX 引擎未加载'); return; }
+      if (!mathCfg || typeof mathCfg.macros !== 'object') { markMath(el, 'error', '缺少内嵌数学配置 qc-math-config'); return; }
+      var src = el.textContent;
+      var d = stripDelims(src, el.classList.contains('qc-math-display'));
+      if (d.error) { markMath(el, 'error', d.error); return; }
+      try {
+        window.katex.render(d.body, el, {
+          displayMode: d.display,
+          throwOnError: true,
+          trust: false,
+          macros: JSON.parse(JSON.stringify(mathCfg.macros)),
+          maxExpand: mathCfg.maxExpand,
+          maxSize: mathCfg.maxSize,
+          strict: mathCfg.strict,
+          errorColor: mathCfg.errorColor
+        });
+        if (mathCfg.errorColor && el.innerHTML.indexOf(mathCfg.errorColor) >= 0){
+          el.textContent = src;
+          throw new Error('受限/不支持的命令被降级为错误色文本');
+        }
+        markMath(el, 'ok');
+      } catch (err) {
+        el.textContent = src;                     // 保留源码，便于定位
+        markMath(el, 'error', String(err && err.message ? err.message : err));
+      }
+    });
+    document.documentElement.setAttribute('data-math-report',
+      window.__qcMath.error ? 'error' : 'ok');
   }
   if (document.readyState === 'complete' || document.readyState === 'interactive'){
-    setTimeout(renderMath, 0);
+    setTimeout(function(){ renderMath(false); }, 0);
   } else {
-    document.addEventListener('DOMContentLoaded', function(){ setTimeout(renderMath, 0); });
+    document.addEventListener('DOMContentLoaded', function(){ setTimeout(function(){ renderMath(false); }, 0); });
   }
-  window.addEventListener('load', function(){ setTimeout(renderMath, 50); });
+  window.addEventListener('load', function(){ setTimeout(function(){ renderMath(true); }, 50); });
 })();
 </script>
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg" crossorigin="anonymous" onerror="document.documentElement.classList.add('qc-nokatex')"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" integrity="sha384-43gviWU0YVjaDtb/GhzOouOXtZMP/7XUzwPTstBeZFe/+rCMvRwr4yROQP43s0Xk" crossorigin="anonymous" onerror="document.documentElement.classList.add('qc-nokatex')"></script>
+<script defer src="katex/katex.min.js" onerror="document.documentElement.classList.add('qc-nokatex')"></script>
+<script defer src="katex/auto-render.min.js" onerror="document.documentElement.classList.add('qc-nokatex')"></script>
 </body>
 </html>

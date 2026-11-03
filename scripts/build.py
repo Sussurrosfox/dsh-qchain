@@ -445,7 +445,7 @@ def main():
     ap.add_argument("--template", default=render_html.DEFAULT_TEMPLATE, help="HTML 模版路径")
     ap.add_argument("--max-retry", type=int, default=1)
     ap.add_argument("--max-overfull-pt", type=float, default=10.0)
-    ap.add_argument("--max-underfull-teacher", type=int, default=3)
+    ap.add_argument("--max-underfull-teacher", type=int, default=15)
     ap.add_argument("--max-underfull-student", type=int, default=None)
     ap.add_argument("--allow-mdframed-breaks", action="store_true")
     ap.add_argument("--strict", action="store_true")

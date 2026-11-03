@@ -66,11 +66,17 @@ from .section_batch_nodes import (
     _join_timeout,
     _live_pool,
     _load_dispatch_config,
+    _load_dispatch_run,
+    _parallelism_check,
     _plan_allow_unattested,
+    _pool_metrics_attribution,
     _result_field,
     _shrink_output,
     _verify_requests_from_disk,
     _write_json_atomic,
+    dispatch_run_rel,
+    render_pipeline_digest,
+    template_semantic_digest,
 )
 from . import agent_evidence
 
@@ -102,7 +108,9 @@ _EMPTY_STAGE_RECORD = "（本批次未产生可解析的切片验收记录）"
 
 #: 任务6：scope 级复用的验收规则版本。复审规则/记录 schema 变更时递增，
 #: 旧版本验收记录一律失效重审（禁止旧规则结论冒充本轮结论）。
-REVIEW_RULE_VERSION = "1.0"
+#: 1.1（任务16/C7）：复用条件新增 macro_semantic_digest 绑定——宏/模板语义
+#: 变化后旧内容审读不再代表本轮产物，必须重审；1.0 记录因此一律失效。
+REVIEW_RULE_VERSION = "1.1"
 
 #: 跨节引用指纹正则（章节级上下文变更检测：某节引用其他节的文本变化）
 _RE_SEC_REF = re.compile(r"sec[0-9]+[a-z]?")
@@ -268,12 +276,16 @@ def _reusable_scopes(
     - ``conclusion == PASS``；
     - ``review_rule_version == REVIEW_RULE_VERSION``（复审规则未变更）；
     - ``scope_content_digest`` 等于当前 ``<sec>.tex`` 摘要（本节未改）；
-    - ``chapter_digest`` 等于当前章节级上下文摘要（无章节级变更）。
+    - ``chapter_digest`` 等于当前章节级上下文摘要（无章节级变更）；
+    - ``macro_semantic_digest`` 等于当前宏/模板语义版本（任务16：宏定义、
+      切片模板、KaTeX 转换规则或渲染 runtime 一变，旧内容审读就不再代表
+      本轮产物的数学含义，必须重审；纯 CSS/版面变化不在此列）。
 
     返回 ``(可复用集合, 未复用原因表)``；原因表供 history 留痕（可验证）。
     """
     reused: set = set()
     reasons: Dict[str, str] = {}
+    current_macro = template_semantic_digest(self_dir)
     for sec in batch:
         rec, err = _load_scope_record(self_dir, sec)
         if rec is None:
@@ -291,12 +303,21 @@ def _reusable_scopes(
         if rec.get("chapter_digest") != chapter_digest:
             reasons[sec] = "章节级上下文已变更（依赖图/装配/顺序/跨节引用）"
             continue
+        if rec.get("macro_semantic_digest") != current_macro:
+            reasons[sec] = ("宏/模板语义已变更（header.tex / sec_template.tex / "
+                            "math-config.json / deck.template.html），内容审读失效")
+            continue
         problems = evidence.validate_acceptance_json(rec)
         if problems:
             reasons[sec] = "schema: " + "; ".join(str(p) for p in problems)
             continue
         reused.add(sec)
     return reused, reasons
+
+
+def _current_macro_digest(self_dir: str) -> str:
+    """当前宏/模板语义版本（与 section_batch_nodes 同口径，避免两处漂移）。"""
+    return template_semantic_digest(self_dir)
 
 
 def _stamp_review_provenance(
@@ -314,8 +335,76 @@ def _stamp_review_provenance(
     rec["scope_content_digest"] = _scope_content_digest(self_dir, sec)
     rec["chapter_digest"] = chapter_digest
     rec["review_rule_version"] = REVIEW_RULE_VERSION
+    # 任务16（CACHE-03）：宏/模板语义版本也由主控盖章——模板语义一变，
+    # 旧内容审读就不能再代表本轮产物的数学含义。
+    rec["macro_semantic_digest"] = _current_macro_digest(self_dir)
     path = os.path.join(self_dir, ACCEPTANCE_DIR_REL, f"{sec}.json")
     _write_json_atomic(path, rec)
+
+
+def _rebind_reused_delivery(
+    self_dir: str, sec: str, rec: Optional[Dict[str, Any]],
+    output_format: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """复用旧内容审读时，把交付检查重新绑定到**本轮实测**指纹（C7/CACHE-03）。
+
+    分工（绝不混用）：
+
+    - ``content_review_refs``：历史内容审读的真实证据，**原样保留**。
+      改写它的 ``artifact_digests`` 去冒充「审读员见过新产物」正是 C7 明令
+      禁止的作弊；
+    - ``delivery_check_ref``：本轮磁盘实测的交付指纹 + 渲染管线版本，
+      模板/CSS 变化后旧指纹一律作废；
+    - ``content_review_reused``：仅当「审读时产物 ≠ 本轮产物」才置真
+      （两者一致却标复用会与证据自相矛盾，见 evidence._validate_acceptance_v2）；
+    - ``reuse_binding``：scope 级复用证据（内容摘要 / 宏语义版本 / 规则版本）。
+    """
+    if not isinstance(rec, dict):
+        return rec
+    fmt = str(output_format or rec.get("output_format") or "both")
+    wanted = {
+        "html": ("student.html",),
+        "pdf": ("student.pdf",),
+        "both": ("student.pdf", "student.html"),
+    }.get(fmt, ("student.pdf", "student.html"))
+    current: Dict[str, str] = {}
+    for rel in wanted:
+        digest = ""
+        try:
+            digest = str(evidence.sha256_file(os.path.join(self_dir, rel)) or "")
+        except Exception:  # noqa: BLE001 - 缺文件只是没指纹，不能因此崩流程
+            digest = ""
+        if digest:
+            current[rel] = digest
+    content_digests: Dict[str, Any] = {}
+    refs = rec.get("content_review_refs")
+    if isinstance(refs, list):
+        for item in refs:
+            if isinstance(item, dict) and isinstance(item.get("artifact_digests"), dict):
+                content_digests.update(item["artifact_digests"])
+    elif isinstance(refs, dict) and isinstance(refs.get("artifact_digests"), dict):
+        content_digests = dict(refs["artifact_digests"])
+    rec["delivery_check_ref"] = {
+        "artifact_digests": dict(current),
+        "output_format": fmt,
+        "source": "t4_review_batch_nodes/%s T4 复用重测（本轮磁盘实测）"
+                  % REVIEW_RULE_VERSION,
+        "render_pipeline_digest": render_pipeline_digest(self_dir),
+    }
+    differed = any(
+        str(content_digests.get(rel) or "") and current.get(rel)
+        and str(content_digests.get(rel)) != current.get(rel)
+        for rel in wanted)
+    rec["content_review_reused"] = bool(differed)
+    rec["reuse_binding"] = {
+        "reused": True,
+        "scope_content_digest": _scope_content_digest(self_dir, sec),
+        "macro_semantic_digest": _current_macro_digest(self_dir),
+        "review_rule_version": REVIEW_RULE_VERSION,
+        "delivery_artifacts": sorted(current),
+        "content_review_kept_intact": True,
+    }
+    return rec
 
 
 def _fold_reused_scopes(
@@ -329,13 +418,15 @@ def _fold_reused_scopes(
 ) -> List[str]:
     """把未本轮派发但证据仍有效的旧 PASS 记录纳入 fan-in 聚合。
 
-    绑定口径（替代旧的全局 content_digest 校验）：三重一致
-    （scope_content_digest + chapter_digest + review_rule_version）且 schema
-    零问题，才允许旧 PASS 进入汇总。任一其他节变更不再顺带作废本节记录
-    （scope 级复用）；但 student.pdf/html 因构建时间戳每次 sha 都变，
-    故复用绑定只认内容摘要，产物 sha 仅作 provenance 留档。
+    绑定口径（替代旧的全局 content_digest 校验）：四重一致
+    （scope_content_digest + chapter_digest + review_rule_version +
+    macro_semantic_digest）且 schema 零问题，才允许旧 PASS 进入汇总。任一其他
+    节变更不再顺带作废本节记录（scope 级复用）；但**内容审读可复用 ≠ 本轮
+    交付被检查过**：进入汇总前必须重测本轮 student.pdf/html 指纹并写进
+    ``delivery_check_ref``（旧指纹绝不冒充见过新产物，任务16/CACHE-03）。
     """
     folded: List[str] = []
+    current_macro = _current_macro_digest(self_dir)
     for sec in expected_sections:
         if not sec or sec in requested_scopes:
             continue
@@ -350,8 +441,13 @@ def _fold_reused_scopes(
             continue
         if rec.get("chapter_digest") != chapter_digest:
             continue
+        if rec.get("macro_semantic_digest") != current_macro:
+            continue
         if evidence.validate_acceptance_json(rec):
             continue
+        _rebind_reused_delivery(self_dir, sec, rec)
+        _write_json_atomic(
+            os.path.join(self_dir, ACCEPTANCE_DIR_REL, f"{sec}.json"), rec)
         evaluated.append((sec, {
             "dispatch_id": f"disk-{sec}",
             "batch_id": batch_id,
@@ -362,6 +458,7 @@ def _fold_reused_scopes(
             "verdict": "PASS",
             "conclusion": "PASS",
             "reused": True,
+            "cache_reused": True,
         }, rec))
         folded.append(sec)
     if folded:
@@ -447,6 +544,11 @@ def _t4_batch_interrupt_payload(
         ],
         "before_digests": before_digests,
         "context": {"sections": sections, "expected_qids": expected_qids},
+        # 卡20（C12.2）：T4 批次入口附可直接执行的 dispatch_args（一次取全批），
+        # 并补齐此前缺失的派发协议三件套（与 T2 载荷同键）。
+        **agent_evidence.dispatch_protocol_block(
+            batch_id=batch_id, self_dir=state.get("self_dir") or "",
+        ),
         "max_concurrency": plan.get("max_concurrency"),
         "min_parallelism": plan.get("min_parallelism"),
         "requests": [
@@ -501,13 +603,48 @@ def _load_scope_record(
 _T4_BATCH_PREFIX = "bat-t4"
 
 
+def reviewer_role(sec: str = "") -> str:
+    """T4 逐节验收的角色名（卡14：角色命名收敛到唯一函数）。
+
+    修复前「审阅者」只靠批次 ID 前缀（``bat-t4``）在审计脚本里被认出来，
+    角色本身没有名字——于是合并终审批次（``bat-t4c``）一带进来，同一条
+    worker 就既算写作者又算审读者，创审分离形同虚设。这里把角色命名收敛成
+    唯一函数（派发单 role、证据审计、投影认证共用同一口径），并**保持**既有
+    角色字符串不变（旧验收证据与测试依赖它，绝不为了「看起来新」而改名）。
+
+    角色化并不靠名字里的花哨措辞，而是靠两件硬事实：派发单 ``stage``
+    （``T4_REVIEW_<SEC>``）与 ``role`` 的取值本身——两者都在
+    :func:`review_projection.is_reviewer_stage` / 角色前缀里被机器判定。
+    """
+    scope = str(sec or "").strip()
+    if not scope or scope == "sec0":
+        return "开篇验收专员"
+    return f"{scope} 切片独立教学验收专员"
+
+
+def _writer_workers(self_dir: str) -> set:
+    """写作阶段 worker 集合（审读角色按 stage 识别，批次前缀仅作兜底）。"""
+    try:
+        import review_projection
+
+        return review_projection.writer_workers(self_dir)
+    except Exception:                     # pragma: no cover - 防御性
+        return {
+            str(ev.get("worker") or "").strip()
+            for ev in agent_evidence.scan_evidence(self_dir)
+            if str(ev.get("worker") or "").strip()
+            and not str(ev.get("batch_id") or "").startswith(_T4_BATCH_PREFIX)
+        }
+
+
 def _reviewer_identity_violation(
     self_dir: str, req: Dict[str, Any]
 ) -> Tuple[bool, str]:
     """INV-2 创审分离校验：验收者不得与写作者同体（q_audit.md）。
 
     比对口径：本 T4 派发单的代理证据 worker 字段 vs 全量写作阶段证据
-    （.pd/agent-calls/ 全量扫描，排除 bat-t4* 验收批次）的 worker 集合。
+    （.pd/agent-calls/ 全量扫描，排除审读角色：stage 为 T4_REVIEW_* /
+    T4_COMBINED_REVIEW 或批次前缀 bat-t4 / bat-t4c）的 worker 集合。
     任一交集 → 违规。无 T4 证据（无法判定验收者身份）时返回 (False, "")，
     由产物证据门禁（ok_unattested）另行处置。
     """
@@ -518,12 +655,7 @@ def _reviewer_identity_violation(
     reviewer = str(review_ev.get("worker") or "").strip()
     if not reviewer:
         return False, ""
-    writers = {
-        str(ev.get("worker") or "").strip()
-        for ev in agent_evidence.scan_evidence(self_dir)
-        if str(ev.get("worker") or "").strip()
-        and not str(ev.get("batch_id") or "").startswith(_T4_BATCH_PREFIX)
-    }
+    writers = _writer_workers(self_dir)
     if reviewer in writers:
         return True, (
             f"reviewer_identity_violation: 验收者与写作者同体（worker={reviewer}），"
@@ -818,7 +950,7 @@ def node_t4_plan_review(state: ShrinkCoursewareState) -> Dict[str, Any]:
     requests: List[Dict[str, Any]] = []
     for sec in batch:
         qids_sec = list(qids_by_sec.get(sec) or [])
-        role_name = "开篇验收专员" if sec == "sec0" else f"{sec} 切片独立教学验收专员"
+        role_name = reviewer_role(sec)
         req = build_request(
             state,
             stage=f"T4_REVIEW_{sec.upper()}",
@@ -954,6 +1086,30 @@ def node_t4_plan_review(state: ShrinkCoursewareState) -> Dict[str, Any]:
             "stage": "HALTED",
             "routing_action": "HALT",
             "error_message": f"派发门禁未通过: {_gate_error_codes(report)}",
+            "history": history,
+        }
+
+    # 卡20（C12.2）：T4 验收批同样写批次索引，保证 qchain_dispatch 的
+    # batch_id 入口对 T2_WRITE / T2_CHECK / T4 三类计划一致可用。
+    try:
+        agent_evidence.write_batch_index(
+            self_dir,
+            batch_id=batch_id,
+            run_id=state.get("run_id", ""),
+            stage="T4",
+            request_ids=[req.get("dispatch_id") for req in requests],
+            plan_rel=DISPATCH_PLAN_REL.replace("\\", "/"),
+            plan_digest=evidence.sha256_file(os.path.join(self_dir, DISPATCH_PLAN_REL)),
+            sections=list(batch),
+            required_scope_count=plan_disk.get("required_scope_count"),
+            dispatch_contract_version=plan_disk.get("dispatch_contract_version"),
+        )
+        history.append(f"T4 Review Dispatch: 已写批次索引（batch_id={batch_id}）")
+    except ValueError as exc:
+        return {
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": f"批次索引写入失败: {exc}",
             "history": history,
         }
 
@@ -1196,7 +1352,9 @@ def _t4_join_review_impl(state: ShrinkCoursewareState) -> Dict[str, Any]:
                     entry["output"] = output
             results[dispatch_id] = entry
             evaluated.append((scope, entry, rec))
-        metrics = stats
+        metrics = _pool_metrics_attribution(
+            stats, requests, plan,
+            reused=int((state.get("dispatch_metrics") or {}).get("reused", 0) or 0))
         pass_count = sum(1 for _s, e, _r in evaluated if e["verdict"] == "PASS")
         history.append(
             "T4 Review Dispatch: 批次 %s 并行收尾（PASS=%d，非 PASS=%d）"
@@ -1237,7 +1395,24 @@ def _t4_join_review_impl(state: ShrinkCoursewareState) -> Dict[str, Any]:
                     entry["verified_via"] = disk["verified_via"]
                 results[dispatch_id] = entry
                 evaluated.append((scope, entry, rec))
-            metrics = _disk_metrics(requests, ok_scopes, failures)
+            metrics = _disk_metrics(
+                requests, ok_scopes, failures,
+                reused=int((state.get("dispatch_metrics") or {}).get("reused", 0) or 0),
+                self_dir=self_dir, batch_id=batch_id)
+            if metrics.get("max_in_flight") is None:
+                history.append(
+                    "T4 Review Dispatch: 本批并发峰值 unknown（%s，来源 %s；批摘要 %s），"
+                    "不据未知判定「伪装完成」，也不返修学案"
+                    % (metrics.get("diagnostics") or "no_run_record",
+                       metrics.get("max_in_flight_source"),
+                       metrics.get("batch_run_rel") or dispatch_run_rel(batch_id)))
+            else:
+                history.append(
+                    "T4 Review Dispatch: 本批并发观测 峰值=%d（口径 %s，来源 %s，原因 %s/%s）"
+                    % (int(metrics["max_in_flight"]), metrics.get("observed_scope"),
+                       metrics.get("max_in_flight_source"),
+                       metrics.get("serial_reason_code"),
+                       metrics.get("serial_reason_source")))
             # 证据链断裂计数（q_audit.md）：主线程直写嫌疑 / 证据与盘面不符
             evidence_error = sum(
                 1 for e in entries.values()
@@ -1286,26 +1461,31 @@ def _t4_join_review_impl(state: ShrinkCoursewareState) -> Dict[str, Any]:
                 "history": history,
             }
 
-    # ---- 硬门禁：实际并发度不得低于计划值（audit_agent.md §6 / P1.4） -----
-    # 仅 parallel 模式校验：manual 路径是人工/Antigravity 批次，已由
-    # dispatch_mode="manual" 显式标记，不属于「伪装并行」。
-    if parallel_mode:
-        min_parallel = int(plan.get("min_parallelism") or 1)
-        actual = int((metrics or {}).get("max_in_flight", 0) or 0)
-        if actual < min_parallel:
-            history.append(
-                "T4 Review Dispatch: 批次 %s 实际并发度 %d 低于计划值 %d，判定伪装完成"
-                % (batch_id, actual, min_parallel))
-            return {
-                "stage": "HALTED",
-                "routing_action": "HALT",
-                "error_message": (
-                    f"实际并发度 {actual} 低于计划值 {min_parallel}，"
-                    "禁止伪装完成（audit_agent.md §6）"),
-                "dispatch_results": results,
-                "dispatch_metrics": metrics,
-                "history": history,
-            }
+    # ---- 并发门禁（任务21 / C12.4）：越界才阻断，低峰值只记原因 ---------
+    # 生产内容门禁不设「峰值必须 >= 声明并行度」的硬阈值：仅剩一单、缓存命中、
+    # 实际依赖、极短请求、宿主限流都能合法压低峰值——必须给原因 + 警告，
+    # 不得据此返修/重写学案；cap 越界才是正确性阻断。
+    parallelism = _parallelism_check(plan, metrics or {}, batch_id or "")
+    if parallelism["halt"]:
+        history.append(
+            "T4 Review Dispatch: 批次 %s %s" % (batch_id, parallelism["halt"]))
+        return {
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": parallelism["halt"],
+            "dispatch_results": results,
+            "dispatch_metrics": metrics,
+            "history": history,
+        }
+    if parallelism["warning"]:
+        warning = parallelism["warning"]
+        metrics = dict(metrics or {})
+        metrics["parallelism_warning"] = warning
+        history.append(
+            "T4 Review Dispatch: 批次 %s 并发告警 %s（声明 %d，实测 %s，原因 %s/%s）："
+            "仅记录原因，不返修学案"
+            % (batch_id, warning["code"], warning["declared"], warning["observed"],
+               warning["serial_reason_code"], warning["serial_reason_source"]))
 
     # ---- INV-2 创审分离注记（q_audit.md）：验收者与写作者同体即验收无效 ----
     for _scope, entry, _rec in evaluated:

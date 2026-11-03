@@ -45,6 +45,10 @@ PURE_PYTHON_GATES: Dict[str, str] = {
     "check_dispatch": "check_dispatch.py",
     "check_scope": "check_scope.py",
     "check_provenance": "check_provenance.py",
+    # 渲染质量门禁（乱码/选项空白防复发）：check_render.py 在构建产物
+    # （*.html / *.pdf / *.log）就绪之后运行，因此由 node_t3_build 调
+    # GateRunner.run_gate 单独执行，而非并入 t3_checks 的装配前批量。
+    "check_render": "check_render.py",
 }
 
 #: 进程内执行的软护栏：单批量门禁数量上限（防止误把全部门禁塞进一批）。

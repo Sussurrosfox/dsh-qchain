@@ -60,6 +60,14 @@ FIELDS = {
     # 调试/provider 不稳定；fast=并发4 完整生成默认；budget=并发2 限流。
     "agent_dispatch": ("enum", ("interactive", "safe", "fast", "budget")),
     "agent_max_concurrency": ("int0", None),
+    # 任务19（DATA-CONTRACTS C12）：派发契约版本。
+    # 缺省（键不存在）= 1 = legacy：保留旧的「扁平键优先」优先级与旧并发语义，
+    # 旧工程/旧检查点因此不会被静默放大。写 2 = 执行器计划契约：
+    # 工具显式正整数 > 嵌套 agent_dispatch.max_concurrency > 扁平
+    # agent_max_concurrency > 档位表；嵌套与扁平同时为正且不一致 → 冲突报错
+    # （CONFIG_CONCURRENCY_CONFLICT），0 表示自动，负数/小数/布尔/>16 一律拒绝。
+    # 未知版本（如 3）必须拒绝：绝不按最新版本的规则去解释一份旧计划。
+    "dispatch_contract_version": ("int", None),
     "agent_batch_window": ("int", None),
     "agent_timeout_seconds": ("int", None),
     "agent_max_retries": ("int", None),
@@ -82,6 +90,21 @@ FIELDS = {
     "run_scope": ("enum", ("full", "focused", "edit")),
     "target_sections": ("text", None),
     "target_qids": ("text", None),
+    # 任务10（DATA-CONTRACTS C1）：执行契约扁平键——把「内容策略」与「执行图」
+    # 分开。这些键只进入 Phase 0 冻结的 state / intent-contract.json，**绝不进入
+    # config.tex 版面输出**：既不在 text_keys 里，也不以 dialogue_ 开头
+    # （generate() 只遍历 text_keys 与 dialogue_* 两组键，见 test_t08）。
+    # 取值语义：execution_profile 决定编译哪张图（缺省 legacy）；其余键是
+    # faithful_fast 的工程初始值（非已验证最佳值）。
+    "execution_profile": ("enum", ("legacy", "faithful_fast")),
+    "pedagogy_policy": ("enum", ("advisory", "strict")),
+    "budget_policy": ("enum", ("advisory", "strict")),
+    "require_classroom_plan": ("bool", None),
+    "writer_batch_max_sections": ("int", None),
+    "writer_batch_max_source_chars": ("int", None),
+    "agent_prompt_max_chars": ("int", None),
+    "repair_max_per_scope": ("int", None),
+    "repair_max_total": ("int", None),
 }
 
 #: agent_dispatch 映射块允许的嵌套键及其校验类型（q_audit.md §1.4）
@@ -99,7 +122,13 @@ INT_MAX_BOUNDS = {
     "lesson_minutes": 300,
     "core_task_limit": 30,
     "max_student_pages": 40,
+    # 任务19（C12）：客户端并发硬上限，与 workflow/dispatch_policy.py 的
+    # MAX_CONCURRENCY_LIMIT、scripts/check_dispatch.py 的 MAX_CONCURRENCY_LIMIT 同值
+    "agent_max_concurrency": 16,
 }
+
+#: 任务19（C12）：受支持的派发契约版本（1=legacy，2=执行器计划契约）
+SUPPORTED_DISPATCH_CONTRACT_VERSIONS = (1, 2)
 
 
 def parse_flat_yaml(text):
@@ -172,11 +201,21 @@ def _validate_dispatch_map(dispatch):
             errors.append("agent_dispatch.%s 取值 “%s” 非法，只能是: true / false"
                           % (key, value))
         elif kind == "int0":
+            # 任务19（C12）：bool 是 int 子类（int(True)=1），必须显式拒绝；
+            # 0 = 自动（按档位表），正数不得超过客户端并发硬上限 16。
+            if isinstance(value, bool):
+                errors.append("agent_dispatch.%s 不能是布尔值（收到 “%s”）"
+                              % (key, value))
+                continue
             try:
                 num = int(v_str)
                 if num < 0:
                     errors.append("agent_dispatch.%s 必须是非负整数（收到 “%s”）"
                                   % (key, value))
+                elif num > INT_MAX_BOUNDS["agent_max_concurrency"]:
+                    errors.append(
+                        "agent_dispatch.%s (%d) 超过客户端并发上限 %d"
+                        % (key, num, INT_MAX_BOUNDS["agent_max_concurrency"]))
             except (TypeError, ValueError):
                 errors.append("agent_dispatch.%s 必须是非负整数（收到 “%s”）"
                               % (key, value))
@@ -209,6 +248,25 @@ def validate(cfg):
             continue
         kind, enum = FIELDS[k]
         v_str = str(v).strip()
+        if k == "dispatch_contract_version":
+            # 任务19（C12）：版本必须显式受支持，未知版本一律拒绝
+            # （绝不按最新版本的规则解释旧计划）
+            if isinstance(v, bool):
+                errors.append("%s 不能是布尔值（收到 “%s”）；布尔只能用于 bool 字段"
+                              % (k, v))
+                continue
+            try:
+                version = int(v_str)
+            except (ValueError, TypeError):
+                errors.append("%s 必须是整数（收到 “%s”）" % (k, v))
+                continue
+            if version not in SUPPORTED_DISPATCH_CONTRACT_VERSIONS:
+                errors.append(
+                    "%s=%d 不受支持，只能是: %s（1=legacy 旧契约，"
+                    "2=执行器计划契约）"
+                    % (k, version,
+                       " / ".join(str(x) for x in SUPPORTED_DISPATCH_CONTRACT_VERSIONS)))
+            continue
         if kind == "enum" and v_str not in enum:
             errors.append("%s 取值 “%s” 非法，只能是: %s"
                           % (k, v, " / ".join(enum)))
@@ -218,6 +276,11 @@ def validate(cfg):
             errors.append("%s 取值 “%s” 非法，只能是 true / false / "
                           "逗号分隔的小节列表（如 sec0,sec1）" % (k, v))
         elif kind == "int0":
+            # 任务10：bool 是 int 的子类，int(True)=1 会静默通过——必须显式拒绝
+            if isinstance(v, bool):
+                errors.append("%s 不能是布尔值（收到 “%s”）；布尔只能用于 bool 字段"
+                              % (k, v))
+                continue
             try:
                 val = int(v_str)
                 if val < 0:
@@ -227,6 +290,11 @@ def validate(cfg):
             except (ValueError, TypeError):
                 errors.append("%s 必须是非负整数（收到 “%s”）" % (k, v))
         elif kind == "int":
+            # 任务10：bool 是 int 的子类，int(True)=1 会静默通过——必须显式拒绝
+            if isinstance(v, bool):
+                errors.append("%s 不能是布尔值（收到 “%s”）；布尔只能用于 bool 字段"
+                              % (k, v))
+                continue
             try:
                 val = int(v_str)
                 if val < 1:
@@ -238,7 +306,45 @@ def validate(cfg):
         elif kind == "dim" and not DIM_RE.match(v_str):
             errors.append("%s 必须带单位（mm/cm/in/pt 等），收到 “%s”"
                           % (k, v))
+    errors.extend(_validate_dispatch_concurrency_conflict(cfg))
     return errors
+
+
+def _validate_dispatch_concurrency_conflict(cfg):
+    """任务19（C12）：v2 派发契约下嵌套/扁平并发值互相矛盾 → 写配置时就点名。
+
+    v2 规则：``agent_dispatch.max_concurrency`` 与 ``agent_max_concurrency``
+    同时为正且不一致时，派发阶段会以 CONFIG_CONCURRENCY_CONFLICT 硬失败
+    （绝不静默挑一个）。这里提前在生成配置阶段给出同样的诊断，避免跑到
+    派发才发现。legacy（无版本或版本 1）保持旧的「扁平优先」语义，不报冲突。
+    """
+    version = cfg.get("dispatch_contract_version")
+    nested = cfg.get("agent_dispatch")
+    if not isinstance(nested, dict):
+        return []
+    try:
+        version_num = int(str(version).strip()) if version not in (None, "") else 1
+    except (TypeError, ValueError):
+        return []  # 版本本身非法由主校验器报错，这里不重复
+    if version_num < 2:
+        return []
+
+    def _as_int(value):
+        if isinstance(value, bool) or value is None:
+            return 0
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return 0
+
+    flat = _as_int(cfg.get("agent_max_concurrency"))
+    inner = _as_int(nested.get("max_concurrency"))
+    if flat > 0 and inner > 0 and flat != inner:
+        return ["派发并发配置冲突 [CONFIG_CONCURRENCY_CONFLICT]: "
+                "agent_dispatch.max_concurrency=%d 与 agent_max_concurrency=%d "
+                "不一致；dispatch_contract_version=2 下请只保留一个（或改成 0=自动）"
+                % (inner, flat)]
+    return []
 
 
 def esc(v):
@@ -274,20 +380,21 @@ def verify_confirmed_spec(project_dir, cfg=None):
     """读取 <project_dir>/.pd/confirmed-spec.json（若存在），比对 config.yaml 校验：
       - 禁止未授权降级：如果 confirmed-spec 中是 teaching/classroom，而 config.yaml 被篡改为 self_study，返回错误；
       - 如果 lesson_minutes 与 confirmed-spec 不匹配，返回错误。
+      - 任务10：若 .pd/intent-contract.json 已冻结 execution_profile，
+        则 config.yaml 声明不同值即报错（冻结策略不得被当前 YAML 改写）。
     返回具体错误信息列表。
     """
     errors = []
     project_dir = os.path.abspath(project_dir)
     spec_path = os.path.join(project_dir, ".pd", "confirmed-spec.json")
-    if not os.path.isfile(spec_path):
-        return errors
-
-    try:
-        with open(spec_path, "r", encoding="utf-8") as f:
-            confirmed = json.load(f)
-    except Exception as e:
-        errors.append("读取 confirmed-spec.json 失败: %s" % e)
-        return errors
+    confirmed = {}
+    if os.path.isfile(spec_path):
+        try:
+            with open(spec_path, "r", encoding="utf-8") as f:
+                confirmed = json.load(f)
+        except Exception as e:
+            errors.append("读取 confirmed-spec.json 失败: %s" % e)
+            return errors
 
     if cfg is None:
         cfg_path = os.path.join(project_dir, "config.yaml")
@@ -325,6 +432,25 @@ def verify_confirmed_spec(project_dir, cfg=None):
             errors.append(
                 "交付模式不匹配: confirmed-spec 为 “%s”，但 config.yaml 为 “%s”" % (conf_prof, cfg_prof)
             )
+
+    # 任务10（C1 规则3/6）：执行策略一旦冻结，config.yaml 不得改写它。
+    # 冻结记录写在 .pd/intent-contract.json（仅新 run 有执行字段；旧契约没有 -> 跳过）。
+    contract_path = os.path.join(project_dir, ".pd", "intent-contract.json")
+    if os.path.isfile(contract_path):
+        contract = None
+        try:
+            with open(contract_path, "r", encoding="utf-8") as f:
+                contract = json.load(f)
+        except Exception as e:
+            errors.append("读取 intent-contract.json 失败: %s" % e)
+        if isinstance(contract, dict):
+            frozen_prof = str(contract.get("execution_profile") or "").strip()
+            cfg_exec = str(cfg.get("execution_profile") or "").strip()
+            if frozen_prof and cfg_exec and cfg_exec != frozen_prof:
+                errors.append(
+                    "执行策略被篡改: intent-contract 已冻结 “%s”，但 config.yaml 为 “%s”"
+                    "（换图必须新开 thread 或显式重新确认）" % (frozen_prof, cfg_exec)
+                )
 
     return errors
 

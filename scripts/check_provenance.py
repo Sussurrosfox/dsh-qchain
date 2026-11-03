@@ -32,7 +32,9 @@ attempt 与写域核对记 WARNING 跳过——该交付路径未经多 Agent �
 - .pd/shuffle-map.json         打乱血缘台账（摘要迁移豁免）
 - coverage-map.md              规划登记（qid 覆盖核对）
 
-用法: python check_provenance.py [工作目录] [--json PATH]
+用法: python check_provenance.py [工作目录] [--json PATH] [--mode full|writer-only]
+      （writer-only 供 faithful_fast 图的「构建前」使用：跳过 checker 链；
+        交付前的正式报告一律 full，且仍是 deliver 的 MUST_PASS 项。）
 退出码: 0 = 通过, 1 = 存在阻断性问题。
 """
 
@@ -57,9 +59,15 @@ if PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, PLUGIN_ROOT)
 
 import evidence  # noqa: E402
+import request_scopes  # noqa: E402  C5：多 scope 授权唯一口径
 
 TOOL_NAME = "check_provenance.py"
 TOOL_VERSION = "1.0"
+
+#: 卡15（C6）门禁分层：full=终审/交付；writer-only=构建前（审读证据尚未产生）
+MODE_FULL = "full"
+MODE_WRITER_ONLY = "writer-only"
+MODES = (MODE_FULL, MODE_WRITER_ONLY)
 
 REQUESTS_DIR_REL = os.path.join(".pd", "agent-requests")
 CALLS_DIR_REL = os.path.join(".pd", "agent-calls")
@@ -150,13 +158,19 @@ def _writer_certifies(self_dir, sec, requests, current_digest, edges):
     """是否存在一条证据台账认证「当前切片内容」的写作 attempt。
 
     返回 (ok, detail)：detail 描述最佳候选失败原因（留痕用）。
+
+    卡13（C5）：一个作者可以一次写 1–2 个相邻节，因此「这个派发单是否被授权写
+    sec」必须读正规化 scopes（``request_scopes``），不能再拿 ``scope`` 字段做
+    独占判定——否则 sec1+sec2 的合批单永远无法为 sec2 认证，来源链必然断裂。
     """
     best = None
     for req in requests:
         artifacts = [a for a in (req.get("artifacts") or [])
                      if isinstance(a, str)]
-        req_scope = str(req.get("scope") or (req.get("context") or {}).get("target_section") or "")
-        if req_scope != sec or (sec + ".tex") not in artifacts:
+        # 授权真源：v2 读 scopes，legacy 回落 scope/context.target_section
+        if not request_scopes.request_covers(req, sec):
+            continue
+        if (sec + ".tex") not in artifacts:
             continue
         ledger = _load_ledger(self_dir, req.get("dispatch_id"))
         if not isinstance(ledger, dict):
@@ -205,8 +219,18 @@ def _artifact_paths_allowed(self_dir, ledger):
     return bad
 
 
-def check_provenance_project(workdir):
-    """返回 {errors, warnings, checked, workdir}。"""
+def check_provenance_project(workdir, mode=MODE_FULL):
+    """返回 {errors, warnings, checked, workdir, mode}。
+
+    卡15（C6）：mode 分两档——
+      * MODE_FULL：「writer attempt 链 + 写域白名单 + checker 链 + qid 规划」全查，
+        终审（合并审读全部 PASS 之后）与交付前使用；
+      * MODE_WRITER_ONLY：只查 writer 认证/写域/qid 规划，跳过 checker 链——
+        构建前还不可能有审读证据，跳过不算放行：交付侧的正式报告仍按 FULL 生成
+        并纳入 MUST_PASS。
+    """
+    if mode not in (MODE_FULL, MODE_WRITER_ONLY):
+        raise ValueError("未知 provenance 模式: %r" % (mode,))
     self_dir = os.path.abspath(workdir)
     errors, warnings = [], []
 
@@ -245,7 +269,8 @@ def check_provenance_project(workdir):
                       "写作 attempt 与写域核对跳过（非多 Agent 交付路径）"})
 
     checked = {"sections": sections, "requests": len(requests),
-               "certified": [], "checker": {}, "has_pipeline": has_pipeline}
+               "certified": [], "checker": {}, "has_pipeline": has_pipeline,
+               "mode": mode}
 
     for sec in sections:
         sec_path = os.path.join(self_dir, sec + ".tex")
@@ -268,8 +293,10 @@ def check_provenance_project(workdir):
                 checked["certified"].append(sec)
 
             # ---- 2. 写域白名单（只看认证当前内容的证据台账）----
+            # 卡13（C5）：授权同样按 scopes 判定——合批单写 sec2 的证据台账也要
+            # 被 sec2 的写域检查覆盖，否则第二节的越界写入彻底漏检。
             for req in requests:
-                if str(req.get("scope") or "") != sec:
+                if not request_scopes.request_covers(req, sec):
                     continue
                 if (sec + ".tex") not in [a for a in (req.get("artifacts") or [])
                                           if isinstance(a, str)]:
@@ -287,7 +314,8 @@ def check_provenance_project(workdir):
                                   % (req.get("dispatch_id"), ", ".join(bad))})
 
         # ---- 3. checker 链（复用语义审读求值，含打乱血缘豁免）----
-        if has_semantic or has_pipeline:
+        # writer-only（构建前）跳过：审读证据要到合并终审才产生。
+        if mode == MODE_FULL and (has_semantic or has_pipeline):
             if evaluate is not None:
                 status, detail = evaluate(self_dir, sec, current)
             else:
@@ -326,7 +354,7 @@ def check_provenance_project(workdir):
                               "（规划链路断裂）" % (sec, qid)})
 
     return {"errors": errors, "warnings": warnings,
-            "checked": checked, "workdir": self_dir}
+            "checked": checked, "workdir": self_dir, "mode": mode}
 
 
 def main(argv=None):
@@ -335,9 +363,12 @@ def main(argv=None):
     ap.add_argument("workdir", nargs="?", default=".",
                     help="self 工作区目录（默认当前目录）")
     ap.add_argument("--json", metavar="PATH", help="写入结构化检查报告")
+    ap.add_argument("--mode", choices=MODES, default=MODE_FULL,
+                    help="full=含 checker 链（终审/交付）；"
+                         "writer-only=只查 writer 认证/写域/qid（构建前）")
     args = ap.parse_args(argv)
 
-    res = check_provenance_project(args.workdir)
+    res = check_provenance_project(args.workdir, mode=args.mode)
     errors, warnings = res["errors"], res["warnings"]
 
     report = {
@@ -351,6 +382,8 @@ def main(argv=None):
         "errors": errors,
         "warnings": warnings,
         "checked": res["checked"],
+        # 卡15：门禁档位入库，交付侧/UI 可据此识别「构建前只做 writer-only」
+        "mode": res["mode"],
     }
 
     if args.json:
@@ -373,12 +406,12 @@ def main(argv=None):
         return 1
 
     checked = res["checked"]
-    print("[check_provenance] 通过：血缘链完整（%d 节 / %d 张派发单，"
+    print("[check_provenance] 通过（模式 %s）：血缘链完整（%d 节 / %d 张派发单，"
           "认证 %d 节，checker %s）。"
-          % (len(checked["sections"]), checked["requests"],
+          % (res["mode"], len(checked["sections"]), checked["requests"],
              len(checked["certified"]),
              ",".join("%s:%s" % kv for kv in sorted(checked["checker"].items()))
-             or "无"))
+             or ("跳过（writer-only）" if res["mode"] == MODE_WRITER_ONLY else "无")))
     return 0
 
 

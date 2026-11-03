@@ -3,6 +3,7 @@ Enforces the 'one section, one author' boundary, pdstate.py start/submit/mark fl
 and main.tex assembly.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,117 @@ from .agent_nodes import build_request, write_request_file, run_dispatch
 #: 已有产物，skipped=本轮跳过（未生成也不伪装完成）；两者都不是 pending，
 #: 不得再进入派发/提交路径（否则 focused/edit 选择会被串行路径覆盖）。
 SKIPPED_STATUSES = ("reused", "skipped")
+
+#: 卡15：faithful_fast（轻量图）——批收尾只做「构建前就绪」，不跑逐节语义审读
+EXECUTION_PROFILE_FAST = "faithful_fast"
+
+
+def _is_fast_execution(state: ShrinkCoursewareState) -> bool:
+    return str(state.get("execution_profile") or "") == EXECUTION_PROFILE_FAST
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _pdstate_task_status(self_dir: str, sec: str) -> Optional[str]:
+    run_json_path = os.path.join(self_dir, ".pd", "run.json")
+    if not os.path.isfile(run_json_path):
+        return None
+    try:
+        with open(run_json_path, "r", encoding="utf-8-sig") as f:
+            rdata = json.load(f)
+        return ((rdata.get("tasks") or {}).get(sec) or {}).get("status")
+    except Exception:
+        return None
+
+
+def _fast_record_prebuild_ready(
+    state: ShrinkCoursewareState,
+    self_dir: str,
+    active_sec: str,
+    statuses: Dict[str, Any],
+    history: List[str],
+    runner: ScriptRunner,
+) -> Dict[str, Any]:
+    """faithful_fast：把候选按 pdstate 契约纳管为 produced，并记录就绪摘要。
+
+    这里**不** mark checked、**不**调语义审读——`checked` 只能由终审门禁
+    （t3_checks 的 final 趟）在合并终审全部 PASS 之后统一写入。记录的
+    ``prebuild_ready_sections[sec]`` 让作者循环知道该节已经产出且内容未变，
+    从而不会把同一节反复重写（GRAPH-04）。
+    """
+    sec_tex = os.path.join(self_dir, active_sec + ".tex")
+    digest = _sha256_file(sec_tex)
+    ready = dict(state.get("prebuild_ready_sections") or {})
+    cur_status = _pdstate_task_status(self_dir, active_sec)
+
+    reusable = (ready.get(active_sec) == digest
+                and cur_status in ("produced", "checked")
+                and statuses.get(active_sec) in ("prebuild_ready", "checked"))
+    if reusable:
+        history.append(
+            f"T2: 切片 {active_sec} 内容未变（{digest[:12]}），复用既有构建前就绪记录")
+        ready[active_sec] = digest
+        statuses[active_sec] = ("checked" if cur_status == "checked"
+                                else "prebuild_ready")
+        _sync_required_acceptance_scopes(
+            self_dir, state.get("expected_sections", [active_sec]), history)
+        return {
+            "section_statuses": statuses,
+            "prebuild_ready_sections": ready,
+            "gate_phase": "prebuild",
+            "stage": "T2_SECTIONS_STAGED",
+            "routing_action": "PROCEED",
+            "history": history,
+        }
+
+    if cur_status not in ("produced", "checked"):
+        code_sub, out_sub, err_sub = runner.run_script(
+            "pdstate.py", [self_dir, "submit", active_sec])
+        if code_sub != 0:
+            # 与 legacy 相同：先补 ready/start 再把落盘的候选正式纳管后重试
+            if cur_status is None or cur_status in ("stale", "failed",
+                                                    "blocked", "planned"):
+                _ensure_task_ready_and_start(self_dir, active_sec, runner)
+            if _import_direct_candidate(self_dir, active_sec, runner, history):
+                code_sub, out_sub, err_sub = runner.run_script(
+                    "pdstate.py", [self_dir, "submit", active_sec])
+            if code_sub != 0:
+                err_msg = (err_sub or out_sub or "submit failed").strip()
+                history.append(f"T2: 切片 {active_sec} 提交失败: {err_msg}")
+                return {
+                    "stage": "REPAIR_LOOP",
+                    "routing_action": "REPAIR_SECTION",
+                    "repair_target": active_sec,
+                    "repair_reason": f"切片提交失败: {err_msg}",
+                    "history": history,
+                }
+            history.append(
+                f"T2: pdstate.py submit {active_sec} 纳管后成功提升候选")
+        else:
+            history.append(f"T2: pdstate.py submit {active_sec} 成功提升候选")
+        digest = _sha256_file(sec_tex)
+
+    history.append(
+        f"T2: 切片 {active_sec} 构建前就绪（produced，{digest[:12]}）；"
+        f"语义审读留到合并终审")
+    ready[active_sec] = digest
+    statuses[active_sec] = "prebuild_ready"
+    _sync_required_acceptance_scopes(
+        self_dir, state.get("expected_sections", [active_sec]), history)
+    return {
+        "section_statuses": statuses,
+        "prebuild_ready_sections": ready,
+        "gate_phase": "prebuild",
+        "stage": "T2_SECTIONS_STAGED",
+        "routing_action": "PROCEED",
+        "history": history,
+    }
 
 
 def _get_next_pending_section(
@@ -94,6 +206,31 @@ def node_t2_request_sections(state: ShrinkCoursewareState) -> Dict[str, Any]:
     else:
         history.append(f"T2: pdstate.py start {active_sec} 提示: {(out_st or err_st).strip()}")
 
+    # 复盘报告 §4.3.3 内容审计前置：派发单 context 携带源侧资产计数
+    # （图/表/TikZ），验收 Agent 逐项对账，从源头消灭静默丢弃。
+    # 口径与 section_batch_nodes._source_asset_counts / check_fidelity
+    # 第 8 项资产守恒一致（复用同一函数，不得另写一套）。
+    # 惰性 import：section_batch_nodes → section_nodes 构成环，模块级
+    # import 会在 workflow 包初始化时断裂（与 semantic_nodes 同因）。
+    from .section_batch_nodes import _source_asset_counts
+
+    try:
+        source_assets = _source_asset_counts(self_dir)
+    except Exception as exc:  # fail closed：计数失败不静默下发无基线派发单
+        code = getattr(exc, "code", "SOURCE_ASSET_ERROR")
+        detail = getattr(exc, "detail", None) or str(exc) or exc.__class__.__name__
+        history.append(f"T2: 源资产计数失败 [{code}] {detail}")
+        return {
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": f"T2 源资产计数失败 [{code}]: {detail}",
+            "history": history,
+        }
+    if not source_assets.get("available"):
+        history.append(
+            "T2: 源资产清单不可用（.pd/source-manifest.json 缺失），"
+            "派发单以 available=false 空计数下发（不阻断派发，验收侧无源侧基线）")
+
     # Build dispatch request
     tex_filename = f"{active_sec}.tex"
     role_name = "开篇引入专员" if active_sec == "sec0" else f"{active_sec} 切片制作专员"
@@ -109,7 +246,8 @@ def node_t2_request_sections(state: ShrinkCoursewareState) -> Dict[str, Any]:
         command=f"python scripts/pdstate.py self/ submit {active_sec} && python scripts/pdstate.py self/ mark {active_sec} checked",
         context={
             "section_id": active_sec,
-            "user_spec": state.get("user_spec", {})
+            "user_spec": state.get("user_spec", {}),
+            "source_assets": source_assets,
         }
     )
     req_ref = write_request_file(self_dir, req)
@@ -250,13 +388,6 @@ def node_t2_submit_and_check_sections(state: ShrinkCoursewareState) -> Dict[str,
         active_sec = None
 
     if active_sec:
-        # §6：语义审读硬闸门——checker 结果是 submit 的硬前置。
-        # 缺结果 / 候选摘要过期 / schema 非法 → 补派审读（semantic_repair_target）；
-        # REVISE / NEEDS_EVIDENCE → 重派写作者返修。任何情形不得静默提交。
-        # （惰性 import：semantic_nodes → section_batch_nodes → section_nodes
-        #   构成环，模块级 import 会在 workflow 包初始化时断裂）
-        from .semantic_nodes import semantic_gate_verdict
-
         sec_tex = os.path.join(self_dir, f"{active_sec}.tex")
         if not os.path.isfile(sec_tex):
             history.append(f"T2: 切片 {active_sec}.tex 缺失，无法进入语义审读")
@@ -268,6 +399,20 @@ def node_t2_submit_and_check_sections(state: ShrinkCoursewareState) -> Dict[str,
                 "repair_reason": f"切片 {active_sec}.tex 缺失，需重新生成后才能提交",
                 "history": history
             }
+        if _is_fast_execution(state):
+            # 卡15：faithful_fast 的批收尾**不再**逐节调语义审读——只做候选纳管
+            # （produced）与构建前就绪登记；checked 与全量 semantic/provenance
+            # 由终审通过后的 final 门禁统一完成。
+            return _fast_record_prebuild_ready(
+                state, self_dir, active_sec, statuses, history, runner)
+
+        # §6：语义审读硬闸门——checker 结果是 submit 的硬前置。
+        # 缺结果 / 候选摘要过期 / schema 非法 → 补派审读（semantic_repair_target）；
+        # REVISE / NEEDS_EVIDENCE → 重派写作者返修。任何情形不得静默提交。
+        # （惰性 import：semantic_nodes → section_batch_nodes → section_nodes
+        #   构成环，模块级 import 会在 workflow 包初始化时断裂）
+        from .semantic_nodes import semantic_gate_verdict
+
         verdict, reason = semantic_gate_verdict(self_dir, active_sec)
         if verdict != "PASS":
             history.append(f"T2: 切片 {active_sec} 语义审读硬闸门未通过: {reason}")

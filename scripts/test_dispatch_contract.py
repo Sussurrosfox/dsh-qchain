@@ -26,6 +26,7 @@ from workflow.nodes.agent_nodes import (  # noqa: E402
     build_request,
     write_request_file,
     run_dispatch,
+    _interrupt_payload,
 )
 from workflow.state import ShrinkCoursewareState  # noqa: E402
 from workflow.adapters.worker_registry import worker_registry  # noqa: E402
@@ -216,6 +217,36 @@ class T06_StateFields(unittest.TestCase):
         for k in ("dispatch_plan", "batch_id", "dispatch_metrics",
                   "dispatch_history", "agent_dispatch_profile"):
             self.assertIn(k, ann)
+
+
+class T07_InterruptPayloadPolicy(unittest.TestCase):
+    """T7（卡09）：单请求中断载荷必须携带逐尝试调度策略。
+
+    批次载荷（_batch_interrupt_payload / _t4_batch_interrupt_payload）早已带
+    timeout_seconds / max_retries；单请求载荷缺这三键时，恢复侧只能吃宿主
+    默认值，超时与重试分型在派发链路首公里就丢失。
+    """
+
+    def test_t07_payload_carries_scheduling_policy(self):
+        with tempfile.TemporaryDirectory() as d:
+            kw = base_kwargs()
+            kw.update(timeout_seconds=42, max_retries=1, retry_class="contract")
+            req = build_request(make_state(d), **kw)
+            payload = _interrupt_payload(req)
+            for key in ("timeout_seconds", "max_retries", "retry_class",
+                        "input_digest"):
+                self.assertIn(key, payload, f"中断载荷缺少 {key}")
+            # 值与请求单一致（不得被静默改写为默认值）
+            self.assertEqual(payload["timeout_seconds"], 42)
+            self.assertEqual(payload["max_retries"], 1)
+            self.assertEqual(payload["retry_class"], "contract")
+            self.assertEqual(payload["input_digest"], req["input_digest"])
+            # 既有键与派发协议三件套不得被挤掉
+            self.assertEqual(payload["type"], "AGENT_DISPATCH")
+            self.assertEqual(payload["dispatch_id"], req["dispatch_id"])
+            self.assertEqual(payload["before_digests"], req["before"])
+            self.assertTrue(payload.get("dispatch_protocol"))
+            self.assertTrue(payload.get("required_tool"))
 
 
 if __name__ == "__main__":

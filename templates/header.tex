@@ -47,6 +47,12 @@
 \usetikzlibrary{arrows.meta, positioning, calc, shapes.geometric}
 \usepackage{exam-zh-choices}  % 选择题选项自动排版宏包
 \usepackage{hyperref}
+% 总页码锚点 LastPage：必须由 lastpage 宏包在 enddocument/afterlastpage 钩子
+% 里用 \protected@iwrite（\immediate\write + 全展开）落盘。历史上 footer.tex
+% 手写 \label{LastPage}，其 \write 延迟到下一次 shipout，末页已输出且其后无
+% 新页时整条写入永久丢失，页脚退化成 "1 of ??"（GR.4 教师版 22 页文档复现）。
+% lastpage 与 shipout 时机解耦，且 hyperref ≥ 2024-10-30 时写全 5 字段。
+\usepackage{lastpage}
 
 \hypersetup{
   colorlinks=true,
@@ -60,6 +66,43 @@
 % -----------------------------------------------------------------------------
 \newcommand{\quotgrp}[2]{{#1}/{#2}}
 \newcommand{\quotring}[2]{{#1}/{#2}}
+
+% -----------------------------------------------------------------------------
+% CJK 安全的数学串渲染（\fillin 答案/选项专用，修复“选项空白”缺陷）
+%
+% 背景：\fillin 的答案与选项参数按“数学语境”书写（如 N_G(H) \le C_G(H)），
+%   因此统一交给 \ensuremath 排版。但实际数据里大量参数混有汉字（如“未必重合”
+%   “逐点不动”“且不相等”）。汉字进入数学模式后不在数学字体中，xeCJK 也不会
+%   在数学模式里接管断字，于是触发 "Missing character" 并整体留白 —— PDF 上
+%   的选项/答案因此成片空白。
+%
+% 方案：\pdCJKTextWrap 用 l3regex 把“连续汉字段”就地包进 \text{...}（数学模式
+%   下切回文本模式，走 CJK 字体），其余字符原样保留并继续按数学排版。由此
+%   纯数学 / 纯汉字 / 中英数混排三种参数都能正确出字形。
+% -----------------------------------------------------------------------------
+\ExplSyntaxOn
+\regex_const:Nn \c_pd_cjk_run_re
+  { ([\x{2E80}-\x{2FFF}\x{3000}-\x{303F}\x{3040}-\x{30FF}\x{3400}-\x{4DBF}\x{4E00}-\x{9FFF}\x{F900}-\x{FAFF}\x{FE30}-\x{FE4F}\x{FF00}-\x{FFEF}]+) }
+\tl_new:N \l_pd_cjkwrap_tl
+\NewDocumentCommand{\pdCJKTextWrap}{m}
+  {
+    \tl_set:Nn \l_pd_cjkwrap_tl {#1}
+    \regex_replace_all:NnN \c_pd_cjk_run_re { \c{text}\cB\{\1\cE\} } \l_pd_cjkwrap_tl
+    \tl_use:N \l_pd_cjkwrap_tl
+  }
+\ExplSyntaxOff
+
+% -----------------------------------------------------------------------------
+% 断行容错（GR.4 复盘）：\emergencystretch
+% 背景：本模板正文是「汉字 + 行内公式 + \fillin 不可断盒」的高密度混排。汉字之间
+%   没有可伸长的胶水，一旦某行剩余空间容纳不下紧随其后的 \fillin 盒（或长公式），
+%   TeX 在每个合法断点上都凑不出所需伸长量（换行后该行会松到超出 \tolerance），
+%   于是宁可整行溢出——GR.4 教师版 33.4pt / 15.2pt 两处残余 Overfull 即此机制：
+%   断点其实都有，但换行代价比溢出更大。
+% 方案：给应急断行轮追加 3em 伸长量。应急轮仅在"本来要 overfull"时才参与决策，
+%   正常段落仍由首轮/次轮定稿，故不会普遍性拉松版面，只把"溢出"降级为"稍松"。
+% -----------------------------------------------------------------------------
+\emergencystretch=3em
 
 % -----------------------------------------------------------------------------
 % 统计计数器（编译后输出环境使用摘要，便于验收与排错）
@@ -85,17 +128,43 @@
 % 硬检查（至少 3 个选项、参考答案必须是选项之一、选项不得重复）。
 % \fillin 本体为 o m o 三参数宏（见下方双版本定义）：可选答案、必选宽度、
 % 可选选项；\newcommand 只能给一个可选缺省，故选项参数由 \IfNoValueTF 判定。
+%
+% 断行修复（GR.4 复盘）：选项组曾整组塞进 \text{...}——\text 是不可断行盒，
+% 选项组一旦落在行末就整组越界（teacher.log 实测最多 172.8pt ≈ 6cm 溢出栏外）。
+% 现按 / 拆成单项、以 \text{/}\allowbreak 连接，选项组即可在选项之间的 / 处
+% 断行；单项仍各自 \ensuremath + \pdCJKTextWrap，数学/汉字混排出字形不受影响。
+% 注意 1：括号也不得再包进同一个 \text{...}（否则整组又变成不可断行盒）。
+% 注意 2：mmode 分支的 \text{\small...（} 之前必须再给一个 \allowbreak——
+% 选项组紧跟 \fillin 的 \underline{\makebox[..]} 不可断盒，其与左括号之间
+% 原本没有任何合法断点，TeX 只能把首项硬塞进行内（实测 40.9pt 溢出）。
+% 有了这个断点，整组即可整体下移，与 text 模式的词间空格断点对齐。
 % -----------------------------------------------------------------------------
-\newcommand{\pdFillinOptions}[1]{%
+\ExplSyntaxOn
+\seq_new:N \l_pd_opt_split_seq
+\tl_new:N \l_pd_opt_body_tl
+\bool_new:N \l_pd_opt_first_bool
+\NewDocumentCommand{\pdFillinOptions}{m}{%
   \if\relax\detokenize{#1}\relax
     \PackageWarning{problem-driven}{\protect\fillin\space 未配置选项（第 \thepdFillinCount\space 处，选择题化填空须提供 [选项1/选项2/选项3]）}%
   \else
+    \seq_set_split:Nnn \l_pd_opt_split_seq { / } { #1 }
+    \tl_clear:N \l_pd_opt_body_tl
+    \bool_set_true:N \l_pd_opt_first_bool
+    \seq_map_inline:Nn \l_pd_opt_split_seq
+      {
+        \bool_if:NTF \l_pd_opt_first_bool
+          { \bool_set_false:N \l_pd_opt_first_bool }
+          { \tl_put_right:Nn \l_pd_opt_body_tl { \text{/}\allowbreak } }
+        \tl_put_right:Nn \l_pd_opt_body_tl { \ensuremath{\pdCJKTextWrap{##1}} }
+      }
     \ifmmode
-      \text{\ {\small\color{black!65}（\ensuremath{#1}）}}%
+      \allowbreak\text{\small\color{black!65}\ （}\tl_use:N \l_pd_opt_body_tl
+        \text{\small\color{black!65}）}%
     \else
-      \ {\small\color{black!65}（\ensuremath{#1}）}%
+      \ {\small\color{black!65}（\tl_use:N \l_pd_opt_body_tl）}%
     \fi
-  \fi}%
+  \fi}
+\ExplSyntaxOff
 
 \ifdefined\TeacherVersion
   % ============================ 教师版环境配置 ============================
@@ -162,18 +231,18 @@
          \underline{\hspace{#2}}%
        \else
          \ifmmode
-           \settowidth{\fillinwidth}{\mbox{\boldmath$#1$}}%
+           \settowidth{\fillinwidth}{\mbox{\boldmath$\pdCJKTextWrap{#1}$}}%
            \ifdim\fillinwidth>#2
-             \underline{\hspace{0.5em}{\color{blue!85!black}\mbox{\boldmath$#1$}}\hspace{0.5em}}%
+             \underline{\hspace{0.5em}{\color{blue!85!black}\mbox{\boldmath$\pdCJKTextWrap{#1}$}}\hspace{0.5em}}%
            \else
-             \underline{\makebox[#2][c]{\color{blue!85!black}\mbox{\boldmath$#1$}}}%
+             \underline{\makebox[#2][c]{\color{blue!85!black}\mbox{\boldmath$\pdCJKTextWrap{#1}$}}}%
            \fi
          \else
-           \settowidth{\fillinwidth}{\bfseries\ensuremath{#1}}%
+           \settowidth{\fillinwidth}{\bfseries\ensuremath{\pdCJKTextWrap{#1}}}%
            \ifdim\fillinwidth>#2
-             \underline{\hspace{0.5em}\textbf{\color{blue!85!black}\ensuremath{#1}}\hspace{0.5em}}%
+             \underline{\hspace{0.5em}\textbf{\color{blue!85!black}\ensuremath{\pdCJKTextWrap{#1}}}\hspace{0.5em}}%
            \else
-             \underline{\makebox[#2][c]{\bfseries\color{blue!85!black}\ensuremath{#1}}}%
+             \underline{\makebox[#2][c]{\bfseries\color{blue!85!black}\ensuremath{\pdCJKTextWrap{#1}}}}%
            \fi
          \fi
        \fi}%

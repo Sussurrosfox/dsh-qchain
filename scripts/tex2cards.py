@@ -27,6 +27,7 @@ qchain-html（题链 HTML）流水线的“填写规范”机器侧：把 sec*.t
 退出码: 0=解析完成（issues 可能含提示）, 1=解析失败（输入缺失/结构错误）。
 """
 import argparse
+import contextvars
 import json
 import os
 import re
@@ -38,7 +39,13 @@ for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import asset_bundle  # noqa: E402
 import check_numbering  # noqa: E402
+
+#: 当前正在解析的项目目录；includegraphics 据此用 asset_bundle.image_asset
+#: 生成与复制端一致的“内容哈希”图片 URL（无上下文时回退旧的 basename 映射）。
+_CURRENT_PROJECT = contextvars.ContextVar("qchain_current_project",
+                                          default=None)
 
 DECK_SCHEMA = "qchain-html-deck/1"
 
@@ -157,6 +164,161 @@ def html_escape(s):
 
 
 # ---------------------------------------------------------------------------
+# 块级结构预处理：center / tabular 等“非卡片环境” → HTML
+#
+# 背景（修复缺陷：HTML 卡片出现 “center tabularc|cc … \hline” 之类压平乱码）：
+#   卡片状态机只认识 BLOCK_ENVS 内的环境；\begin{center} 与 \begin{tabular}
+#   不在其中，会被当作普通行内文本流交给 inline_to_html —— 环境名与列格式
+#   参数被当成正文文本吐出来，表格对齐信息全部丢失。
+# 处理：解析前机械转换 —
+#   center  → 透明容器（只删壳，内容照旧）
+#   tabular → <table class="qc-table">，单元格仍走 inline_to_html
+#             （因此单元格内的 $...$ 依旧由 KaTeX 渲染）
+# 转换结果以 \qrawhtml{...} 占位符回填，并补齐等量空行以维持行号可追溯。
+# ---------------------------------------------------------------------------
+RE_CENTER_TOKENS = re.compile(r"\\(?:begin|end)\s*\{center\}")
+RE_TABULAR_BEGIN = re.compile(r"\\begin\s*\{tabular\}")
+RE_TABULAR_END = re.compile(r"\\end\s*\{tabular\}")
+
+
+def _table_col_count(spec):
+    r"""{c|cc} → 3；无法识别列格式时按 1 列保守处理。"""
+    return max(1, sum(1 for ch in spec if ch in "lcrX"))
+
+
+def _table_cells(row):
+    r"""按顶层 & 切分单元格（花括号内与转义 & 不切）。"""
+    cells, cur, depth, i, n = [], [], 0, 0, len(row)
+    while i < n:
+        c = row[i]
+        if c == "\\":
+            cur.append(row[i:i + 2])
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+        elif c == "&" and depth == 0:
+            cells.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    cells.append("".join(cur))
+    return [c.strip() for c in cells]
+
+
+def _tabular_to_html(spec, body):
+    r"""把 tabular 的环境体转成一行 <table> HTML（不含换行）。"""
+    ncol = _table_col_count(spec)
+    ctx = InlineCtx("table")
+    rows = []
+    first = True
+    for raw in re.split(r"\\\\", body):
+        row = raw.strip()
+        rule = False
+        while row:
+            if row.startswith("\\hline"):
+                rule = True
+                row = row[len("\\hline"):].strip()
+                continue
+            if row.endswith("\\hline"):
+                rule = True
+                row = row[:-len("\\hline")].strip()
+                continue
+            break
+        if not row:
+            if rule and rows:
+                rows.append('<tr class="qc-tr-rule"><td colspan="%d"></td></tr>'
+                            % ncol)
+            continue
+        cells = _table_cells(row)
+        cls = ' class="qc-tr-head"' if first else ""
+        first = False
+        tds = "".join("<td>%s</td>" % inline_to_html(c, ctx) for c in cells)
+        rows.append("<tr%s>%s</tr>" % (cls, tds))
+    if not rows:  # 兜底：解析失败时按源码文本呈现，内容不丢失
+        return html_escape(body.strip())
+    return ('<div class="qc-table-wrap"><table class="qc-table">%s</table></div>'
+            % "".join(rows))
+
+
+def rawhtml_wrap(html):
+    r"""把已转换完成的 HTML 片段包成 \qrawhtml{...} 占位符。
+
+    用于“已渲染内容回灌文本缓冲区”的场景（如子列表 <ol> 要挂到父层
+    题解缓冲区），避免缓冲区整体再做一次 inline_to_html 时被二次转义。
+    花括号转义为实体，解开时还原，保证占位符配对扫描安全。
+    """
+    return "\\qrawhtml{%s}" % html.replace("&#123;", "{").replace(
+        "&#125;", "}").replace("{", "&#123;").replace("}", "&#125;")
+
+
+def _unwrap_rawhtml(s):
+    r"""递归解开 \qrawhtml{...} 占位符，返回纯 HTML。"""
+    if "\\qrawhtml" not in s:
+        return s.replace("&#123;", "{").replace("&#125;", "}")
+    out, i, n = [], 0, len(s)
+    while i < n:
+        j = s.find("\\qrawhtml", i)
+        if j < 0:
+            out.append(s[i:])
+            break
+        out.append(s[i:j])
+        k = j + len("\\qrawhtml")
+        while k < n and s[k] in " \t\n":
+            k += 1
+        if k < n and s[k] == "{":
+            k2, payload, ok = scan_brace(s, k)
+            if ok:
+                out.append(_unwrap_rawhtml(payload))
+                i = k2
+                continue
+        out.append(s[j])
+        i = j + 1
+    return "".join(out)
+
+
+
+def normalize_block_structures(lines):
+    r"""把 center / tabular 环境转成等价 HTML（返回等长行列表）。
+
+    行数严格保持不变：被折叠的多行以空行补齐，source 行号因此仍可追溯。
+    """
+    text = "\n".join(lines)
+    if "\\begin{tabular}" not in text and "\\begin{center}" not in text:
+        return lines
+    parts, i = [], 0
+    while True:
+        m = RE_TABULAR_BEGIN.search(text, i)
+        if not m:
+            parts.append(text[i:])
+            break
+        parts.append(text[i:m.start()])
+        k = m.end()
+        while k < len(text) and text[k] in " \t\n":
+            k += 1
+        spec = ""
+        if k < len(text) and text[k] == "{":
+            k2, spec, ok = scan_brace(text, k)
+            if ok:
+                k = k2
+        me = RE_TABULAR_END.search(text, k)
+        if not me:  # 未闭合：原样保留，交由后续流程报错
+            parts.append(text[m.start():])
+            break
+        payload = _tabular_to_html(spec, text[k:me.start()])
+        span_nl = text.count("\n", m.start(), me.end())
+        parts.append("%s%s" % (rawhtml_wrap(payload), "\n" * span_nl))
+        i = me.end()
+    text = "".join(parts)
+    text = RE_CENTER_TOKENS.sub("", text)
+    return text.split("\n")
+
+
+# ---------------------------------------------------------------------------
 # 行内 TeX → HTML 转换（数学段原样保留，由前端 KaTeX 渲染）
 # ---------------------------------------------------------------------------
 SIMPLE_MACROS = {
@@ -197,6 +359,115 @@ def _find_math_end(text, i):
     return -1
 
 
+# ---------------------------------------------------------------------------
+# 数学段增强：展示宏展开 + 中英混排安全化 + 数学段内嵌 \fillin 拆分
+#
+# 背景（修复缺陷：HTML 卡片出现大段未渲染源码，观感等同“乱码”）：
+#   1) 切片可用导言区自定义的纯展示宏（如 \quotgrp{A}{B}）来规避 \fillin
+#      选项切分符；这些宏只存在于 LaTeX 导言区，KaTeX 不认识 → 整个数学段
+#      渲染报错，页面上留下未渲染的源码。
+#   2) 数学段里可能混入汉字（如 $\sim_l \subseteq \sim_r 且不相等$）。KaTeX
+#      不允许数学模式出现裸汉字 → 同样整段失败。
+#   3) 形如 $Hr = \fillin[...]{2.6cm}[...]$ 的“数学段内嵌填空”会被整段当作
+#      一个公式，\fillin 未定义 → 公式与交互槽位一起丢失。
+# ---------------------------------------------------------------------------
+# 纯展示宏 → 展开为普通 TeX（宏名 → 参数个数）
+PRESENTATION_MACROS = {
+    "quotgrp": 2, "quotring": 2,
+}
+# 汉字/全角标点连续段（用于包 \text{}）
+CJK_RUN_RE = re.compile(
+    "[\u2e80-\u2fff\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf"
+    "\u4e00-\u9fff\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]+")
+# 已处于文本模式的宏：其花括号内容不再二次包装
+TEXT_SAFE_MACROS = ("text", "textrm", "textbf", "textit", "textsf",
+                    "texttt", "mbox", "hbox")
+
+
+def expand_presentation_macros(s):
+    r"""把 \quotgrp{A}{B} 之类的纯展示宏展开成 {A}/{B} 等普通 TeX。"""
+    if "\\" not in s:
+        return s
+    out, i, n = [], 0, len(s)
+    while i < n:
+        if s[i] != "\\":
+            out.append(s[i])
+            i += 1
+            continue
+        m = RE_CTRL.match(s, i)
+        if m and m.group(1) in PRESENTATION_MACROS:
+            name = m.group(1)
+            k, args, ok = m.end(), [], True
+            for _ in range(PRESENTATION_MACROS[name]):
+                while k < n and s[k] in " \t\n":
+                    k += 1
+                if k < n and s[k] == "{":
+                    k, a, closed = scan_brace(s, k)
+                    if not closed:
+                        ok = False
+                        break
+                    args.append(a)
+                else:
+                    ok = False
+                    break
+            if ok:
+                out.append("/".join("{%s}" % a for a in args))
+                i = k
+                continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def cjk_safe_math(s):
+    r"""数学段内裸汉字包成 \text{...}（KaTeX 文本模式可渲染汉字）。"""
+    if not CJK_RUN_RE.search(s):
+        return s
+    out, i, n = [], 0, len(s)
+    while i < n:
+        if s[i] == "\\":
+            m = RE_CTRL.match(s, i)
+            if m and m.group(1) in TEXT_SAFE_MACROS:
+                out.append(s[i:m.end()])
+                k = m.end()
+                while k < n and s[k] in " \t\n":
+                    out.append(s[k])
+                    k += 1
+                if k < n and s[k] == "{":
+                    k2, body, ok = scan_brace(s, k)
+                    if ok:
+                        # 已在文本模式内，内容原样保留（不再包装）
+                        out.append("{" + body + "}")
+                        i = k2
+                        continue
+                i = k
+                continue
+            out.append(s[i:i + 2] if m is None else s[i:m.end()])
+            i = i + 2 if m is None else m.end()
+            continue
+        mc = CJK_RUN_RE.match(s, i)
+        if mc:
+            out.append("\\text{" + mc.group(0) + "}")
+            i = mc.end()
+            continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def math_prepare(raw):
+    r"""数学段正文预处理（与定界符 $ 无关）：先展开展示宏，再兜住裸汉字。"""
+    return cjk_safe_math(expand_presentation_macros(raw))
+
+
+def math_span_html(body, display=False):
+    r"""把数学正文包成 qc-math span（正文经 math_prepare 预处理）。"""
+    dl = "$$" if display else "$"
+    cls = "qc-math qc-math-display" if display else "qc-math"
+    return '<span class="%s">%s</span>' % (
+        cls, html_escape(dl + math_prepare(body) + dl))
+
+
 class InlineCtx:
     """行内转换上下文：登记槽位/图片/提示。"""
 
@@ -230,27 +501,29 @@ def inline_to_html(text, ctx):
                 out.append(html_escape(text[i:]))
                 ctx.issues.append("未闭合的数学定界符 $（按源码文本呈现）")
                 break
-            inner = text[i:j + 1]
-            cls = "qc-math"
-            if inner.startswith("$$"):
-                cls += " qc-math-display"
-            out.append('<span class="%s">%s</span>' % (cls, html_escape(inner)))
-            i = j + 1
+            display = text[i:i + 2] == "$$"
+            dlen = 2 if display else 1
+            body = text[i + dlen:j]
+            if "\\fillin" in body:
+                # 数学段内嵌填空：必须拆成 数学段 + 交互槽位 + 数学段
+                out.append(split_math_fillin(body, ctx, display))
+            else:
+                out.append(math_span_html(body, display))
+            i = j + dlen
             continue
         if c == "\\":
             # LaTeX 定界数学：\[ ... \] 与 \( ... \)
             if text[i:i + 2] == "\\[":
                 j = text.find("\\]", i + 2)
                 if j >= 0:
-                    out.append('<span class="qc-math qc-math-display">$$%s$$</span>'
-                               % html_escape(text[i + 2:j]))
+                    # 四种定界符统一经 math_prepare（展示宏展开 + 汉字兜底）
+                    out.append(math_span_html(text[i + 2:j], True))
                     i = j + 2
                     continue
             if text[i:i + 2] == "\\(":
                 j = text.find("\\)", i + 2)
                 if j >= 0:
-                    out.append('<span class="qc-math">$%s$</span>'
-                               % html_escape(text[i + 2:j]))
+                    out.append(math_span_html(text[i + 2:j], False))
                     i = j + 2
                     continue
             m = RE_CTRL.match(text, i)
@@ -318,6 +591,33 @@ def inline_to_html(text, ctx):
                         continue
                 ctx.issues.append("\\ansspace 缺少高度参数")
                 continue
+            if name == "qrawhtml":
+                # 块级预处理（表格等）产出的已转换 HTML 片段，原样输出。
+                # 允许嵌套（列表嵌套时内层占位符会随外层一起被包裹），
+                # 故递归解开，避免二次转义（&amp;lt;span…&gt; 之类乱码）。
+                k = i
+                while k < n and text[k] in " \t\n":
+                    k += 1
+                if k < n and text[k] == "{":
+                    k, payload, ok = scan_brace(text, k)
+                    if ok:
+                        out.append(_unwrap_rawhtml(payload))
+                        i = k
+                        continue
+                ctx.issues.append("\\qrawhtml 缺少花括号参数")
+                continue
+            if name == "mbox":
+                # \mbox{} 常用于“撑高行/占位”，内容透明输出
+                k = i
+                while k < n and text[k] in " \t\n":
+                    k += 1
+                if k < n and text[k] == "{":
+                    k, inner, ok = scan_brace(text, k)
+                    if ok:
+                        out.append(inline_to_html(inner, ctx))
+                        i = k
+                        continue
+                continue
             if name == "includegraphics":
                 k = i
                 while k < n and text[k] in " \t\n":
@@ -335,9 +635,15 @@ def inline_to_html(text, ctx):
                     if ok:
                         ctx.images.add(path.strip())
                         base = os.path.basename(path.strip())
-                        out.append('<img class="qc-img" src="assets/%s" '
+                        proj = _CURRENT_PROJECT.get()
+                        if proj:
+                            url = asset_bundle.image_asset(
+                                proj, path.strip())["url"]
+                        else:
+                            url = "assets/" + base
+                        out.append('<img class="qc-img" src="%s" '
                                    'alt="%s" loading="lazy">'
-                                   % (html_escape(base), html_escape(base)))
+                                   % (html_escape(url), html_escape(base)))
                         i = k
                         continue
                 ctx.issues.append("\\includegraphics 缺少路径参数")
@@ -363,8 +669,7 @@ def inline_to_html(text, ctx):
                 if k < n and text[k] == "{":
                     k, inner, ok = scan_brace(text, k)
                     if ok:
-                        out.append('<span class="qc-math">$\\%s{%s}$</span>'
-                                   % (name, html_escape(inner)))
+                        out.append(math_span_html("\\%s{%s}" % (name, inner), False))
                         i = k
                         continue
                 ctx.issues.append("\\%s 缺少花括号参数" % name)
@@ -434,6 +739,51 @@ def inline_to_html(text, ctx):
     return "".join(out)
 
 
+def split_math_fillin(body, ctx, display=False):
+    r"""拆分“数学段内嵌 \fillin”：数学正文 → 槽位 HTML → 数学正文…
+
+    典型写法 $Hr = \fillin[{...}]{2.6cm}[...]$：\fillin 不是数学命令，
+    整段交给 KaTeX 会报未定义命令并使公式与槽位同时丢失，故按顶层
+    \fillin 位置切分（花括号深度 0 处才算顶层）。
+    """
+    out = []
+    seg_start = 0
+    i, n, depth = 0, len(body), 0
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            m = RE_CTRL.match(body, i)
+            if m and m.group(1) == "fillin" and depth == 0:
+                seg = body[seg_start:i]
+                if seg.strip():
+                    out.append(math_span_html(seg, display))
+                i, slot_html = _convert_fillin(body, m.end(), ctx)
+                out.append(slot_html)
+                seg_start = i
+                continue
+            i = m.end() if m else i + 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+        i += 1
+    tail = body[seg_start:]
+    if tail.strip():
+        out.append(math_span_html(tail, display))
+    return "".join(out)
+
+
+def _option_html(opt, ctx):
+    r"""\fillin 选项呈现：以数学语境书写的选项走 KaTeX，纯文本走行内转换。"""
+    s = opt.strip()
+    if not s:
+        return ""
+    if "$" not in s and "\\" in s:
+        return math_span_html(s)
+    return inline_to_html(s, ctx)
+
+
 def _convert_fillin(text, i, ctx):
     r"""解析 \fillin[答案]{宽度}[选项...] 并生成交互槽位 HTML。
 
@@ -484,7 +834,7 @@ def _convert_fillin(text, i, ctx):
             correct = "true" if (ans_norm and norm_opt(o) == ans_norm) else "false"
             parts.append(
                 '<button type="button" class="qc-option" data-correct="%s">%s'
-                '</button>' % (correct, inline_to_html(o, ctx)))
+                '</button>' % (correct, _option_html(o, ctx)))
         parts.append("</span>")
     parts.append("</span>")
     return k, "".join(parts)
@@ -499,7 +849,7 @@ class SecParser:
     def __init__(self, sec_name, lines, seq_base=0):
         self.sec = sec_name
         self.lines = lines
-        self.masked = mask_comments(lines)
+        self.masked = normalize_block_structures(mask_comments(lines))
         self.cards = []
         self.issues = []
         self.in_probchain = False
@@ -649,13 +999,29 @@ class SecParser:
             if item is None:
                 return
             meta["cur_item"] = None
-            card = meta.get("card") or {}
-            ctx = InlineCtx(card.get("id", "item"))
+            # 槽位归属：items_mode（知识/结论卡列表）→ 该卡片；
+            # 题内 \item 子列表（sec1-05/sec3-08 的"选代表元试算" bullet）
+            # → 当前题目卡。二者都必须把 ctx.slots 回灌，否则 HTML 渲染出
+            # 选项组而 cards.json 牌组不登记 → check_html「选项组 69 个与
+            # 牌组槽位 66 个不一致」，且 data-slot 退化为重复的 item-sN。
+            card = meta.get("card")
+            if card is not None:
+                owner_id = card.get("id") or "item"
+                slot_list = card.setdefault("slots", [])
+            else:
+                q = self.cur_question
+                owner_id = q["id"] if q else "item"
+                slot_list = q["slots"] if q is not None else None
+            ctx = InlineCtx(owner_id,
+                            len(slot_list) if slot_list is not None else 0)
             html = inline_to_html("".join(item["buf"]).strip(), ctx)
             for msg in ctx.issues:
                 self.issues.append("%s:%s(item): %s" % (self.sec, item.get(
                     "line", "?"), msg))
             meta.setdefault("items", []).append(html)
+            if slot_list is not None:
+                for s in ctx.slots:
+                    slot_list.append(s)
 
         prev_end = 0
         for m in RE_TOKEN.finditer(text):
@@ -772,7 +1138,12 @@ class SecParser:
                             q["slots"].append(s)
                 elif meta.get("parts"):
                     close_cur_part(fr, fr[1])
-                    self.stem_open = False  # 子题列表结束 → 题干区关闭
+                    # 题干区保持开放：嵌套子题列表只是当前题目题干的一部分，
+                    # \end{enumerate} 之后到下一个 \item 之前的文本仍是题干
+                    # 续文（含 \ansspace 与 \fillin）。曾在此处无条件
+                    # stem_open=False，导致续文被降级成题间引导、其中的
+                    # \fillin 槽位不登记（HTML 渲染出选项组而 cards.json
+                    # 无槽位 → check_html 槽位契约不一致，属静默内容丢失）。
                 elif meta.get("items_mode") or meta.get("list"):
                     close_cur_item(fr)
                     self._flush_list(fr, stack)
@@ -780,12 +1151,15 @@ class SecParser:
                     card = meta.get("card")
                     if card is not None and not card.get("items_html") \
                             and content.strip():
-                        ctx = InlineCtx(card["id"])
+                        ctx = InlineCtx(card["id"],
+                                        len(card.get("slots", [])))
                         card["body_html"] = inline_to_html(content.strip(),
                                                           ctx)
                         for msg in ctx.issues:
                             self.issues.append("%s:%d: %s"
                                                % (self.sec, fr[1], msg))
+                        for s in ctx.slots:
+                            card.setdefault("slots", []).append(s)
                 elif meta.get("probchain"):
                     self.finalize_question(fr[1])
                     self.in_probchain = False
@@ -927,17 +1301,21 @@ class SecParser:
         if meta.get("items_mode") and card is not None:
             card["items_html"].extend(items)
             return
+        # 已渲染 HTML 回灌文本缓冲区：必须走 rawhtml 占位符，否则父层收尾时
+        # 会对整段再做一次 inline_to_html → 二次转义，页面上出现
+        # “&lt;span class="qc-math"&gt;” 之类的可见乱码（本缺陷即由此产生）。
+        raw = rawhtml_wrap(_unwrap_rawhtml(html))
         parent = stack[-1] if stack else None
         if parent is not None:
             pmeta = parent[3]
             if pmeta.get("cur_part") is not None:
-                pmeta["cur_part"]["buf"].append(html)
+                pmeta["cur_part"]["buf"].append(raw)
             elif pmeta.get("cur_item") is not None:
-                pmeta["cur_item"]["buf"].append(html)
+                pmeta["cur_item"]["buf"].append(raw)
             else:
-                parent[2].append(html)
+                parent[2].append(raw)
         else:
-            self.pending_lead.append(html)
+            self.pending_lead.append(raw)
 
 
 def _part_label(n):
@@ -990,6 +1368,14 @@ def load_main_title(project):
 
 def parse_project(project):
     """解析项目目录 → (deck dict, issues list)。"""
+    token = _CURRENT_PROJECT.set(os.path.abspath(project))
+    try:
+        return _parse_project(project)
+    finally:
+        _CURRENT_PROJECT.reset(token)
+
+
+def _parse_project(project):
     project = os.path.abspath(project)
     secs = sec_inputs(project)
     issues = []

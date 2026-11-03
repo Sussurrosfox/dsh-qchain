@@ -132,12 +132,15 @@ def write_scope_record(self_dir, sec, conclusion="PASS", qids=None, digest=None,
                        pdf_sha=None, html_sha=None, stage1=None, stage2=None,
                        issues=None, drop_key=None,
                        scope_digest=None, chapter_digest=None,
-                       rule_version=None):
+                       rule_version=None, macro_digest=None):
     """按 prompts/acceptance_prompt.md 的 schema 写一份切片验收记录。
 
     scope_digest / chapter_digest / rule_version：任务6 复用绑定字段
     （生产里由主控 _stamp_review_provenance 盖章，测试直接写入以构造
     「上一轮已验收」场景）。
+    macro_digest：任务16（C7）宏/模板语义绑定字段——复审规则 1.1 起，
+    缺这一项的记录一律视为「宏语义已变更」而失效，因此构造合规历史记录时
+    必须给出（生产同样由 _stamp_review_provenance 盖章）。
     """
     if digest is None:
         digest = evidence.content_digest(evidence.collect_inputs(self_dir))
@@ -172,6 +175,8 @@ def write_scope_record(self_dir, sec, conclusion="PASS", qids=None, digest=None,
         rec["chapter_digest"] = chapter_digest
     if rule_version is not None:
         rec["review_rule_version"] = rule_version
+    if macro_digest is not None:
+        rec["macro_semantic_digest"] = macro_digest
     path = os.path.join(self_dir, ".pd", "acceptance", f"{sec}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rec, f, ensure_ascii=False, indent=2)
@@ -564,24 +569,53 @@ class TestT05JoinParallel(T04Base):
         self.assertTrue(any("汇总结论 PASS" in h for h in patch["history"]))
 
     def test_t05b_under_parallelism_halts(self):
-        """audit §6 硬门禁：池全 ok 但 max_in_flight < min_parallelism → 禁止伪装完成。"""
+        """任务21（C12.4）：T4 低峰值也只警告，不得据此返修学案。
+
+        历史缺陷：池全 ok 但 max_in_flight < min_parallelism → HALT
+        「禁止伪装完成」，会让合法低峰值（单请求/缓存命中/依赖/宿主限流）
+        变成对正文的误伤。
+        """
         state = self._prepared()
         requests = self.requests_of(state)
         for req in requests:
             write_scope_record(state["self_dir"], req["scope"])
-        # 2 个 scope → min_parallelism=2；伪造实际并发 1
         pool = FakePool({r["dispatch_id"]: ok_result(r) for r in requests},
                         deferred=0, max_in_flight=1)
         self.run_dispatch(state, pool)
         with mock.patch.object(t4nodes, "_live_pool", lambda *a, **k: pool):
             patch = t4nodes.node_t4_join_review(state)
 
-        self.assertEqual(patch["stage"], "HALTED")
-        self.assertEqual(patch["routing_action"], "HALT")
-        self.assertIn("禁止伪装完成", patch["error_message"])
-        # 聚合不得发生：chapter.json 不存在
-        self.assertFalse(os.path.isfile(os.path.join(
+        self.assertEqual(patch["stage"], "T4_ACCEPTANCE_PENDING")
+        self.assertEqual(patch["routing_action"], "PROCEED")
+        metrics = patch["dispatch_metrics"]
+        self.assertEqual(metrics["max_in_flight"], 1)
+        self.assertEqual(metrics["max_in_flight_source"], "worker_pool_stats")
+        warning = metrics["parallelism_warning"]
+        self.assertEqual(warning["code"], "PARALLELISM_BELOW_DECLARED")
+        self.assertEqual(warning["observed"], 1)
+        self.assertIs(warning["content_rework_allowed"], False)
+        # 聚合照常发生（低峰值不是内容问题）
+        self.assertTrue(os.path.isfile(os.path.join(
             state["self_dir"], ".pd", "acceptance", "chapter.json")))
+
+    def test_t05c_peak_over_cap_halts(self):
+        """cap 越界仍属正确性阻断（并发越界）。"""
+        state = self._prepared()
+        requests = self.requests_of(state)
+        for req in requests:
+            write_scope_record(state["self_dir"], req["scope"])
+        plan = dict(state["dispatch_plan"])
+        plan["max_concurrency"] = 1
+        plan["min_parallelism"] = 1
+        state["dispatch_plan"] = plan
+        pool = FakePool({r["dispatch_id"]: ok_result(r) for r in requests},
+                        deferred=0, max_in_flight=2)
+        self.run_dispatch(state, pool)
+        with mock.patch.object(t4nodes, "_live_pool", lambda *a, **k: pool):
+            patch = t4nodes.node_t4_join_review(state)
+
+        self.assertEqual(patch["stage"], "HALTED")
+        self.assertIn("并发越界", patch["error_message"])
 
 
 class TestT06JoinParallelRevise(T04Base):
@@ -985,6 +1019,7 @@ class TestT12ScopeReuse(T04Base):
                       t4nodes._scope_content_digest(self_dir, sec))
         kw.setdefault("chapter_digest", chapter_digest)
         kw.setdefault("rule_version", t4nodes.REVIEW_RULE_VERSION)
+        kw.setdefault("macro_digest", t4nodes._current_macro_digest(self_dir))
         return write_scope_record(self_dir, sec, **kw)
 
     def test_t12_all_scopes_reused_zero_dispatch(self):

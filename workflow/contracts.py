@@ -42,6 +42,26 @@ CONTRACT_REL = os.path.join(".pd", "intent-contract.json")
 CONTENT_POLICIES = ("faithful", "authoring")
 DEFAULT_CONTENT_POLICY = "faithful"
 
+#: 任务10（C1）：执行契约冻结元数据字段（与 workflow/execution_policy.py 的
+#: FROZEN_FIELDS 同序）。此处独立声明，避免 contracts 反向依赖执行策略模块。
+EXECUTION_FROZEN_FIELDS = (
+    "execution_schema_version",
+    "execution_profile",
+    "graph_version",
+    "policy_digest",
+    "execution_config",
+)
+
+#: 任务19（C12）：派发契约冻结字段。与执行契约同批写入 intent-contract.json 的
+#: ``dispatch`` 子块；旧契约没有该块时一律按 legacy 派发契约（版本 1）处理，
+#: 因此这里绝不能并入 EXECUTION_FROZEN_FIELDS（否则旧契约会被判为不完整）。
+DISPATCH_FROZEN_FIELDS = (
+    "dispatch_contract_version",
+    "profile",
+    "configured_concurrency",
+    "concurrency_source",
+)
+
 #: 已生成文件/中间稿的构建副产物后缀（不得作为 source-baseline）
 GENERATED_SUFFIXES = (
     ".pdf", ".html", ".aux", ".log", ".out", ".synctex", ".synctex.gz",
@@ -239,11 +259,23 @@ def build_source_manifest(*, project_root: str, self_dir: str = "",
     return manifest
 
 
-def build_intent_contract(*, user_spec: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def build_intent_contract(*, user_spec: Optional[Dict[str, Any]],
+                          execution: Optional[Dict[str, Any]] = None,
+                          dispatch: Optional[Dict[str, Any]] = None
+                          ) -> Dict[str, Any]:
     """构建冻结的 intent-contract（audit §4.2/§18.3）。
 
     self_study / lesson_minutes / 137 分钟 core 等值在此冻结，下游 Agent
     不得推断或覆盖；扩写必须经 allowed_extensions 显式批准。
+
+    任务10（DATA-CONTRACTS C1）：`execution` 给出时把执行契约（执行图版本 /
+    有效执行配置 / 策略摘要）一并冻结进契约；**缺省 None 保持旧契约形状**
+    （旧工程的 .pd/intent-contract.json 没有执行字段，摘要不能被凭空改写）。
+    一旦给出就必须完整——残缺块显式拒绝，不猜默认值。
+
+    任务19（DATA-CONTRACTS C12）：`dispatch` 给出时把派发契约（契约版本 /
+    档位 / 配置原值 / 生效来源）冻结成契约的 ``dispatch`` 子块。缺省 None
+    保持旧契约形状——旧检查点没有该块，按 legacy 派发契约（版本 1）继续。
     """
     spec = dict(user_spec or {})
     policy = str(spec.get("content_policy") or DEFAULT_CONTENT_POLICY).strip().lower()
@@ -289,9 +321,45 @@ def build_intent_contract(*, user_spec: Optional[Dict[str, Any]]) -> Dict[str, A
         "excluded_sources": [raw for raw, _ in parse_excluded_entries(
             spec.get("excluded_sources"))],
     }
+    if execution is not None:
+        contract.update(_freeze_execution_block(execution))
+    if dispatch is not None:
+        contract["dispatch"] = _freeze_dispatch_block(dispatch)
     contract["digest"] = canonical_digest(
         {k: v for k, v in contract.items() if k not in ("digest", "frozen_at")})
     return contract
+
+
+def _freeze_dispatch_block(dispatch: Dict[str, Any]) -> Dict[str, Any]:
+    """校验并挑出 C12 冻结派发契约块（与 workflow/dispatch_policy.py 同字段）。
+
+    ``configured_concurrency`` 允许为 0（= 自动，按档位表取并发），所以这里
+    只用「键必须存在」判定完整性，不能用 ``in (None, "")``——那会把合法的
+    0 误判为残缺。版本号非法/缺失仍然显式拒绝。
+    """
+    block = dict(dispatch or {})
+    missing = [field for field in DISPATCH_FROZEN_FIELDS
+               if field not in block or block[field] is None
+               or (field != "configured_concurrency" and block[field] == "")]
+    if missing:
+        raise ContractError(
+            "INCOMPLETE_DISPATCH_METADATA",
+            "派发契约字段不完整，缺少: %s（拒绝按猜测的默认值冻结）"
+            % ", ".join(missing))
+    return {field: block[field] for field in DISPATCH_FROZEN_FIELDS}
+
+
+def _freeze_execution_block(execution: Dict[str, Any]) -> Dict[str, Any]:
+    """校验并挑出 C1 冻结执行元数据块（字段顺序与 C1 一致）。"""
+    block = dict(execution or {})
+    missing = [field for field in EXECUTION_FROZEN_FIELDS
+               if block.get(field) in (None, "")]
+    if missing:
+        raise ContractError(
+            "INCOMPLETE_EXECUTION_METADATA",
+            "执行契约字段不完整，缺少: %s（拒绝按猜测的默认值冻结）"
+            % ", ".join(missing))
+    return {field: block[field] for field in EXECUTION_FROZEN_FIELDS}
 
 
 def manifest_entries(manifest: Optional[Dict[str, Any]],

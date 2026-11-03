@@ -42,6 +42,7 @@ if PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, PLUGIN_ROOT)
 
 import evidence  # noqa: E402
+import request_scopes  # noqa: E402  C5：多 scope 授权唯一口径
 from check_semantic import load_shuffle_transitions, shuffle_bound  # noqa: E402
 
 from workflow.nodes import agent_evidence  # noqa: E402
@@ -51,8 +52,37 @@ TOOL_VERSION = "1.0"
 
 REQUESTS_DIR_REL = ".pd/agent-requests"
 
+#: 派生物缓存目录与复用台账（任务16/C7：缓存命中也是需要审计的事实）
+CACHE_DIR_REL = ".pd/artifact-cache"
+CACHE_REUSE_LEDGER_REL = ".pd/artifact-cache/reuse-ledger.json"
+
+#: 缓存复用台账对账失败码（任务16/C7）
+CACHE_REUSE_UNVERIFIED = "CACHE_REUSE_UNVERIFIED"
+CACHE_REUSE_DRIFT = "CACHE_REUSE_DRIFT"
+CACHE_LEDGER_CORRUPT = "CACHE_LEDGER_CORRUPT"
+
 #: T4 验收批次 ID 前缀（创审分离比对时排除验收阶段自身证据）
 T4_BATCH_PREFIX = "bat-t4"
+#: 合并终审批次 ID 前缀（卡14：一次独立审读覆盖多节，仍是审读角色）
+T4_COMBINED_BATCH_PREFIX = "bat-t4c"
+
+
+def _is_reviewer_evidence(self_dir, ev):
+    """该条证据是否属于「审读角色」（卡14）。
+
+    角色真源 = 派发单声明的 stage（``T4_COMBINED_REVIEW`` /
+    ``T4_REVIEW_<SEC>``），批次前缀仅作兼容兜底（请求文件可能已被清理）。
+    实现落在 :mod:`review_projection`，与投影/认证侧共用同一口径，避免两处
+    判定漂移。导入失败时退化为旧的前缀判定（绝不因此把审读误记为写作者）。
+    """
+    try:
+        import review_projection
+
+        return bool(review_projection.is_reviewer_evidence(self_dir, ev))
+    except Exception:
+        batch = str((ev or {}).get("batch_id") or "")
+        return batch.startswith(T4_BATCH_PREFIX) or batch.startswith(
+            T4_COMBINED_BATCH_PREFIX)
 
 
 def _load_json(path):
@@ -98,6 +128,122 @@ def _load_allow_unattested(self_dir):
             return stripped.split(":", 1)[1].strip().lower() in (
                 "true", "yes", "on", "1")
     return False
+
+
+def _load_cache_ledger(self_dir):
+    """读缓存复用台账；返回 {entries, corrupt}（缺失=空台账，损坏=corrupt）。"""
+    path = os.path.join(self_dir, *CACHE_REUSE_LEDGER_REL.split("/"))
+    if not os.path.isfile(path):
+        return {"entries": [], "corrupt": False}
+    data = _load_json(path)
+    if data is None or not isinstance(data.get("entries"), list):
+        return {"entries": [], "corrupt": True}
+    return {"entries": [e for e in data["entries"] if isinstance(e, dict)],
+            "corrupt": False}
+
+
+def verify_cache_reuse_ledger(self_dir, attested_current=None):
+    """对账缓存复用台账：命中必须能和真实历史派发双向对得上（任务16/C7）。
+
+    C7 红线「缓存绝不能伪造一个从未运行过的 agent」。每条 ``hit=True`` 的台账
+    必须同时满足：
+
+    1. 引用的缓存条目真实存在，且条目里的 ``input_digest`` 与台账写的一致
+       （台账不能自说自话）；
+    2. 存在一份**历史派发单/回执**带同一 ``input_digest`` —— 证明这份产物确实
+       由某个 agent 产出过，而不是凭空补出来的；
+    3. 条目记录的产物摘要与盘面现值一致（命中后又被手改 → 复用不成立）。
+
+    任一不满足 → error。命中条目**绝不**计入 ``dispatches``（它不是一次新的
+    调用，也不能把命中数伪装成派发数）。
+    """
+    self_dir = os.path.abspath(self_dir or ".")
+    ledger = _load_cache_ledger(self_dir)
+    reuses, errors = [], []
+    if ledger.get("corrupt"):
+        errors.append({"code": CACHE_LEDGER_CORRUPT,
+                       "detail": "缓存复用台账不可解析（%s）" % CACHE_REUSE_LEDGER_REL,
+                       "dispatch_id": ""})
+        return reuses, errors
+
+    # 历史派发单/回执摘要索引：input_digest -> {dispatch_id, ...}
+    historical = {}
+    for path in sorted(glob.glob(os.path.join(self_dir, REQUESTS_DIR_REL, "*.json"))):
+        req = _load_json(path)
+        if not req:
+            continue
+        digest = str(req.get("input_digest") or "")
+        if digest:
+            historical.setdefault(digest, set()).add(
+                str(req.get("dispatch_id") or ""))
+    try:
+        for ev in agent_evidence.scan_evidence(self_dir):
+            digest = str((ev or {}).get("input_digest") or "")
+            if digest:
+                historical.setdefault(digest, set()).add(
+                    str((ev or {}).get("dispatch_id") or ""))
+    except Exception:  # noqa: BLE001 - 回执索引只是佐证，缺失不掩盖派发单索引
+        pass
+
+    for entry in ledger["entries"]:
+        if not entry.get("hit"):
+            continue
+        scope = str(entry.get("scope") or "")
+        stage = str(entry.get("stage") or "")
+        digest = str(entry.get("input_digest") or "")
+        key = str(entry.get("cache_key") or "")
+        cache_entry = None
+        if key:
+            cache_entry = _load_json(os.path.join(
+                self_dir, *CACHE_DIR_REL.split("/"), key, "entry.json"))
+        problems = []
+        if not key or cache_entry is None:
+            problems.append("台账引用的缓存条目不存在（key=%s）" % (key or "<空>"))
+        else:
+            if str(cache_entry.get("key") or "") != key:
+                problems.append("缓存条目键自相矛盾")
+            if str(cache_entry.get("input_digest") or "") != digest:
+                problems.append(
+                    "台账摘要与缓存条目摘要不一致（台账 %s vs 条目 %s）"
+                    % (digest[:12] or "<空>",
+                       str(cache_entry.get("input_digest") or "")[:12] or "<空>"))
+        if not digest:
+            problems.append("台账未记录输入摘要")
+        elif digest not in historical:
+            problems.append("没有任何历史派发单/回执带同一 input_digest"
+                            "（疑似伪造 agent 调用）")
+        if problems:
+            errors.append({
+                "code": CACHE_REUSE_UNVERIFIED,
+                "detail": "缓存复用台账 %s/%s（scope=%s）无法复核：%s"
+                          % (stage, scope, scope, "；".join(problems)),
+                "dispatch_id": str(entry.get("historical_dispatch_id") or ""),
+            })
+        drifts = []
+        if cache_entry is not None:
+            for rel, expect in (cache_entry.get("artifacts") or {}).items():
+                disk = evidence.sha256_file(os.path.join(self_dir, rel))
+                if disk is None:
+                    drifts.append("%s（缺失）" % rel)
+                elif str(disk) != str(expect):
+                    drifts.append("%s（摘要不符）" % rel)
+        if drifts:
+            errors.append({
+                "code": CACHE_REUSE_DRIFT,
+                "detail": "缓存命中后盘面产物已改变：%s（scope=%s）"
+                          % (", ".join(sorted(drifts)), scope),
+                "dispatch_id": "",
+            })
+        reuses.append({
+            "stage": stage,
+            "scope": scope,
+            "cache_key": key,
+            "input_digest": digest,
+            "historical_dispatch_id": sorted(historical.get(digest, set())),
+            "source_assets_available": bool(entry.get("source_assets_available", True)),
+            "reason": str(entry.get("reason") or ""),
+        })
+    return reuses, errors
 
 
 def audit_agent_evidence(workdir, allow_unattested=None):
@@ -187,6 +333,7 @@ def audit_agent_evidence(workdir, allow_unattested=None):
         "attested": 0,
         "unattested": 0,
         "superseded": 0,
+        "cached": 0,
     }
 
     def _record(code, detail, dispatch_id, severity="error"):
@@ -202,6 +349,9 @@ def audit_agent_evidence(workdir, allow_unattested=None):
         dispatch_id = str(request.get("dispatch_id") or "")
         scope = str(request.get("scope") or "")
         stage = str(request.get("stage") or "")
+        # 卡13（C5）：一个作者可以一次写 1–2 个相邻节，所以证据台账必须能被
+        # 这一批里的**每一个** scope 认领（保留 scope 首元素做兼容标签）。
+        req_scopes = request_scopes.request_scopes(request)
         artifacts = [a for a in (request.get("artifacts") or [])
                      if isinstance(a, str) and a]
         checked["dispatches"] += 1
@@ -218,15 +368,22 @@ def audit_agent_evidence(workdir, allow_unattested=None):
             if stale else False
         )
         if ev is None and artifacts:
-            # 产物是否已被另一条证据台账认证（返修重派场景）
-            superseded = any(
-                bool(attested_current.get(rel, set())) for rel in disk if disk.get(rel)
+            # 产物是否已被另一条证据台账认证（返修重派场景）。
+            # 卡13：必须是 all，且按**声明的全部产物**遍历——缺一件盘面产物、
+            # 或有一件产物没有别的台账认证，这条派发单就不算 superseded；
+            # 绝不允许 any(...) 用一个成功产物给整批背书。
+            superseded = all(
+                bool(disk.get(rel))
+                and bool(attested_current.get(rel, set()) - {dispatch_id})
+                for rel in artifacts
             )
 
         if ev is None:
             detail = (f"派发单 {dispatch_id}（{stage}/{scope}）无证据台账"
                       f"（.pd/agent-calls/{dispatch_id}.json），产物由主 Agent "
                       f"单会话直写的嫌疑无法排除")
+            if len(req_scopes) > 1:
+                detail += f"；多 scope 请求覆盖 {','.join(req_scopes)}，需整批产物都有认证"
             if allow_unattested and not superseded:
                 _record("EVIDENCE_MISSING", detail, dispatch_id, "warning")
                 checked["unattested"] += 1
@@ -271,14 +428,19 @@ def audit_agent_evidence(workdir, allow_unattested=None):
                            "evidence": str(ev.get("worker") or ""),
                            "status": "ok" if not (missing or stale) else "stale"})
 
-    # ---- INV-2 创审分离：T4 验收 worker 不得与写作阶段 worker 同体 ----------
+    # ---- INV-2 创审分离：审读 worker 不得与写作阶段 worker 同体 ----------
+    # 卡14：审读角色**不能**只靠 batch_id 字符串区分——合并终审批次是
+    # ``bat-t4c-*``，若仍用单一前缀判定，它带的 worker 会被算进「写作者」集合，
+    # 于是真正的审读员反而被误判同体、而同体的审读员反被放过。角色真源是派发
+    # 单声明的 stage（T4_COMBINED_REVIEW / T4_REVIEW_<SEC>），批次前缀仅作兼容
+    # 兜底（请求文件可能已被清理的旧台账）。两遍扫描保证判定与遍历顺序无关。
     writers = set()
     reviewers = []
     for ev in evidence_files:
         worker = str(ev.get("worker") or "").strip()
         if not worker:
             continue
-        if str(ev.get("batch_id") or "").startswith(T4_BATCH_PREFIX):
+        if _is_reviewer_evidence(self_dir, ev):
             reviewers.append((str(ev.get("dispatch_id") or ""), worker))
         else:
             writers.add(worker)
@@ -288,8 +450,18 @@ def audit_agent_evidence(workdir, allow_unattested=None):
                     f"验收证据 {dispatch_id} 的 worker={worker} 与写作阶段"
                     f"（T1/T2）证据同体，违反 INV-2 创审分离", dispatch_id)
 
+    # ---- 缓存复用台账对账（任务16/C7）-----------------------------------
+    # 缓存命中的 scope 没有本轮派发单，因此**不会**进入上面的遍历；这既避免
+    # 误判 FAIL，也意味着「命中」本身没有任何审计。这里补上双向对账：命中必须
+    # 能指向真实缓存条目 + 真实历史派发（同一 input_digest），且盘面产物仍是
+    # 条目记录的那份。命中数单独记在 checked["cached"]，绝不混进 dispatches。
+    cache_reuses, cache_errors = verify_cache_reuse_ledger(
+        self_dir, attested_current=attested_current)
+    errors.extend(cache_errors)
+    checked["cached"] = len(cache_reuses)
+
     return {"errors": errors, "warnings": warnings, "checked": checked,
-            "dispatches": dispatches}
+            "dispatches": dispatches, "cache_reuses": cache_reuses}
 
 
 def check_agent_audit_project(workdir):
@@ -338,6 +510,7 @@ def main(argv=None):
             "checked": checked,
             "allow_unattested": bool(allow_unattested),
             "dispatches": res["dispatches"],
+            "cache_reuses": res.get("cache_reuses", []),
         },
     }
 

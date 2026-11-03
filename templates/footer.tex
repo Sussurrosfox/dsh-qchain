@@ -1,11 +1,20 @@
 % -*- coding: utf-8 -*-
 % =============================================================================
-% footer.tex —— 纯问题驱动自学案：栏环境结束（\pdEndColumns）+ 总页码锚点 + 文档结束
+% footer.tex —— 纯问题驱动自学案：栏环境结束（\pdEndColumns）+ 文档结束
 % 由 main.tex 在所有 sec*.tex 切片之后 \input。
 % =============================================================================
 
-% 页面总数锚点
-\label{LastPage}
+% 总页码锚点（LastPage）【GR.4 复盘 · 2026-10 修复】
+% 原实现在此处手写 \label{LastPage}。该写法不可靠：\label 的 \write 是延迟到
+% 下一次 shipout 才执行的，而此处之后只有 \pdEndColumns（教师版 \pdColumns=1
+% 时它还是空操作）与 \end{document}；一旦末页恰好在标签之前就已输出、
+% 且其后不再有新页装箱，这条 \write 就永久丢失，页脚变成 "1 of ??"。
+% 实测：GR.4 教师版 22 页文档重排后即触发，学生版 7 页同样偶发。
+% 改为由 lastpage 宏包在 enddocument/afterlastpage 钩子里用
+% \protected@iwrite（\immediate\write + 全展开）落盘，与 shipout 时机解耦，
+% 并对 hyperref 的 5 字段 \newlabel 结构完整兼容（\pageref 取第 5 字段）。
+% 注意：切勿再把 \label{LastPage} 加回来，否则将出现重复标签
+% （LaTeX Warning: Label `LastPage' multiply defined）。
 
 \pdEndColumns
 

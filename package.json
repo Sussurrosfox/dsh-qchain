@@ -1,6 +1,6 @@
 {
   "name": "@local/qchain",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "private": true,
   "type": "module",
   "description": "题链流水线：问题驱动数学自学案制作 (XeLaTeX PDF / HTML 卡片双模交付 + 零信任质量门禁)",
@@ -20,6 +20,9 @@
     "templates",
     "prompts",
     "references",
+    "docs",
+    "!**/__pycache__/**",
+    "!**/*.pyc",
     "README.md",
     "USER_GUIDE.md",
     "SKILL.md"

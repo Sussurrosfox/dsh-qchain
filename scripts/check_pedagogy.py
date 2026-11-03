@@ -30,9 +30,18 @@ for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+PLUGIN_ROOT = os.path.abspath(os.path.join(HERE, ".."))
+if PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, PLUGIN_ROOT)
+
 import evidence  # noqa: E402
 import check_numbering  # noqa: E402
+# 卡 11：教学偏好是**可选策略**——策略字段与解析器全部复用 C1 的
+# workflow/execution_policy.py（卡 10 落地），本脚本不另造开关。
+from workflow import execution_policy as ep  # noqa: E402
 
 RE_KNOWLEDGEBOX = re.compile(r"\\begin\{knowledgebox\}(?:\[([^\]]*)\])?")
 RE_MICROKNOWLEDGE = re.compile(r"\\begin\{microknowledge\}(?:\[([^\]]*)\])?")
@@ -59,8 +68,70 @@ def norm_text(s):
     return check_numbering.norm_opt(s).lower()
 
 
-def check_pedagogy_slice(name, text, problems, warnings):
-    """单切片教学语义与认知结构质检。"""
+# ---------------------------------------------------------------------------
+# 卡 11：教学偏好策略解析（复用 C1 字段矩阵，legacy 缺键 → 旧默认 strict）
+# ---------------------------------------------------------------------------
+
+def resolve_policy(values=None):
+    """把扁平配置解析为门禁策略。
+
+    - 缺 ``execution_profile`` → legacy：``pedagogy_policy``/``budget_policy``
+      取 LEGACY_EXECUTION_DEFAULTS（strict）、``require_classroom_plan``=True，
+      即旧项目行为一字不变；
+    - ``execution_profile=faithful_fast`` → 取 EXECUTION_DEFAULTS（advisory /
+      不要求额外教案）；
+    - 显式键永远优先于 profile 默认，并在 ``sources`` 中标记来源；
+    - 未知 profile / 非法枚举抛 ``ExecutionPolicyError``，绝不静默降级。
+    """
+    values = dict(values or {})
+    profile = ep.resolve_profile(values.get("execution_profile"))
+    defaults = (ep.EXECUTION_DEFAULTS if profile == ep.FAST_PROFILE
+                else ep.LEGACY_EXECUTION_DEFAULTS)
+    raw_profile = values.get("execution_profile")
+    out = {
+        "execution_profile": profile,
+        "sources": {
+            "execution_profile": "default" if raw_profile in (None, "") else "explicit"
+        },
+    }
+    for key in ("pedagogy_policy", "budget_policy"):
+        raw = values.get(key)
+        if raw is None:
+            out[key] = defaults[key]
+            out["sources"][key] = "default"
+        else:
+            out[key] = ep.coerce_enum(raw, key, ep.EXECUTION_ENUMS[key])
+            out["sources"][key] = "explicit"
+    raw_plan = values.get("require_classroom_plan")
+    if raw_plan is None:
+        out["require_classroom_plan"] = bool(defaults["require_classroom_plan"])
+        out["sources"]["require_classroom_plan"] = "default"
+    else:
+        out["require_classroom_plan"] = ep.normalize_bool(
+            raw_plan, "require_classroom_plan")
+        out["sources"]["require_classroom_plan"] = "explicit"
+    return out
+
+
+def load_policy(project_dir):
+    """从项目 config.yaml 读取执行策略（缺文件=旧项目 → legacy）。"""
+    cfg_path = os.path.join(project_dir, "config.yaml")
+    return resolve_policy(ep.read_execution_overrides(cfg_path))
+
+
+def check_pedagogy_slice(name, text, problems, warnings, policy=None):
+    """单切片教学语义与认知结构质检。
+
+    卡 11：``policy`` 为 None 或 ``pedagogy_policy=strict`` 时保持旧语义（全部
+    规则硬阻断）；``advisory`` 时**只**把教学偏好类规则降级为提示——四问台阶、
+    数值例题、常量填空比例。数学/来源/编号/结构/证据类错误永远阻断，不受策略影响。
+    """
+    advisory = str((policy or {}).get("pedagogy_policy", "strict")).lower() != "strict"
+
+    def _pref(msg):
+        """教学偏好类问题：advisory → warning（仅提示），strict/legacy → 阻断。"""
+        (warnings if advisory else problems).append(msg)
+
     # 教师专属区（solution/teacherNote）内的内容属教师可见，
     # 不参与学生可见统计、知识框/卡存在性与闭合性检测、填空剧透/包办检测。
     teacher_spans = [(m.start(), m.end())
@@ -199,16 +270,18 @@ def check_pedagogy_slice(name, text, problems, warnings):
                 )
 
     # 常量填空率上限检测（学生可见填空）
+    # 卡 11：这是**教学偏好**（“看词猜答案”风险提示），不是事实错误——
+    # advisory 下只提示；strict/legacy 保留原阻断。
     if total_fillins >= 4:
         ratio = constant_ans_count / total_fillins
         if ratio > 0.20:
-            problems.append(
+            _pref(
                 "%s: 常量类填空（0/1/-1）占比过高（%d/%d = %.1f%% > 20%%），存在看词猜答案的伪自学倾向，必须替换为具体代数式或数值运算结果"
                 % (name, constant_ans_count, total_fillins, ratio * 100)
             )
     elif 2 <= total_fillins <= 3 and constant_ans_count == total_fillins:
         # 小切片全常量兜底：2~3 个填空全是 0/1/-1 同样属伪自学
-        problems.append(
+        _pref(
             "%s: 全部 %d 个学生可见填空答案均为常量（0/1/-1），属看词猜答案的伪自学填空，必须替换为具体代数式或数值运算结果"
             % (name, total_fillins)
         )
@@ -300,24 +373,26 @@ def check_pedagogy_slice(name, text, problems, warnings):
         # 核心定理/引理题认知步长检测：涉及核心定理证明/推导的大题必须拆解为至少 4~7 步台阶
         # 触发条件收紧：核心词出现在一级题干，或全题累计出现 ≥2 次（避免"二项式定理"等
         # 顺带提及触发误拦；纯证明任务仍能稳定命中）
+        # 卡 11：关键词命中**不等于**必须四问——这是教学偏好，advisory 下只提示。
         core_hits = RE_CORE_KEYWORDS.findall(student_part)
         kw_in_stem = bool(RE_CORE_KEYWORDS.search(stem_part))
         if has_core_kw and (kw_in_stem or len(core_hits) >= 2):
             slice_has_core_theorems = True
             kw = RE_CORE_KEYWORDS.search(student_part).group(0)
             if q["sub_items"] < 4:
-                problems.append(
+                _pref(
                     "%s:%d: 核心定理/引理大题认知步长过大（涉及“%s”但仅配置了 %d 个小问台阶），长逻辑链核心推导必须拆解为 (a) 到 (f) 至少 4~7 个连续小问！"
                     % (name, q["line"], kw, max(1, q["sub_items"]))
                 )
 
     # 4. 数值算例先行检测（核心定理切片强制硬阻断，其他切片提示警告）
+    # 卡 11：是否有数值算例同属教学偏好——忠实原文的抽象推导不必强插数值例。
     has_numeric = bool(
         RE_NUMERIC_EXAMPLE.search(text)
         or (RE_EXAMPLE_KEYWORDS.search(text) and re.search(r"\d", text))
     )
     if slice_has_core_theorems and not has_numeric:
-        problems.append(
+        _pref(
             "%s: 核心定理切片缺少具体数值/低阶特例算例演练（全篇均为抽象字母参数），严重缺失算例先行认知脚手架！核心大定理推导前必须配置具体数值或低阶特例验算。"
             % name
         )
@@ -330,7 +405,7 @@ def check_pedagogy_slice(name, text, problems, warnings):
     return len(kb_matches), len(mk_matches)
 
 
-def scan_project_pedagogy(workdir):
+def scan_project_pedagogy(workdir, policy=None):
     """扫描项目各切片教学语义。"""
     inputs = check_numbering.sec_inputs(workdir)
     if inputs is None:
@@ -349,18 +424,19 @@ def scan_project_pedagogy(workdir):
         except OSError as e:
             problems.append("%s: 无法读取切片: %s" % (f, e))
             continue
-        kb_n, mk_n = check_pedagogy_slice(f, txt, problems, warnings)
+        kb_n, mk_n = check_pedagogy_slice(f, txt, problems, warnings, policy=policy)
         stats[f] = {"knowledgebox_count": kb_n, "microknowledge_count": mk_n}
     return files, problems, warnings, stats
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="题链教学语义与认知结构门禁 (check_pedagogy.py)")
     ap.add_argument("workdir", nargs="?", default=".")
     ap.add_argument("--json", metavar="PATH", help="写入结构化检查报告")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     workdir = os.path.abspath(args.workdir)
 
+    policy = load_policy(workdir)
     manifest = evidence.collect_inputs(workdir)
     digest = evidence.content_digest(manifest)
     report = {
@@ -372,10 +448,11 @@ def main():
         "pdf_sha256": None,
         "status": "pass",
         "issues": [],
-        "evidence": {}
+        "evidence": {},
+        "policy": dict(policy),
     }
 
-    files, problems, warnings, stats = scan_project_pedagogy(workdir)
+    files, problems, warnings, stats = scan_project_pedagogy(workdir, policy=policy)
     report["scope"]["files"] = files
     report["evidence"]["pedagogy_stats"] = stats
 

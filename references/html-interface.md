@@ -46,6 +46,7 @@ HTML —— `student.html`（学生版）与 `teacher.html`（教师版）。**�
 | `{{GENERATED_AT}}` | 生成时间 |
 | `{{TOC_HTML}}` | 目录抽屉条目（按节分组） |
 | `{{CARDS_HTML}}` | 全部卡片（一张卡 = 一页） |
+| `{{MATH_CONFIG_JSON}}` | 数学配置（templates/html/math-config.json，转义后内嵌于 `<script type="application/json" id="qc-math-config">`；浏览器与 check_render 严格校验共用，模版缺此占位符则拒绝渲染） |
 
 渲染器强制校验：占位符全部填充（正文区任何形式的已知占位符残留即失败）。
 

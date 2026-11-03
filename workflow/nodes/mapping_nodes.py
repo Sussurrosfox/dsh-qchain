@@ -38,6 +38,37 @@ SOURCE_MAP_ACTIONS = ("PRESERVE", "EXPLAIN", "BRIDGE", "EXTEND")
 _RE_SOURCE_MAP_ROW = re.compile(
     r"^\s*(SRC-\d+)\s*->\s*(\S+)\s*->\s*(\w+)\s*->\s*(\w+)\s*->\s*(.+?)\s*$")
 
+
+def _execution_policy(self_dir: str) -> Dict[str, Any]:
+    """卡 11：读取执行策略（C1 字段矩阵）。
+
+    缺 execution_profile 的旧项目 → legacy 默认（pedagogy/budget=strict、
+    require_classroom_plan=True），规划提示与旧行为一字不变；faithful_fast
+    才把“四问模板/固定三节/题量区间/讲法必填”降为建议。
+    """
+    from .. import execution_policy as ep
+    try:
+        values = ep.read_execution_overrides(os.path.join(self_dir, "config.yaml"))
+    except Exception:
+        values = {}
+    values = values or {}
+    profile = ep.resolve_profile(values.get("execution_profile"))
+    defaults = (ep.EXECUTION_DEFAULTS if profile == ep.FAST_PROFILE
+                else ep.LEGACY_EXECUTION_DEFAULTS)
+    cfg: Dict[str, Any] = dict(defaults)
+    for key in ep.EXECUTION_KEYS:
+        raw = values.get(key)
+        if raw is None:
+            continue
+        if key in ep.EXECUTION_ENUMS:
+            cfg[key] = ep.coerce_enum(raw, key, ep.EXECUTION_ENUMS[key])
+        elif key in ep.EXECUTION_BOOL_KEYS:
+            cfg[key] = ep.normalize_bool(raw, key)
+        else:
+            cfg[key] = ep.coerce_int(raw, key)
+    cfg["execution_profile"] = profile
+    return cfg
+
 # §5.1 三角色 round 定义（stage 键 → (缓存 scope, 产物清单)）。
 # t1_round_digests 以 stage 为键记录本轮各 round 的 input_digest，
 # 供 verify 节点分键存入派生物缓存、失败时整链进入缓存黑名单。
@@ -45,6 +76,10 @@ T1_ROUNDS: Dict[str, Tuple[str, List[str]]] = {
     "T1_SOURCE_AUDIT": ("source-map", ["source-map.md"]),
     "T1_DEPENDENCY": ("dependency-map", ["dependency-map.md"]),
     "T1_COVERAGE": ("coverage-map", ["coverage-map.md"]),
+    # 卡 12：faithful_fast 图把上面三个 round 压成一次派发，三表作为一组
+    # 同进同出。键位与 legacy 三轮不重叠，缓存/黑名单天然不混用。
+    "T1_UNIFIED_PLAN": ("unified-mapping",
+                        ["source-map.md", "dependency-map.md", "coverage-map.md"]),
 }
 
 # §5.1 三角色名（audit §5.1：source-auditor / dependency-planner /
@@ -83,12 +118,18 @@ def _ensure_source_inventory(self_dir: str, project_root: str
         return None, "SOURCE_INVENTORY_ERROR: %s" % exc
 
 
-def _validate_source_map(self_dir: str) -> List[str]:
+def _validate_source_map(self_dir: str, path: Optional[str] = None) -> List[str]:
     """F2 结构校验：source-map.md 每行满足 source_id -> scope -> action ->
-    status -> reason 契约（深度语义校验由 F3 check_fidelity.py 负责）。"""
-    path = os.path.join(self_dir, "source-map.md")
+    status -> reason 契约（深度语义校验由 F3 check_fidelity.py 负责）。
+
+    path 缺省指向 self 根的 source-map.md（legacy 行为逐字节不变）；统一规划
+    （卡 12）传入暂存区路径，让同一套校验同时守 staging 与提升后的正式产物。
+    """
+    if path is None:
+        path = os.path.join(self_dir, "source-map.md")
+    label = os.path.basename(path) or "source-map.md"
     if not os.path.isfile(path):
-        return ["source-map.md 缺失（F2 映射契约要求逐行来源映射）"]
+        return ["%s 缺失（F2 映射契约要求逐行来源映射）" % label]
     errors: List[str] = []
     rows = 0
     with open(path, "r", encoding="utf-8") as f:
@@ -102,20 +143,21 @@ def _validate_source_map(self_dir: str) -> List[str]:
             m = _RE_SOURCE_MAP_ROW.match(stripped)
             if not m:
                 errors.append(
-                    "source-map.md:%d 映射行格式应为 "
+                    "%s:%d 映射行格式应为 "
                     "SRC-xxx -> output_scope -> action -> status -> reason"
-                    % lineno)
+                    % (label, lineno))
                 continue
             _, _scope, action, status, _reason = m.groups()
             if action.upper() not in SOURCE_MAP_ACTIONS:
-                errors.append("source-map.md:%d action=%s 非法（应为 %s）"
-                              % (lineno, action, "/".join(SOURCE_MAP_ACTIONS)))
+                errors.append("%s:%d action=%s 非法（应为 %s）"
+                              % (label, lineno, action,
+                                 "/".join(SOURCE_MAP_ACTIONS)))
             if status.upper() not in SOURCE_MAP_STATUSES:
-                errors.append("source-map.md:%d status=%s 非法（应为 %s）"
-                              % (lineno, status,
+                errors.append("%s:%d status=%s 非法（应为 %s）"
+                              % (label, lineno, status,
                                  "/".join(SOURCE_MAP_STATUSES)))
     if rows == 0:
-        errors.append("source-map.md 没有任何 SRC-xxx 映射行（F2 契约）")
+        errors.append("%s 没有任何 SRC-xxx 映射行（F2 契约）" % label)
     return errors
 
 
@@ -181,6 +223,45 @@ def _cache_blocklisted(state: ShrinkCoursewareState, digest: str) -> bool:
     return digest in (state.get("dispatch_blocklist") or [])
 
 
+def _round_digest_context(self_dir: str, state: ShrinkCoursewareState, *,
+                          stage: str, role: str, prompt_file: str) -> Dict[str, Any]:
+    """任务16（C7）：T1 派生物缓存键必须钉住图 / 策略 / 角色 / 提示词 / 工具版本。
+
+    legacy 与 faithful_fast 是两张语义不同的图（DATA-CONTRACTS C7 与
+    ``execution_policy.cache_namespace`` 都要求二者缓存互不串用），因此把
+    ``graph_version`` 与 ``policy_digest`` 一起塞进 ``build_request`` 的
+    ``digest_context``：两者的 ``input_digest`` 必然不同，隔离落在数据层，
+    而不是靠调用方「记得换目录」。
+
+    纯函数式读取（不含 mtime/路径），旧项目（无 execution_profile）解析为
+    legacy，其 digest_context 仍然稳定 → 同输入仍会命中，只是键变了一次。
+    """
+    from .. import execution_policy as ep
+
+    cfg = _execution_policy(self_dir)
+    profile = ep.resolve_profile(
+        state.get("execution_profile") or cfg.get("execution_profile"))
+    policy_value = str(state.get("policy_digest") or "")
+    if not policy_value:
+        try:
+            policy_value = str(
+                ep.policy_digest(cfg, execution_profile=profile) or "")
+        except Exception:  # noqa: BLE001 - 策略摘要只是键的一部分，取不到就不参与
+            policy_value = ""
+    return {
+        "stage": stage,
+        "graph_version": str(state.get("graph_version")
+                             or ep.graph_version_for_profile(profile)),
+        "execution_schema_version": ep.EXECUTION_SCHEMA_VERSION,
+        "execution_profile": profile,
+        "policy_digest": policy_value,
+        "content_policy": str(state.get("content_policy") or "faithful"),
+        "role": role,
+        "prompt_version": str(prompt_version(self_dir, prompt_file) or ""),
+        "tool_version": "t1-cache-key-v2",
+    }
+
+
 def _request_round(state: ShrinkCoursewareState, *, stage: str, role: str,
                    prompt_file: str, artifacts: List[str],
                    instruction: str, command: str, context: Dict[str, Any],
@@ -199,6 +280,8 @@ def _request_round(state: ShrinkCoursewareState, *, stage: str, role: str,
         instruction=instruction,
         command=command,
         context=context,
+        digest_context=_round_digest_context(
+            self_dir, state, stage=stage, role=role, prompt_file=prompt_file),
     )
 
     round_digests = dict(state.get("t1_round_digests") or {})
@@ -450,6 +533,44 @@ def node_t1_request_coverage_plan(state: ShrinkCoursewareState) -> Dict[str, Any
     content_policy = str(contract.get("content_policy")
                          or user_spec.get("content_policy") or "faithful")
 
+    # 卡 11：教学偏好（题量区间/固定三节/讲法必填/时长下限）在
+    # faithful_fast + advisory 下只作建议；strict（含 legacy 默认）保留硬指令。
+    policy = _execution_policy(self_dir)
+    pref_advisory = str(policy.get("pedagogy_policy", "strict")).lower() != "strict"
+
+    if pref_advisory:
+        density_block = (
+            "2. 题量按原文自然结构与知识密度如实安排，不设机械区间（“3–4 题 / 6–8 题”"
+            "只是经验参考，不是配额）：原文一题足够支撑该结论时就保留一题，不得为凑题"
+            "拆解原文或注水；\n"
+            "3. 核心定理/同构分类小节若原文推导很长，可按原文自身层次拆分为更细粒度小节"
+            "（如 sec3a 与 sec3b），也可保持原文节次不变——关键是不遗漏原文证明台阶，"
+            "而不是套用固定节数；\n"
+        )
+        teach_block = (
+            "5. coverage-map.md 建议包含『推荐讲法』与『易错点』两列并实质填写"
+            "（翻转课堂教师讲解与卡点突破用）；faithful_fast 下留空只作提示、不阻断交付，"
+            "严禁为填满这两列而改写原文；\n"
+        )
+        budget_block = (
+            f"6. 时间预算建议：teaching/classroom 模式参考课时预算 {lesson_minutes} 分钟，"
+            "超出时优先由教师缩小授课范围（.pd/classroom-selection.json），"
+            "不得通过删减原文或压缩推导台阶来凑预算；self_study 模式不设时长上限；\n"
+        )
+    else:
+        density_block = (
+            "2. 基础概念/计算引入型内容：知识密度较低，配置 3–4 道直观探索题，不生硬凑题；\n"
+            "3. 核心定理/同构分类驱动型内容：知识密度极高，必须允许拆分为更细粒度小节（如 sec3a 与 sec3b）或扩展为 6–8 道阶梯式引理题，"
+            "必须配置小素数/低阶特例算例演练与充分的中间脚手架，严禁为凑 5 题上限跳过证明关键步骤；\n"
+        )
+        teach_block = (
+            "5. coverage-map.md 中必须包含『推荐讲法』与『易错点』两列且每行实质填写，不得留空或填占位符（此为翻转课堂教师讲解与卡点突破的必备输入）；\n"
+        )
+        budget_block = (
+            f"6. 双向认知预算规范：teaching/classroom 模式下 core 任务总耗时受课时预算严格约束（预算 {lesson_minutes} 分钟，超标需删减次要题量）；"
+            "self_study 模式不设时长上限，但不得以“自足完备”为由新增未批准内容；无论何种模式，核心定理/引理推导长链题 planned_minutes 必须 >= 12 分钟，严禁削减长题推导台阶！\n"
+        )
+
     instruction = (
         "你是覆盖与预算规划专员（coverage-planner），只负责生成 "
         "coverage-map.md 这一份覆盖与课堂预算规划；source-map.md 与 "
@@ -464,30 +585,41 @@ def node_t1_request_coverage_plan(state: ShrinkCoursewareState) -> Dict[str, Any
         "inclass/core，需人工确认。\n\n"
         "【知识密度自适应规划规范（废除机械等额分配）】：\n"
         "1. 严禁死板机械均分为 4 节、每节 5 题、每题 3 问的均分定额制；\n"
-        "2. 基础概念/计算引入型内容：知识密度较低，配置 3–4 道直观探索题，不生硬凑题；\n"
-        "3. 核心定理/同构分类驱动型内容：知识密度极高，必须允许拆分为更细粒度小节（如 sec3a 与 sec3b）或扩展为 6–8 道阶梯式引理题，"
-        "必须配置小素数/低阶特例算例演练与充分的中间脚手架，严禁为凑 5 题上限跳过证明关键步骤；\n"
-        "4. 保证每个小节以 microknowledge 前置卡开头，以 knowledgebox 节末结论框收束；\n"
-        "5. coverage-map.md 中必须包含『推荐讲法』与『易错点』两列且每行实质填写，不得留空或填占位符（此为翻转课堂教师讲解与卡点突破的必备输入）；\n"
-        f"6. 双向认知预算规范：teaching/classroom 模式下 core 任务总耗时受课时预算严格约束（预算 {lesson_minutes} 分钟，超标需删减次要题量）；"
-        "self_study 模式不设时长上限，但不得以“自足完备”为由新增未批准内容；无论何种模式，核心定理/引理推导长链题 planned_minutes 必须 >= 12 分钟，严禁削减长题推导台阶！\n"
+        + density_block
+        + "4. 保证每个小节以 microknowledge 前置卡开头，以 knowledgebox 节末结论框收束；\n"
+        + teach_block
+        + budget_block
     )
 
     # 自学模式（self_study）切片规划硬红线（report.md 模块三 3.1）：
     # 仅靠 research_prompt.md 提示词不够，规划派发指令必须按模式注入可执行约束。
     prof = str(user_spec.get("delivery_profile", "self_study")).lower()
     if prof == "self_study":
-        instruction += (
-            "\n\n【self_study 自学模式硬红线（必须遵守）】：\n"
-            "1. 自学模式不设总时长上限，以认知台阶完备、逻辑严谨自足为唯一准绳，切勿为凑时间压缩题目推导；\n"
-            "2. 严禁将原材料末尾的“习题选讲/压轴题精讲/例题讨论/例题课”单独划为独立切片小节；"
-            "此类内容若适合探究，必须拆解为工具应用题并入前述理论小节，否则在 source-map.md 中登记移入课后自测题库；\n"
-            "3. 单模块切片严格限制为“概念引入节 → 核心工具推导节 → 度量与应用节”的 3 节精炼自足体系"
-            "（确有必要时可用 sec3a/sec3b 细分，但不得增设习题选讲节）；\n"
-            "4. 大定理长链推导题（如 Routh、EFFT 类）必须在 coverage-map.md 登记 planned_minutes: 12~15，"
-            "在切片题量统计中计为 2 道标准题的认知权重，废除每题均分 6~7 分钟的机械表格；\n"
-            "5. coverage-map.md 中只允许登记计划生成的 sec 节名，不得提及已删除/不存在的节。"
-        )
+        if pref_advisory:
+            # 卡 11：faithful_fast + advisory 不预设固定节数、不禁止原文自带
+            # 的习题/例题课独立成节——切片结构按原文自然结构安排。
+            instruction += (
+                "\n\n【self_study 自学模式规划指引（忠实优先）】：\n"
+                "1. 自学模式不设总时长上限，以认知台阶完备、逻辑严谨自足为唯一准绳，切勿为凑时间压缩题目推导；\n"
+                "2. 切片结构按原文自然结构安排：不预设“概念引入节 → 核心工具推导节 → 度量与应用节”"
+                "这类固定三节体系，也不禁止原文自带的“习题选讲/压轴题精讲/例题讨论”内容独立成节；"
+                "原文如何组织，学案就如何组织，不得为凑模板删改原文；\n"
+                "3. 大定理长链推导题的 planned_minutes 按原文推导长度如实登记（不套用 12~15 分钟机械区间），"
+                "切片题量按实际认知权重计数；\n"
+                "4. coverage-map.md 中只允许登记计划生成的 sec 节名，不得提及已删除/不存在的节。"
+            )
+        else:
+            instruction += (
+                "\n\n【self_study 自学模式硬红线（必须遵守）】：\n"
+                "1. 自学模式不设总时长上限，以认知台阶完备、逻辑严谨自足为唯一准绳，切勿为凑时间压缩题目推导；\n"
+                "2. 严禁将原材料末尾的“习题选讲/压轴题精讲/例题讨论/例题课”单独划为独立切片小节；"
+                "此类内容若适合探究，必须拆解为工具应用题并入前述理论小节，否则在 source-map.md 中登记移入课后自测题库；\n"
+                "3. 单模块切片严格限制为“概念引入节 → 核心工具推导节 → 度量与应用节”的 3 节精炼自足体系"
+                "（确有必要时可用 sec3a/sec3b 细分，但不得增设习题选讲节）；\n"
+                "4. 大定理长链推导题（如 Routh、EFFT 类）必须在 coverage-map.md 登记 planned_minutes: 12~15，"
+                "在切片题量统计中计为 2 道标准题的认知权重，废除每题均分 6~7 分钟的机械表格；\n"
+                "5. coverage-map.md 中只允许登记计划生成的 sec 节名，不得提及已删除/不存在的节。"
+            )
 
     return _request_round(
         state,
@@ -524,6 +656,13 @@ def node_t1_await_coverage_plan(state: ShrinkCoursewareState) -> Dict[str, Any]:
 
 def node_t1_verify_mapping(state: ShrinkCoursewareState) -> Dict[str, Any]:
     """T1: Verify mapping integrity, build materials.json index, and determine expected sections."""
+    if str(state.get("t1_plan_mode") or "").strip().lower() == "unified":
+        # 卡 12：faithful_fast 图的一次规划产三表 → 组事务校验（三表逐表 +
+        # 跨表引用/来源覆盖 + 派发摘要比对，全通过才一起提升）。legacy 三轮
+        # 的校验/缓存逻辑原样保留在下文，未走此分支时行为不变。
+        from . import fast_mapping_nodes
+        return fast_mapping_nodes.node_fast_t1_verify_unified_mapping(state)
+
     self_dir = state.get("self_dir") or state.get("project_root", ".")
     runner = ScriptRunner(self_dir)
     history = list(state.get("history", []))

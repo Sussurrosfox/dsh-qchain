@@ -111,6 +111,24 @@ def seed_agent_calls(d, requests, worker="subagent:test-agent"):
         )
 
 
+def scope_list(req):
+    """请求覆盖的小节列表（卡13：一张合批请求可覆盖 1–2 个相邻节）。"""
+    return [s for s in (req.get("scopes") or [req.get("scope")]) if s]
+
+
+def write_products(d, requests, template="% {sec}\n"):
+    """按请求覆盖的每一节写一份 <sec>.tex（合批请求必须逐节落产物）。
+
+    plan 的 before 快照与磁盘重推导都按节取指纹，因此 fixture 不能只写
+    ``req["scope"]``——那会让合批请求里的第二个节永远缺产物。
+    """
+    for req in requests:
+        for sec in scope_list(req):
+            with open(os.path.join(d, f"{sec}.tex"), "w",
+                      encoding="utf-8") as f:
+                f.write(template.format(sec=sec))
+
+
 def make_state(d, sections=("sec1", "sec2", "sec3"), statuses=None, **extra):
     """最小 state：派发根目录指向临时工程。"""
     state = {
@@ -365,9 +383,17 @@ class T02_PendingOrder(unittest.TestCase):
             # checked/accepted/running 全部排除，只剩 sec3/sec4/sec5
             self.assertEqual(plan["sections"], ["sec3", "sec4", "sec5"])
             self.assertEqual(plan["required_scope_count"], 3)
-            # expected 顺序保持
-            self.assertEqual([r["scope"] for r in plan["requests_full"]],
+            # expected 顺序保持：C5 允许一个作者请求覆盖 1–2 个相邻节（requests
+            # 可以少于节数），因此按 scopes 声明顺序展开后仍必须等于 expected 序。
+            groups = [list(r.get("scopes") or [r["scope"]])
+                      for r in plan["requests_full"]]
+            self.assertEqual([sec for group in groups for sec in group],
                              ["sec3", "sec4", "sec5"])
+            # scope 仍是首节兼容标签
+            self.assertEqual([r["scope"] for r in plan["requests_full"]],
+                             [group[0] for group in groups])
+            self.assertTrue(all(1 <= len(group) <= 2 for group in groups),
+                            groups)
 
     def test_expected_order_preserved_without_dependency_map(self):
         with tempfile.TemporaryDirectory() as d:
@@ -454,25 +480,64 @@ class T03_PlanBuilding(unittest.TestCase):
             self.assertTrue(plan["worker_capabilities"]["cancellable"])
 
             requests = plan["requests_full"]
-            # 3 个 pending 节 → >= 2 个请求（窗口放大后整批派发）
-            self.assertGreaterEqual(len(requests), 2)
-            self.assertEqual(len(requests), 3)
+            # C5：一个作者可写 1–2 个相邻节 → 3 节合批成 2 个请求（sec0+sec1 /
+            # sec2）；「requests 少于节数」不是丢节，覆盖并集必须等于本批全部节。
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(
+                [list(r.get("scopes") or [r["scope"]]) for r in requests],
+                [["sec0", "sec1"], ["sec2"]])
+            covered = [sec for r in requests
+                       for sec in (r.get("scopes") or [r["scope"]])]
+            self.assertEqual(covered, ["sec0", "sec1", "sec2"])
             for req in requests:
+                scopes = list(req.get("scopes") or [req["scope"]])
                 self.assertEqual(req["batch_id"], batch_id)
                 self.assertRegex(req["input_digest"], HEX64)
-                self.assertEqual(req["artifacts"], [f"{req['scope']}.tex"])
-                self.assertEqual(req["scope"], req["context"]["section_id"])
+                # 逐节产物清单；scope 只是首节兼容标签
+                self.assertEqual(req["artifacts"],
+                                 [f"{sec}.tex" for sec in scopes])
+                self.assertEqual(req["scope"], scopes[0])
                 self.assertEqual(req["timeout_seconds"], 900)
                 self.assertEqual(req["max_retries"], 2)
                 self.assertEqual(req["retry_class"], "transient")
                 self.assertTrue(req["dispatch_id"])
-            # sec0 用「开篇引入专员」，其余用「切片制作专员」
-            roles = {r["scope"]: r["role"] for r in requests}
-            self.assertEqual(roles["sec0"], "开篇引入专员")
-            self.assertEqual(roles["sec1"], "sec1 切片制作专员")
+                # R10 / §4.3.3：夹具无 source-manifest → available=false 空计数
+                self.assertEqual(req["context"]["source_assets"],
+                                 {"figure": 0, "table": 0, "tikz": 0,
+                                  "available": False})
+                if len(scopes) >= 2:
+                    # v2 派发单：逐节来源指纹 + 产物归属，缺一不可
+                    self.assertEqual(req["schema_version"], 2)
+                    self.assertEqual(req["artifact_scopes"],
+                                     {f"{sec}.tex": sec for sec in scopes})
+                    self.assertEqual(sorted(req["scope_inputs"]), sorted(scopes))
+                    for sec in scopes:
+                        self.assertRegex(req["scope_inputs"][sec], HEX64)
+                    self.assertEqual(req["context"]["section_id"], scopes[0])
+                    self.assertEqual(req["context"]["section_ids"], scopes)
+                else:
+                    # 单节请求必须逐字节保持 legacy 形状（旧派发单/旧缓存键不变）
+                    self.assertNotIn("scopes", req)
+                    self.assertNotIn("scope_inputs", req)
+                    self.assertEqual(req["context"]["section_id"], scopes[0])
+                    self.assertNotIn("section_ids", req["context"])
+            # 角色名逐节可追溯：合批请求标注合并撰写，单节请求保持原角色
+            roles = {}
+            for req in requests:
+                for sec in (req.get("scopes") or [req["scope"]]):
+                    roles[sec] = req["role"]
+            self.assertEqual(roles["sec0"], "sec0+sec1 切片制作专员（合并撰写）")
+            self.assertEqual(roles["sec1"], "sec0+sec1 切片制作专员（合并撰写）")
             self.assertEqual(roles["sec2"], "sec2 切片制作专员")
-            # 派发单全部落盘
-            self.assertEqual(len(request_files(d)), 3)
+            # 合批只是把相邻节交给同一个作者；「单节派发」的角色口径不变：
+            # sec0 仍是开篇引入专员（合批时角色名标注为合并撰写，不冒用单节角色）
+            self.assertEqual(
+                sbn._section_request_spec(
+                    state, "sec0",
+                    {"timeout_seconds": 900, "max_retries": 2}, {})["role"],
+                "开篇引入专员")
+            # 派发单全部落盘（一个请求一份派发单）
+            self.assertEqual(len(request_files(d)), len(requests))
 
             # 状态推进
             self.assertEqual(patch["section_statuses"],
@@ -495,21 +560,34 @@ class T03_PlanBuilding(unittest.TestCase):
                         "required_scope_count", "created_at"):
                 self.assertIn(key, disk)
             self.assertEqual(disk["sections"], ["sec0", "sec1", "sec2"])
-            self.assertEqual(len(disk["requests"]), 3)
+            self.assertEqual(len(disk["requests"]), len(requests))
+            # 有合批请求 → 计划级 schema_version=2（门禁据此走 scopes 并集口径）
+            self.assertEqual(disk["schema_version"], 2)
+            self.assertEqual(disk["batch_size"], len(requests))
+            self.assertEqual(disk["required_scope_count"], 3)
             for entry in disk["requests"]:
-                self.assertEqual(
-                    sorted(entry.keys()),
-                    sorted(["dispatch_id", "scope", "role", "input_digest",
-                            "artifacts", "status", "batch_id"]))
+                base_keys = ["dispatch_id", "scope", "role", "input_digest",
+                             "artifacts", "source_assets", "status", "batch_id"]
+                if len(entry.get("scopes") or []) >= 2:
+                    self.assertEqual(sorted(entry.keys()),
+                                     sorted(base_keys + ["scopes",
+                                                         "artifact_scopes"]))
+                else:
+                    # 单 scope 请求保持 legacy 形状（不带 scopes 键）
+                    self.assertEqual(sorted(entry.keys()), sorted(base_keys))
                 self.assertEqual(entry["batch_id"], batch_id)
                 self.assertEqual(entry["status"], "pending")
+                # 门禁子集同步落盘源资产计数（check_dispatch R10 的输入）
+                self.assertEqual(entry["source_assets"],
+                                 {"figure": 0, "table": 0, "tikz": 0,
+                                  "available": False})
             # 磁盘计划不含完整派发单（只保留门禁子集）
             self.assertNotIn("requests_full", disk)
 
             # 自门禁：生成的计划必须通过 check_dispatch
             result = check_dispatch.check_dispatch_project(d)
             self.assertEqual(result["errors"], [], msg=str(result["errors"]))
-            self.assertEqual(result["checked"]["requests"], 3)
+            self.assertEqual(result["checked"]["requests"], len(requests))
             self.assertEqual(result["checked"]["sections"], 3)
 
     def test_batch_size_capped_by_window(self):
@@ -517,16 +595,21 @@ class T03_PlanBuilding(unittest.TestCase):
             write_config(d, agent_dispatch="budget")  # 并发2 窗口2 → 上限4
             state = make_state(d, sections=tuple(f"sec{i}" for i in range(1, 8)))
             patch = run_plan(state)
-            self.assertEqual(len(patch["dispatch_plan"]["requests_full"]), 4)
+            plan = patch["dispatch_plan"]
+            # 窗口上限按「节」计量：4 节入批，合批后 2 个作者请求（C5 每单 ≤2 节）
+            self.assertEqual(len(plan["sections"]), 4)
+            self.assertEqual(plan["required_scope_count"], 4)
+            self.assertEqual(len(plan["requests_full"]), 2)
 
         with tempfile.TemporaryDirectory() as d:
             write_config(d, agent_dispatch="budget", agent_batch_window=1)
             state = make_state(d, sections=tuple(f"sec{i}" for i in range(1, 8)))
             patch = run_plan(state)
-            # 并发2 * 窗口1 = 2 < 7 个 pending → 只派 2 个
-            self.assertEqual(len(patch["dispatch_plan"]["requests_full"]), 2)
+            # 并发2 * 窗口1 = 2 < 7 个 pending → 只派 2 节（一个作者请求）
             self.assertEqual(patch["dispatch_plan"]["sections"],
                              ["sec1", "sec2"])
+            self.assertEqual(
+                len(patch["dispatch_plan"]["requests_full"]), 1)
 
     def test_history_archived_on_second_round(self):
         with tempfile.TemporaryDirectory() as d:
@@ -650,6 +733,7 @@ class T07_DispatchNode(unittest.TestCase):
         self.plan_patch = run_plan(self.state)
         self.state.update(self.plan_patch)
         self.batch_id = self.state["batch_id"]
+        self.requests = self.state["dispatch_plan"]["requests_full"]
 
     def _patch_pool(self, pool):
         original = sbn._get_pool
@@ -678,8 +762,9 @@ class T07_DispatchNode(unittest.TestCase):
         self.assertEqual(patch["dispatch_mode"], "parallel")
         self.assertEqual(patch["dispatch_metrics"]["ok"], 3)
         self.assertEqual(patch["dispatch_metrics"]["max_in_flight"], 2)
-        # 全部请求已提交，且 batch_id 一致
-        self.assertEqual(len(pool.submitted), 3)
+        # 全部请求已提交（C5：3 节合批成 2 个作者请求），且 batch_id 一致
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(pool.submitted), len(self.requests))
         self.assertEqual({r["batch_id"] for r in pool.submitted}, {self.batch_id})
         # 任务4：dispatch 节点绝不调 join（join 是 join 节点专属职责）
         self.assertEqual(pool.join_calls, [])
@@ -693,7 +778,7 @@ class T07_DispatchNode(unittest.TestCase):
         self.assertEqual(patch["stage"], "T2_SECTIONS_RUNNING")
         self.assertEqual(patch["dispatch_mode"], "manual")
         self.assertEqual(patch["dispatch_metrics"]["deferred"], 3)
-        self.assertEqual(len(pool.submitted), 3)
+        self.assertEqual(len(pool.submitted), len(self.requests))
         # 任务4：manual 模式同样不得在 dispatch 节点 join
         self.assertEqual(pool.join_calls, [])
 
@@ -725,15 +810,16 @@ class T08_JoinParallel(unittest.TestCase):
         return pool
 
     def test_partial_failure_routes_to_repair(self):
+        # C5：3 节 → 2 个作者请求（sec1+sec2 合批、sec3 独批）
+        self.assertEqual(
+            [list(r.get("scopes") or [r["scope"]]) for r in self.requests],
+            [["sec1", "sec2"], ["sec3"]])
         results = {
             self.requests[0]["dispatch_id"]: DispatchResult(
                 dispatch_id=self.requests[0]["dispatch_id"], scope="sec1",
-                status="ok", output={"files": {}}, attempts=1),
-            self.requests[1]["dispatch_id"]: DispatchResult(
-                dispatch_id=self.requests[1]["dispatch_id"], scope="sec2",
                 status="ok", output={"files": {}}, attempts=2),
-            self.requests[2]["dispatch_id"]: DispatchResult(
-                dispatch_id=self.requests[2]["dispatch_id"], scope="sec3",
+            self.requests[1]["dispatch_id"]: DispatchResult(
+                dispatch_id=self.requests[1]["dispatch_id"], scope="sec3",
                 status="failed", error="认知 worker 调用失败: boom", attempts=3),
         }
         self._install_pool(results, stats={"deferred": 0, "ok": 2, "failed": 1, "max_in_flight": 2})
@@ -743,21 +829,54 @@ class T08_JoinParallel(unittest.TestCase):
         self.assertEqual(patch["repair_target"], "sec3")
         self.assertEqual(patch["stage"], "REPAIR_LOOP")
         self.assertIn("sec3=failed", patch["repair_reason"])
-        # ok 的两个节已暂存
+        # 成功的合批请求逐节暂存（失败节不得让已通过节回滚）
         self.assertEqual(patch["section_statuses"]["sec1"], "staged")
         self.assertEqual(patch["section_statuses"]["sec2"], "staged")
         self.assertEqual(patch["staged_sections"]["sec1"],
                          os.path.join(self.d, "sec1.tex"))
         self.assertEqual(patch["staged_sections"]["sec2"],
                          os.path.join(self.d, "sec2.tex"))
-        # dispatch_results 以 dispatch_id 为键
-        self.assertEqual(len(patch["dispatch_results"]), 3)
-        entry = patch["dispatch_results"][self.requests[2]["dispatch_id"]]
+        # dispatch_results 以 dispatch_id 为键（一个请求一条，scope 逐节可查）
+        self.assertEqual(len(patch["dispatch_results"]), len(self.requests))
+        entry = patch["dispatch_results"][self.requests[1]["dispatch_id"]]
         self.assertEqual(entry["scope"], "sec3")
         self.assertEqual(entry["status"], "failed")
         self.assertEqual(entry["attempts"], 3)
         self.assertEqual(entry["batch_id"], self.batch_id)
         self.assertEqual(patch["dispatch_metrics"]["ok"], 2)
+
+    def test_batched_request_failure_marks_every_scope_failed(self):
+        """C5 逐节结算的反面：合批请求整单失败时，该请求覆盖的每一节都不得
+        被当成已通过（也不能只记首节失败、放过第二节）。"""
+        self.assertEqual(
+            list(self.requests[0].get("scopes") or [self.requests[0]["scope"]]),
+            ["sec1", "sec2"])
+        results = {
+            self.requests[0]["dispatch_id"]: DispatchResult(
+                dispatch_id=self.requests[0]["dispatch_id"], scope="sec1",
+                status="failed", error="文件边界不明确", attempts=1),
+            self.requests[1]["dispatch_id"]: DispatchResult(
+                dispatch_id=self.requests[1]["dispatch_id"], scope="sec3",
+                status="ok", output={"files": {}}, attempts=1),
+        }
+        self._install_pool(results, stats={"deferred": 0, "ok": 1,
+                                           "failed": 2, "max_in_flight": 2})
+        patch = node_t2_join_sections(self.state)
+        self.assertEqual(patch["routing_action"], "REPAIR_SECTION")
+        # expected 顺序首个失败节 = sec1（合批首节）
+        self.assertEqual(patch["repair_target"], "sec1")
+        self.assertIn("sec1=failed", patch["repair_reason"])
+        self.assertIn("sec2=failed", patch["repair_reason"])
+        # 失败节绝不可写成 staged / 进 staged_sections（逐节事务）
+        self.assertNotEqual(patch["section_statuses"].get("sec1"), "staged")
+        self.assertNotEqual(patch["section_statuses"].get("sec2"), "staged")
+        self.assertEqual(patch["section_statuses"]["sec3"], "staged")
+        self.assertNotIn("sec1", patch["staged_sections"])
+        self.assertNotIn("sec2", patch["staged_sections"])
+        # 该请求的元数据同时标出它覆盖的两节，便于返修环精确定位
+        entry = patch["dispatch_results"][self.requests[0]["dispatch_id"]]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(list(entry.get("scopes") or []), ["sec1", "sec2"])
 
     def test_all_ok_proceeds(self):
         results = {
@@ -771,9 +890,12 @@ class T08_JoinParallel(unittest.TestCase):
         self.assertEqual(patch["routing_action"], "PROCEED")
         self.assertEqual(patch["stage"], "T2_SECTIONS_STAGED")
         self.assertEqual(patch["active_section"], "sec1")
+        # C5 逐节落地：合批请求覆盖的每一节都要暂存
         self.assertEqual(patch["section_statuses"],
                          {"sec1": "staged", "sec2": "staged", "sec3": "staged"})
-        self.assertEqual(len(patch["dispatch_results"]), 3)
+        self.assertEqual(sorted(patch["staged_sections"]),
+                         ["sec1", "sec2", "sec3"])
+        self.assertEqual(len(patch["dispatch_results"]), len(self.requests))
         # 任务4：join 节点是本 batch 唯一 join 者，且只 join 一次
         self.assertEqual(len(pool.join_calls), 1)
 
@@ -793,23 +915,64 @@ class T08_JoinParallel(unittest.TestCase):
         self.assertEqual(len(pool.join_calls), 1)
 
     def test_under_parallelism_halts(self):
-        """audit §6 硬门禁：池全 ok 但 max_in_flight < min_parallelism → 禁止伪装完成。"""
+        """任务21（C12.4）取代「低峰值 = 伪装完成」：只警告，不返修。
+
+        历史缺陷：池全 ok 但 max_in_flight < min_parallelism 一律 HALT
+        「禁止伪装完成」。但仅剩一单 / 缓存命中 / 实际依赖 / 宿主限流都能
+        合法压低峰值，此时必须给出原因 + 警告并继续，绝不能返修学案。
+        """
         results = {
             req["dispatch_id"]: DispatchResult(
                 dispatch_id=req["dispatch_id"], scope=req["scope"],
                 status="ok", output={"files": {}}, attempts=1)
             for req in self.requests
         }
-        # fast 档 + 3 节 → min_parallelism=2；伪造实际并发 1
+        # fast 档 + 3 节 → min_parallelism=2；实际并发 1（合法低峰值）
         self._install_pool(results, stats={"deferred": 0, "ok": 3, "max_in_flight": 1})
+        patch = node_t2_join_sections(self.state)
+        self.assertEqual(patch["stage"], "T2_SECTIONS_STAGED")
+        self.assertEqual(patch["routing_action"], "PROCEED")
+        self.assertEqual(len(patch["dispatch_results"]), len(self.requests))
+        metrics = patch["dispatch_metrics"]
+        self.assertEqual(metrics["max_in_flight"], 1)
+        self.assertEqual(metrics["max_in_flight_source"], "worker_pool_stats")
+        self.assertEqual(metrics["observed_scope"], "host_call")
+        warning = metrics["parallelism_warning"]
+        self.assertEqual(warning["code"], "PARALLELISM_BELOW_DECLARED")
+        self.assertEqual(warning["observed"], 1)
+        self.assertEqual(warning["declared"], 2)
+        self.assertIs(warning["content_rework_allowed"], False)
+        # 未观测到的供应商/推理时间必须显式 None，不得写成 0
+        self.assertIsNone(metrics["vendor_queue_ms"])
+        self.assertIsNone(metrics["inference_ms"])
+
+    def test_peak_over_cap_still_halts(self):
+        """正确性阻断仍保留：峰值 > 计划并发上限 → 并发越界 HALT。"""
+        results = {
+            req["dispatch_id"]: DispatchResult(
+                dispatch_id=req["dispatch_id"], scope=req["scope"],
+                status="ok", output={"files": {}}, attempts=1)
+            for req in self.requests
+        }
+        cap = int(self.state["dispatch_plan"]["max_concurrency"])
+        self._install_pool(results, stats={"deferred": 0, "ok": 3,
+                                          "max_in_flight": cap + 1})
         patch = node_t2_join_sections(self.state)
         self.assertEqual(patch["stage"], "HALTED")
         self.assertEqual(patch["routing_action"], "HALT")
-        self.assertIn("禁止伪装完成", patch["error_message"])
-        # 主控仍须看到完整结果以便排查
-        self.assertEqual(len(patch["dispatch_results"]), 3)
+        self.assertIn("并发越界", patch["error_message"])
 
     def test_no_change_and_timeout_are_failures(self):
+        # 本用例要同时覆盖 no_change / timeout / ok 三种结果，需要「一节一请求」
+        # 口径：显式把 writer_batch_max_sections 设为 1（legacy 单节路径），
+        # 契约（三种非 ok 状态都必须判失败）与合批无关。
+        write_config(self.d, agent_dispatch="fast", writer_batch_max_sections=1)
+        state = make_state(self.d, sections=("sec1", "sec2", "sec3"))
+        state.update(run_plan(state))
+        self.state = state
+        self.batch_id = state["batch_id"]
+        self.requests = state["dispatch_plan"]["requests_full"]
+        self.assertEqual(len(self.requests), 3)
         results = {
             self.requests[0]["dispatch_id"]: DispatchResult(
                 dispatch_id=self.requests[0]["dispatch_id"], scope="sec1",
@@ -829,6 +992,8 @@ class T08_JoinParallel(unittest.TestCase):
         self.assertEqual(patch["repair_target"], "sec1")  # expected 顺序首个失败
         self.assertEqual(patch["dispatch_results"]
                          [self.requests[0]["dispatch_id"]]["status"], "no_change")
+        self.assertEqual(patch["dispatch_results"]
+                         [self.requests[1]["dispatch_id"]]["status"], "timeout")
 
     def test_huge_output_is_omitted(self):
         big = {"blob": "x" * (sbn.MAX_OUTPUT_CHARS + 100)}
@@ -892,7 +1057,7 @@ class T09_JoinManual(unittest.TestCase):
         self.assertEqual(payload["required_tool"], "qchain_dispatch")
         self.assertEqual(payload["forbidden"],
                          ["主 Agent 直写 artifacts", "同会话自行撰写产物内容"])
-        self.assertEqual(len(payload["requests"]), 3)
+        self.assertEqual(len(payload["requests"]), len(self.requests))
         self.assertEqual(payload["artifacts"],
                          ["sec1.tex", "sec2.tex", "sec3.tex"])
         self.assertEqual(sorted(payload["before_digests"].keys()),
@@ -900,8 +1065,15 @@ class T09_JoinManual(unittest.TestCase):
         for req, item in zip(self.requests, payload["requests"]):
             self.assertEqual(item["dispatch_id"], req["dispatch_id"])
             self.assertEqual(item["scope"], req["scope"])
+            # 卡13：载荷必须让宿主子 Agent 看见合批请求覆盖的每一节
+            self.assertEqual(item["scopes"],
+                             list(req.get("scopes") or [req["scope"]]))
             self.assertEqual(item["artifacts"], req["artifacts"])
             self.assertEqual(item["instruction"], req["instruction"])
+        # 合批后请求数少于节数，但覆盖的节必须与整批一致
+        self.assertEqual(
+            [s for item in payload["requests"] for s in item["scopes"]],
+            ["sec1", "sec2", "sec3"])
         self.assertEqual(patch["manual_interrupted_batch"], self.batch_id)
         self.assertEqual(patch["stage"], "T2_SECTIONS_RUNNING")
 
@@ -913,7 +1085,7 @@ class T09_JoinManual(unittest.TestCase):
                       encoding="utf-8") as f:
                 f.write(f"% {sec} 内容\n")
         # 证据链：qchain_dispatch 派发子 Agent 写完即落证据（唯一放行依据）
-        seed_agent_calls(self.d, self.requests[:2])
+        seed_agent_calls(self.d, self.requests[:1])
         patch2 = node_t2_join_sections(state)
         self.assertEqual(len(self.captured), 1)  # 没有第二次 interrupt
         self.assertEqual(patch2["routing_action"], "REPAIR_SECTION")
@@ -922,11 +1094,15 @@ class T09_JoinManual(unittest.TestCase):
                          [self.requests[0]["dispatch_id"]]["status"], "ok")
         self.assertEqual(patch2["dispatch_results"]
                          [self.requests[0]["dispatch_id"]]["verified_via"], "agent")
+        # 合批请求里已写完的两节都要逐节暂存
         self.assertEqual(patch2["section_statuses"]["sec1"], "staged")
+        self.assertEqual(patch2["section_statuses"]["sec2"], "staged")
         self.assertEqual(patch2["staged_sections"]["sec1"],
                          os.path.join(self.d, "sec1.tex"))
+        self.assertEqual(patch2["staged_sections"]["sec2"],
+                         os.path.join(self.d, "sec2.tex"))
         self.assertEqual(patch2["dispatch_results"]
-                         [self.requests[2]["dispatch_id"]]["status"],
+                         [self.requests[1]["dispatch_id"]]["status"],
                          "missing_artifacts")
 
         # --- 第三次进入（产物全部缺失）：missing_artifacts → 返修，仍不重复中断 ---
@@ -977,12 +1153,15 @@ class T09_JoinManual(unittest.TestCase):
         state = dict(self.state)
         state["dispatch_mode"] = "parallel"
         state.pop("manual_interrupted_batch", None)
-        # 模拟 worker 已写完 sec1/sec2，sec3 尚未写（崩溃时点）
+        # 模拟 worker 已写完 sec1/sec2（同一张合批单），sec3 尚未写（崩溃时点）
         for sec in ("sec1", "sec2"):
             with open(os.path.join(self.d, f"{sec}.tex"), "w",
                       encoding="utf-8") as f:
                 f.write(f"% {sec} 内容\n")
-        seed_agent_calls(self.d, self.requests[:2])
+        self.assertEqual(
+            list(self.requests[0].get("scopes") or [self.requests[0]["scope"]]),
+            ["sec1", "sec2"])
+        seed_agent_calls(self.d, self.requests[:1])
         patch = node_t2_join_sections(state)
 
         self.assertEqual(len(self.captured), 0)  # 绝不 interrupt
@@ -993,10 +1172,9 @@ class T09_JoinManual(unittest.TestCase):
         self.assertEqual(patch["dispatch_results"]
                          [self.requests[0]["dispatch_id"]]["verified_via"], "agent")
         self.assertEqual(patch["dispatch_results"]
-                         [self.requests[1]["dispatch_id"]]["status"], "ok")
-        self.assertEqual(patch["dispatch_results"]
-                         [self.requests[2]["dispatch_id"]]["status"],
+                         [self.requests[1]["dispatch_id"]]["status"],
                          "missing_artifacts")
+        # 合批单内的两节各自独立结算，都被暂存
         self.assertEqual(patch["section_statuses"]["sec1"], "staged")
         self.assertEqual(patch["section_statuses"]["sec2"], "staged")
 
@@ -1024,7 +1202,10 @@ class T09_JoinManual(unittest.TestCase):
             payload_seen.append(payload)
             return {
                 "dispatch_protocol": "host-subagent-v1",
+                # 卡13：第一张请求覆盖 sec1+sec2，响应必须写全它名下的每一节
+                # （只写 sec1 会被判 missing_artifacts，不再算整单通过）
                 "files": {"sec1.tex": "% sec1 from response\n",
+                          "sec2.tex": "% sec2 from response\n",
                           "not-allowed.tex": "应当被忽略\n"},
             }
 
@@ -1033,6 +1214,7 @@ class T09_JoinManual(unittest.TestCase):
         patch = node_t2_join_sections(self.state)
         self.assertEqual(len(payload_seen), 1)
         self.assertTrue(os.path.isfile(os.path.join(self.d, "sec1.tex")))
+        self.assertTrue(os.path.isfile(os.path.join(self.d, "sec2.tex")))
         self.assertFalse(os.path.exists(os.path.join(self.d, "not-allowed.tex")))
         self.assertEqual(patch["manual_interrupted_batch"], self.batch_id)
 
@@ -1046,6 +1228,7 @@ class T09_JoinManual(unittest.TestCase):
         self.assertEqual(patch2["dispatch_results"]
                          [self.requests[0]["dispatch_id"]]["verified_via"], "agent")
         self.assertEqual(patch2["section_statuses"]["sec1"], "staged")
+        self.assertEqual(patch2["section_statuses"]["sec2"], "staged")
 
     def test_resume_response_legacy_no_protocol_not_blocked(self):
         """旧 checkpoint 中断响应缺 dispatch_protocol 字段 → 不拦截（向后兼容）。"""
@@ -1119,10 +1302,10 @@ class T10_ResumeSafety(unittest.TestCase):
             # 进程重启后内存池为空：_live_pool 返回 None
             self.assertIsNone(sbn._live_pool(state["batch_id"]))
 
-            for req in requests:
-                with open(os.path.join(d, f"{req['scope']}.tex"), "w",
+            for sec in ("sec1", "sec2"):
+                with open(os.path.join(d, f"{sec}.tex"), "w",
                           encoding="utf-8") as f:
-                    f.write(f"% {req['scope']}\n")
+                    f.write(f"% {sec}\n")
             seed_agent_calls(d, requests)
             patch = node_t2_join_sections(state)
             self.assertEqual(captured, [])          # 绝不重复 interrupt
@@ -1153,10 +1336,8 @@ class T10_ResumeSafety(unittest.TestCase):
             sbn.interrupt = lambda payload: captured.append(payload) or {}
             self.addCleanup(lambda: setattr(sbn, "interrupt", original))
 
-            for req in requests:   # 直写但不落证据（q_audit.md 审计发现的违规形态）
-                with open(os.path.join(d, f"{req['scope']}.tex"), "w",
-                          encoding="utf-8") as f:
-                    f.write(f"% {req['scope']} 主线程直写\n")
+            # 直写但不落证据（q_audit.md 审计发现的违规形态）
+            write_products(d, requests, "% {sec} 主线程直写\n")
             patch = node_t2_join_sections(state)
             self.assertEqual(captured, [])
             self.assertEqual(patch["routing_action"], "REPAIR_SECTION")
@@ -1165,6 +1346,11 @@ class T10_ResumeSafety(unittest.TestCase):
                 entry = patch["dispatch_results"][req["dispatch_id"]]
                 self.assertEqual(entry["status"], "ok_unattested")
                 self.assertEqual(entry["verified_via"], "unattested")
+                # 逐节结算：合批请求覆盖的每一节都各自判 ok_unattested
+                self.assertEqual(set(entry["scope_statuses"].values()),
+                                 {"ok_unattested"})
+                self.assertEqual(sorted(entry["scope_statuses"]),
+                                 scope_list(req))
             self.assertTrue(any("产物无代理证据" in h for h in patch["history"]))
 
     def test_verify_from_disk_unattested_escape_valve_allows(self):
@@ -1184,10 +1370,7 @@ class T10_ResumeSafety(unittest.TestCase):
             sbn.interrupt = lambda payload: {}
             self.addCleanup(lambda: setattr(sbn, "interrupt", original))
 
-            for req in requests:
-                with open(os.path.join(d, f"{req['scope']}.tex"), "w",
-                          encoding="utf-8") as f:
-                    f.write(f"% {req['scope']} 直写放行\n")
+            write_products(d, requests, "% {sec} 直写放行\n")
             patch = node_t2_join_sections(state)
             self.assertEqual(patch["routing_action"], "PROCEED")
             for req in requests:
@@ -1213,19 +1396,25 @@ class T10_ResumeSafety(unittest.TestCase):
             sbn.interrupt = lambda payload: {}
             self.addCleanup(lambda: setattr(sbn, "interrupt", original))
 
-            for req in requests:
-                with open(os.path.join(d, f"{req['scope']}.tex"), "w",
-                          encoding="utf-8") as f:
-                    f.write(f"% {req['scope']} 初版\n")
+            write_products(d, requests, "% {sec} 初版\n")
             seed_agent_calls(d, requests)
             # 证据落盘后主 Agent 又改写了产物 → 摘要漂移
             with open(os.path.join(d, "sec1.tex"), "w", encoding="utf-8") as f:
                 f.write("% sec1 被事后改写\n")
             patch = node_t2_join_sections(state)
             self.assertEqual(patch["routing_action"], "REPAIR_SECTION")
-            self.assertEqual(
-                patch["dispatch_results"][requests[0]["dispatch_id"]]["status"],
-                "attested_mismatch")
+            self.assertEqual(patch["repair_target"], "sec1")
+            # 逐节核验：只有被改写的 sec1 判 attested_mismatch，
+            # 同一张合批单里未被改动的 sec2 仍判 ok（不连坐）
+            entry = patch["dispatch_results"][requests[0]["dispatch_id"]]
+            self.assertEqual(entry["scope_statuses"].get("sec1"),
+                             "attested_mismatch")
+            self.assertEqual(entry["scope_statuses"].get("sec2"), "ok")
+            # 请求摘要仍指向可保留的节，但失败节必须出现在 ok_scopes 之外
+            self.assertEqual(entry["scope"], "sec2")
+            self.assertEqual(entry["ok_scopes"], ["sec2"])
+            self.assertEqual(patch["section_statuses"]["sec2"], "staged")
+            self.assertNotEqual(patch["section_statuses"].get("sec1"), "staged")
             # attested_mismatch 无逃生阀：即使开 allow_unattested 也失败
             write_config(d, allow_unattested=True)
             state2 = dict(state)
@@ -1325,8 +1514,14 @@ class T11_PdstateIntegration(unittest.TestCase):
             for sec in ("sec1", "sec2", "sec3"):
                 task = run_after["tasks"][sec]
                 self.assertTrue(task["attempts"], msg=f"{sec} 未创建 attempt")
-            # 派发单落盘
-            self.assertEqual(len(request_files(d)), 3)
+            # 派发单落盘（卡13：3 节默认合批为 2 张作者请求）
+            self.assertEqual(len(request_files(d)),
+                             len(patch["dispatch_plan"]["requests_full"]))
+            self.assertEqual(len(request_files(d)), 2)
+            with open(plan_file(d), "r", encoding="utf-8") as f:
+                plan_disk = json.load(f)
+            self.assertEqual(plan_disk["required_scope_count"], 3)
+            self.assertEqual(plan_disk["batch_size"], 2)
 
     def test_gate_rejects_hand_broken_plan(self):
         """反向证据：手工破坏磁盘计划 → 真实门禁必须报错（证明门禁真的在跑）。"""
@@ -1346,15 +1541,88 @@ class T11_PdstateIntegration(unittest.TestCase):
             patch = node_t2_plan_dispatch(state)
             self.assertEqual(patch["stage"], "T2_SECTIONS_PENDING")
 
-            # 手工把并发上限改成 1（< 请求数 2）→ R7 OVER_CONCURRENCY
+            # 手工把执行并发上限改成 0（非法）→ BAD_CONCURRENCY
+            # （任务19：并发上限改成 1 不再算违规——排队请求数可以大于槽位）
             with open(plan_file(d), "r", encoding="utf-8") as f:
                 plan = json.load(f)
-            plan["max_concurrency"] = 1
+            plan["max_concurrency"] = 0
             with open(plan_file(d), "w", encoding="utf-8") as f:
                 json.dump(plan, f, ensure_ascii=False, indent=2)
             result = check_dispatch.check_dispatch_project(d)
             codes = [e["code"] for e in result["errors"]]
-            self.assertIn("OVER_CONCURRENCY", codes)
+            self.assertIn("BAD_CONCURRENCY", codes)
+
+    def test_gate_accepts_queued_batch_exceeding_slots(self):
+        """任务19 / PARCFG-04：8 个排队请求 + 4 个并发槽位必须通过门禁。
+
+        同时验证计划字段的真实语义：batch_size=排队请求数（卡13 起 = 作者
+        请求数，不再是 1 节 1 请求）、required_scope_count=小节数、
+        max_concurrency=4（执行上限，不再被请求数抬高）、
+        effective_concurrency <= 4、executor_kind 明确。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "self")
+            os.makedirs(d)
+            with open(os.path.join(d, "main.tex"), "w", encoding="utf-8") as f:
+                f.write(MAIN_TEX)
+            # 关掉合批 → 8 节 = 8 张请求，才能真正"排队数 > 槽位"
+            write_config(d, agent_dispatch="fast", writer_batch_max_sections=1)
+            init = subprocess.run(
+                [sys.executable, os.path.join(HERE, "pdstate.py"), d, "init"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace")
+            self.assertEqual(init.returncode, 0, msg=init.stdout + init.stderr)
+
+            sections = tuple(f"sec{i}" for i in range(1, 9))
+            state = make_state(d, sections=sections)
+            patch = node_t2_plan_dispatch(state)
+            self.assertEqual(patch["stage"], "T2_SECTIONS_PENDING")
+
+            with open(plan_file(d), "r", encoding="utf-8") as f:
+                plan = json.load(f)
+            self.assertEqual(plan["batch_size"], len(plan["requests"]))
+            self.assertEqual(plan["batch_size"], 8)
+            self.assertEqual(plan["required_scope_count"], 8)
+            self.assertLessEqual(plan["max_concurrency"], 4)
+            self.assertLessEqual(plan["effective_concurrency"],
+                                 plan["max_concurrency"])
+            self.assertIn(plan["executor_kind"],
+                          ("python_registry", "host_subagent"))
+            self.assertEqual(plan["dispatch_contract_version"], 1)
+            result = check_dispatch.check_dispatch_project(d)
+            self.assertEqual(result["errors"], [], msg=str(result["errors"]))
+
+    def test_gate_accepts_batched_plan_covering_all_sections(self):
+        """卡13：合批后请求数少于节数，门禁按 scopes 并集校验覆盖，不得误判。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "self")
+            os.makedirs(d)
+            with open(os.path.join(d, "main.tex"), "w", encoding="utf-8") as f:
+                f.write(MAIN_TEX)
+            write_config(d, agent_dispatch="fast")
+            init = subprocess.run(
+                [sys.executable, os.path.join(HERE, "pdstate.py"), d, "init"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace")
+            self.assertEqual(init.returncode, 0, msg=init.stdout + init.stderr)
+
+            sections = tuple(f"sec{i}" for i in range(1, 9))
+            state = make_state(d, sections=sections)
+            patch = node_t2_plan_dispatch(state)
+            self.assertEqual(patch["stage"], "T2_SECTIONS_PENDING")
+
+            with open(plan_file(d), "r", encoding="utf-8") as f:
+                plan = json.load(f)
+            # 8 节两两合批 → 4 张请求；覆盖仍是 8 节
+            self.assertEqual(len(plan["requests"]), 4)
+            self.assertEqual(plan["batch_size"], 4)
+            self.assertEqual(plan["required_scope_count"], 8)
+            self.assertEqual(plan["schema_version"], 2)
+            covered = [s for req in plan["requests"]
+                       for s in (req.get("scopes") or [req.get("scope")])]
+            self.assertEqual(covered, list(sections))
+            result = check_dispatch.check_dispatch_project(d)
+            self.assertEqual(result["errors"], [], msg=str(result["errors"]))
 
 
 # ---------------------------------------------------------------------------
@@ -1511,6 +1779,168 @@ class T12_WorkSetSelection(unittest.TestCase):
             self.assertEqual(second["stage"], "T2_SECTIONS_STAGED")
             self.assertNotIn("dispatch_plan", second)
             self.assertEqual(len(request_files(d)), 1)
+
+
+# ---------------------------------------------------------------------------
+# T13 R10 源资产计数（复盘报告 §4.3.3 内容审计前置）
+# ---------------------------------------------------------------------------
+
+#: 源资产夹具：2 个 \includegraphics + 1 个 tikzcd + 1 个 tabular，
+#: 另有一个注释中的假 \includegraphics（不得计数）与一个被排除的文件。
+#: 期望口径与 check_fidelity 第 8 项一致：figure=3（2 图 + 1 tikzcd），
+#: table=1，tikz=1。
+SOURCE_TEX = (
+    r"% qid: src-1" + "\n"
+    r"\section*{Source}" + "\n"
+    r"\begin{tabular}{cc}a & b\end{tabular}" + "\n"
+    r"\includegraphics[width=0.5\textwidth]{fig/a.png}" + "\n"
+    r"% \includegraphics{fig/commented-out.png} 注释中的假图形不计" + "\n"
+    r"\begin{tikzcd}A \arrow[r] & B\end{tikzcd}" + "\n"
+    r"\includegraphics{fig/b.pdf}" + "\n"
+)
+EXPECTED_SOURCE_ASSETS = {"figure": 3, "table": 1, "tikz": 1, "available": True}
+UNAVAILABLE_SOURCE_ASSETS = {"figure": 0, "table": 0, "tikz": 0,
+                             "available": False}
+
+
+def seed_source_manifest(d, project_root=None):
+    """在 <d> 下落一份 Phase 0 冻结形态的 source-manifest + 源 TeX 夹具。
+
+    返回期望的源资产计数字典。project_root 缺省为 d 自身（manifest 的
+    project_root 字段即按它解析相对路径，与 check_fidelity 同一定位方式）。
+    """
+    project_root = project_root or d
+    os.makedirs(os.path.join(d, ".pd"), exist_ok=True)
+    with open(os.path.join(d, "source.tex"), "w", encoding="utf-8") as f:
+        f.write(SOURCE_TEX)
+    # 排除项（role=optional-problem / include=false）不得计入对账基线
+    with open(os.path.join(d, "excluded.tex"), "w", encoding="utf-8") as f:
+        f.write(r"\includegraphics{fig/excluded.png}" + "\n")
+    manifest = {
+        "schema_version": 1,
+        "frozen_at": "2024-01-01T00:00:00+00:00",
+        "title": "源资产计数夹具",
+        "project_root": project_root,
+        "sources": [
+            {"path": "source.tex", "role": "source-baseline",
+             "digest": "0" * 64, "include": True,
+             "reason": "用户确认的原材料"},
+            {"path": "excluded.tex", "role": "optional-problem",
+             "digest": "1" * 64, "include": False,
+             "reason": "用户排除的四道真题"},
+        ],
+    }
+    with open(os.path.join(d, ".pd", "source-manifest.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    return dict(EXPECTED_SOURCE_ASSETS)
+
+
+class T13_SourceAssets(unittest.TestCase):
+    """T13: 派发单 context / 磁盘计划携带源侧资产计数（R10 前置）。"""
+
+    def test_batch_plan_carries_source_assets(self):
+        with tempfile.TemporaryDirectory() as d:
+            expected = seed_source_manifest(d)
+            write_config(d, agent_dispatch="fast")
+            state = make_state(d, sections=("sec1", "sec2"))
+            patch = run_plan(state)
+            self.assertEqual(patch["stage"], "T2_SECTIONS_PENDING")
+
+            requests = patch["dispatch_plan"]["requests_full"]
+            # 卡13：2 个相邻节默认合批为 1 张作者请求（仍逐节携带源侧计数）
+            self.assertEqual(
+                [list(r.get("scopes") or [r["scope"]]) for r in requests],
+                [["sec1", "sec2"]])
+            for req in requests:
+                # 一次计划内逐节复用同一 dict（input_digest 的 context 分量一致）
+                self.assertEqual(req["context"]["source_assets"], expected)
+            with open(plan_file(d), "r", encoding="utf-8") as f:
+                disk = json.load(f)
+            for entry in disk["requests"]:
+                self.assertEqual(entry["source_assets"], expected)
+            # 磁盘计划必须过真实门禁（R10 只认 T2 轮次的合法计数）
+            result = check_dispatch.check_dispatch_project(d)
+            self.assertEqual(result["errors"], [], msg=str(result["errors"]))
+
+    def test_source_asset_counts_helper(self):
+        """单元口径：helper 读 manifest 计数（排除项 / 注释均不计数）。"""
+        with tempfile.TemporaryDirectory() as d:
+            seed_source_manifest(d)
+            self.assertEqual(sbn._source_asset_counts(d),
+                             EXPECTED_SOURCE_ASSETS)
+            # manifest 缺失 → available=False 空计数（夹具/异常早退场景）
+            os.remove(os.path.join(d, ".pd", "source-manifest.json"))
+            self.assertEqual(sbn._source_asset_counts(d),
+                             UNAVAILABLE_SOURCE_ASSETS)
+
+    def test_corrupt_manifest_halts_fail_closed(self):
+        """manifest 损坏 → 节点 HALT（fail closed，不静默跳过对账）。"""
+        with tempfile.TemporaryDirectory() as d:
+            seed_source_manifest(d)
+            write_config(d, agent_dispatch="fast")
+            with open(os.path.join(d, ".pd", "source-manifest.json"), "w",
+                      encoding="utf-8") as f:
+                f.write("{ not json ")
+            patch = run_plan(make_state(d, sections=("sec1", "sec2")))
+            self.assertEqual(patch["stage"], "HALTED")
+            self.assertEqual(patch["routing_action"], "HALT")
+            self.assertIn("源资产计数失败", patch["error_message"])
+            self.assertIn("BAD_SOURCE_MANIFEST", patch["error_message"])
+            # 硬停止：不得留下派发计划
+            self.assertFalse(os.path.isfile(plan_file(d)))
+
+    def test_unreadable_source_halts_fail_closed(self):
+        """manifest 存在但源文件缺失 → HALT（不得静默按 0 计数放行）。"""
+        with tempfile.TemporaryDirectory() as d:
+            seed_source_manifest(d)
+            write_config(d, agent_dispatch="fast")
+            os.remove(os.path.join(d, "source.tex"))
+            patch = run_plan(make_state(d, sections=("sec1", "sec2")))
+            self.assertEqual(patch["stage"], "HALTED")
+            self.assertIn("SOURCE_UNREADABLE", patch["error_message"])
+
+    def test_missing_manifest_warns_but_dispatches(self):
+        """manifest 缺失 → available=false 空计数 + history 警告，不 HALT。"""
+        with tempfile.TemporaryDirectory() as d:
+            write_config(d, agent_dispatch="fast")
+            patch = run_plan(make_state(d, sections=("sec1", "sec2")))
+            self.assertEqual(patch["stage"], "T2_SECTIONS_PENDING")
+            for req in patch["dispatch_plan"]["requests_full"]:
+                self.assertEqual(req["context"]["source_assets"],
+                                 UNAVAILABLE_SOURCE_ASSETS)
+            self.assertTrue(any("源资产清单不可用" in line
+                                for line in patch["history"]))
+
+    def test_serial_path_request_carries_source_assets(self):
+        """T2 串行路径（section_nodes）同样把 source_assets 放进请求 context。"""
+        from workflow.nodes.section_nodes import node_t2_request_sections
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "self")
+            os.makedirs(d)
+            with open(os.path.join(d, "main.tex"), "w", encoding="utf-8") as f:
+                f.write(MAIN_TEX)
+            expected = seed_source_manifest(d)
+            init = subprocess.run(
+                [sys.executable, os.path.join(HERE, "pdstate.py"), d, "init"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace")
+            self.assertEqual(init.returncode, 0, msg=init.stdout + init.stderr)
+
+            patch = node_t2_request_sections(
+                make_state(d, sections=("sec1", "sec2")))
+            self.assertEqual(patch["active_section"], "sec1")
+            req = patch["pending_dispatch"]
+            self.assertEqual(req["context"]["source_assets"], expected)
+            self.assertTrue(any("源资产清单不可用" not in line
+                                for line in patch["history"]))
+            # 派发单已落盘：子 Agent 侧可见同一份计数
+            with open(os.path.join(d, ".pd", "agent-requests",
+                                   f"{req['dispatch_id']}.json"),
+                      "r", encoding="utf-8") as f:
+                on_disk = json.load(f)
+            self.assertEqual(on_disk["context"]["source_assets"], expected)
 
 
 if __name__ == "__main__":

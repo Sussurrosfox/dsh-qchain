@@ -30,15 +30,18 @@ import setup_self
 from langgraph.types import Command
 
 if __package__:
-    from .graph import create_shrink_courseware_graph
+    from .graph import create_graph_for_version
     from .state import ShrinkCoursewareState
+    from . import execution_policy
 else:
     try:
-        from workflow.graph import create_shrink_courseware_graph
+        from workflow.graph import create_graph_for_version
         from workflow.state import ShrinkCoursewareState
+        from workflow import execution_policy
     except ImportError:
-        from graph import create_shrink_courseware_graph
+        from graph import create_graph_for_version
         from state import ShrinkCoursewareState
+        import execution_policy
 
 DEFAULT_DB_NAME = "courseware_checkpoints.sqlite"
 _SAVER_CACHE: Dict[str, Any] = {}
@@ -72,10 +75,66 @@ def get_checkpointer(db_path: Optional[str] = None):
     return saver
 
 
-def get_graph(db_path: Optional[str] = None):
+def get_graph(db_path: Optional[str] = None, graph_version: Optional[str] = None):
+    """按已冻结的图版本编译执行图（缺省 legacy-v1）。
+
+    任务10：调用方**必须**先经 `resume_target()` 从检查点读到冻结版本，
+    再把它传进来；不允许用当前 YAML 决定图版本（否则旧会话会被静默换图）。
+    """
+    version = graph_version or execution_policy.GRAPH_VERSION_LEGACY
     if db_path:
-        return create_shrink_courseware_graph(checkpointer=get_checkpointer(db_path))
-    return create_shrink_courseware_graph()
+        return create_graph_for_version(version, checkpointer=get_checkpointer(db_path))
+    return create_graph_for_version(version)
+
+
+def read_frozen_execution(db_path: Optional[str] = None,
+                          thread_id: str = "qchain_session",
+                          checkpoint_id: Optional[str] = None) -> Dict[str, Any]:
+    """只读检查点的 channel_values（不编译图、不写入、不迁移）。
+
+    旧检查点没有执行字段 -> 返回空 dict（由 execution_policy 解释为 legacy）。
+    """
+    if not db_path:
+        return {}
+    configurable: Dict[str, Any] = {"thread_id": thread_id, "checkpoint_ns": ""}
+    if checkpoint_id:
+        configurable["checkpoint_id"] = checkpoint_id
+    try:
+        tup = get_checkpointer(db_path).get_tuple({"configurable": configurable})
+    except Exception:
+        return {}
+    if not tup:
+        return {}
+    checkpoint = getattr(tup, "checkpoint", None) or {}
+    values = checkpoint.get("channel_values") or {}
+    return dict(values) if isinstance(values, dict) else {}
+
+
+def resume_target(db_path: Optional[str] = None,
+                  thread_id: str = "qchain_session",
+                  checkpoint_id: Optional[str] = None,
+                  requested_profile: Optional[str] = None) -> Dict[str, Any]:
+    """恢复目标判定：**先读检查点冻结版本**，再谈其它。
+
+    C1 规则1/2/3/6：
+      * 旧检查点（无执行版本号）-> legacy-v1，content_policy=faithful 不换图；
+      * 冻结版本未知或与契约冲突 -> SystemExit（显式拒绝，不猜回退）；
+      * 显式请求的 execution_profile 不得覆盖已冻结值。
+    """
+    values = read_frozen_execution(db_path, thread_id, checkpoint_id)
+    try:
+        policy = execution_policy.resolve_resume(
+            values, values.get("intent_contract"))
+        execution_policy.assert_profile_not_overriding(policy, requested_profile)
+        self_dir = values.get("self_dir")
+        if self_dir:
+            execution_policy.assert_config_not_overriding(self_dir, policy)
+    except execution_policy.ExecutionPolicyError as exc:
+        raise SystemExit(
+            "[runner] 恢复被拒绝 [%s]: %s\n"
+            "  - 旧会话的执行图已冻结，不得被当前 YAML/参数改写；\n"
+            "  - 若要更换执行策略：请新开 thread 或显式重新确认。" % (exc.code, exc.detail))
+    return policy
 
 
 def run_pipeline(
@@ -103,7 +162,14 @@ def run_pipeline(
         lesson_minutes=lesson_minutes
     )
 
-    graph = get_graph(db_path)
+    # 任务10（C1 规则4/5）：新 run 的执行图由「本次请求 > config.yaml > legacy」
+    # 解析后显式决定；解析失败/版本未知一律显式拒绝，绝不静默回退。
+    try:
+        exec_policy = execution_policy.resolve_new_run(
+            user_spec or {}, config_path=os.path.join(self_dir, "config.yaml"))
+    except execution_policy.ExecutionPolicyError as exc:
+        raise SystemExit("[runner] 执行策略解析失败 [%s]: %s" % (exc.code, exc.detail))
+    graph = get_graph(db_path, graph_version=exec_policy["graph_version"])
     config = {"configurable": {"thread_id": thread_id}}
 
     # A2：串线防护 —— 同一 thread 已有检查点时，拒绝直接复用（旧 user_spec/
@@ -146,7 +212,11 @@ def run_pipeline(
         "run_scope": run_scope,
         "target_sections": normalize_targets(spec.get("target_sections")),
         "target_qids": normalize_targets(spec.get("target_qids")),
-        "history": [f"Runner: 启动题链流水线 (工作区强制锁定于: {self_dir})..."]
+        "history": [
+            f"Runner: 启动题链流水线 (工作区强制锁定于: {self_dir})...",
+            "Runner: 执行策略 profile=%s / graph=%s（Phase 0 确认后冻结，旧会话不受影响）"
+            % (exec_policy["execution_profile"], exec_policy["graph_version"]),
+        ]
     }
 
     result = graph.invoke(init_state, config=config)
@@ -157,10 +227,18 @@ def resume_pipeline(
     user_response: Dict[str, Any],
     thread_id: str = "qchain_session",
     db_path: Optional[str] = None,
-    expected_self_dir: Optional[str] = None
+    expected_self_dir: Optional[str] = None,
+    requested_profile: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Resume pipeline from a Phase 0 human interrupt."""
-    graph = get_graph(db_path)
+    """Resume pipeline from a Phase 0 human interrupt.
+
+    任务10（C1 规则1/2/3）：**先**从检查点读冻结的执行版本，再编译对应执行图。
+    旧检查点没有版本号 -> legacy-v1（content_policy=faithful 也不换图）；
+    未知版本/契约冲突/被覆盖的 profile -> SystemExit（显式拒绝，不猜回退）。
+    """
+    target = resume_target(db_path=db_path, thread_id=thread_id,
+                           requested_profile=requested_profile)
+    graph = get_graph(db_path, graph_version=target["graph_version"])
     config = {"configurable": {"thread_id": thread_id}}
 
     # A2：跨工作区串线防护 —— 恢复前比对检查点中的 self_dir 与本次推导值
@@ -207,6 +285,10 @@ def main():
                              "令牌由流水线写入 .langgraph/phase0_token.txt，严禁 Agent 自行读取）")
     parser.add_argument("--reuse-thread", action="store_true",
                         help="允许 --run 复用已有检查点的 thread_id（默认拒绝，防状态串线）")
+    parser.add_argument("--execution-profile", choices=["legacy", "faithful_fast"], default=None,
+                        help="执行策略：legacy(默认，旧图) | faithful_fast(轻量图；接通前显式报未实现)。"
+                             "内容策略 content_policy 不决定执行图；--resume 时以检查点冻结版本为准，"
+                             "本参数不得覆盖已冻结值")
 
     args = parser.parse_args()
 
@@ -217,7 +299,14 @@ def main():
     db_path = args.checkpoint_db or default_checkpoint_db(project_root)
 
     if args.status:
-        graph = get_graph(db_path)
+        # 任务10：状态查询也按**冻结版本**选图，避免用当前 YAML 误读旧会话
+        try:
+            frozen_view = execution_policy.resolve_resume(
+                read_frozen_execution(db_path, args.thread_id))
+        except execution_policy.ExecutionPolicyError as exc:
+            print("[runner] 检查点执行契约异常 [%s]: %s" % (exc.code, exc.detail))
+            raise SystemExit(2)
+        graph = get_graph(db_path, graph_version=frozen_view["graph_version"])
         config = {"configurable": {"thread_id": args.thread_id}}
         try:
             state_snapshot = graph.get_state(config)
@@ -234,6 +323,8 @@ def main():
             print(f"  当前阶段: {vals.get('stage', 'UNKNOWN')}")
             print(f"  路由动作: {vals.get('routing_action', 'NONE')}")
             print(f"  输出格式: {vals.get('output_format', 'both')}")
+            print(f"  执行策略: {frozen_view['execution_profile']} "
+                  f"(graph={frozen_view['graph_version']})")
             if state_snapshot and state_snapshot.next:
                 print(f"  待执行节点: {', '.join(state_snapshot.next)}")
             hist = vals.get("history", [])
@@ -275,6 +366,8 @@ def main():
             spec["output_format"] = args.format
         if args.lesson_minutes is not None:
             spec["lesson_minutes"] = args.lesson_minutes
+        if args.execution_profile:
+            spec["execution_profile"] = args.execution_profile
         print(f"[*] 启动流水线: project={project_root}, thread={args.thread_id}, "
               f"format={args.format or 'both'}")
         res = run_pipeline(
@@ -310,6 +403,8 @@ def main():
             spec["output_format"] = args.format
         if args.lesson_minutes is not None:
             spec["lesson_minutes"] = args.lesson_minutes
+        # 任务10：--execution-profile 不写进 spec（避免覆盖冻结值），
+        # 而是作为「请求值」交给 resume_target 校验；不一致则显式拒绝。
         spec.setdefault("main_title", "学案")
         spec.setdefault("delivery_profile", "self_study")
         spec.setdefault("output_format", "both")
@@ -322,7 +417,8 @@ def main():
             user_response={"user_spec": spec, "token": token},
             thread_id=args.thread_id,
             db_path=db_path,
-            expected_self_dir=self_dir
+            expected_self_dir=self_dir,
+            requested_profile=args.execution_profile
         )
         print(f"[*] 执行阶段: {res.get('stage')}, 路由: {res.get('routing_action')}")
         return

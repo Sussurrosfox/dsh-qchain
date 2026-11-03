@@ -31,12 +31,21 @@ for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import asset_bundle  # noqa: E402
+import math_fragments  # noqa: E402
+
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 DEFAULT_TEMPLATE = os.path.join(ROOT, "templates", "html",
                                 "deck.template.html")
 
-RE_IMG = re.compile(r"\\includegraphics\s*(?:\[[^\]]*\])?\s*\{([^{}]*)\}")
-IMG_EXTS = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp")
+#: 随模版一起发布的 KaTeX 静态资源目录（离线自足，不再依赖 CDN）。
+#: 交付物旁的 `katex/` 目录由 copy_katex() 从该处复制而来。
+KATEX_SRC = os.path.join(ROOT, "templates", "html", "katex")
+
+RE_IMG = asset_bundle.RE_IMG
+IMG_EXTS = asset_bundle.IMG_EXTS
 
 KIND_LABEL = {
     "section": "节标题",
@@ -72,42 +81,66 @@ def load_config_value(project, key, default=""):
 
 
 def collect_images(project):
-    """项目切片引用的图片资产（含无扩展名探测）。"""
-    images = {}
-    for name in sorted(os.listdir(project)):
-        if not re.fullmatch(r"sec.*\.tex", name) or name == "sec_template.tex":
-            continue
-        with open(os.path.join(project, name), encoding="utf-8",
-                  errors="replace") as f:
-            for raw in RE_IMG.findall(f.read()):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                cand = None
-                if os.path.splitext(raw)[1]:
-                    cand = raw
-                else:
-                    for ext in IMG_EXTS:
-                        if os.path.exists(os.path.join(project, raw + ext)):
-                            cand = raw + ext
-                            break
-                images[raw] = cand
-    return images
+    """项目切片引用的图片资产（兼容旧接口）：{raw: 源文件相对路径|None}。
+
+    映射规则统一由 asset_bundle.image_asset 提供（含无扩展名探测、越界拒绝）。
+    """
+    out = {}
+    for raw in asset_bundle.collect_image_refs(project):
+        out[raw] = asset_bundle.image_asset(project, raw)["rel_source"]
+    return out
 
 
-def copy_assets(project, out_html):
-    """把图片资产复制到 <html所在目录>/assets/，返回缺失清单。"""
+def copy_katex(out_html, template_path=None):
+    """把随模版发布的 KaTeX 资源复制到 <html所在目录>/katex/。
+
+    背景（缺陷复盘）：此前卡片 HTML 从 jsDelivr CDN 拉 katex.min.js /
+    auto-render.min.js。内网或断网环境下 CDN 不可达 → 数学公式整段以
+    `$...$` 源码形式直接显示，读者看到的就是“成片乱码”。改为随交付物
+    本地自足发布后，离线/内网双击打开也能正常渲染。
+
+    返回 (stale_copy_count, missing_src)。源目录缺失时返回 missing_src=True，
+    由调用方决定是否降级（模板自身有 qc-nokatex 兜底样式）。
+    """
+    src = KATEX_SRC
+    if template_path:
+        alt = os.path.join(os.path.dirname(os.path.abspath(template_path)),
+                           "katex")
+        if os.path.isdir(alt):
+            src = alt
+    if not os.path.isdir(src):
+        return 0, True
     outdir = os.path.dirname(os.path.abspath(out_html))
-    assets = os.path.join(outdir, "assets")
-    missing = []
-    os.makedirs(assets, exist_ok=True)
-    for raw, cand in collect_images(project).items():
-        if cand is None:
-            missing.append(raw)
-            continue
-        dst = os.path.join(assets, os.path.basename(cand))
-        if not os.path.exists(dst):
-            shutil.copy2(os.path.join(project, cand), dst)
+    dst = os.path.join(outdir, "katex")
+    # 按内容 sha256 同步：大小相同但字节不同也必须刷新
+    copied = asset_bundle.sync_tree(src, dst)
+    return copied, False
+
+
+def _iter_rel_files(root):
+    for base, _dirs, files in os.walk(root):
+        for fn in files:
+            full = os.path.join(base, fn)
+            yield os.path.relpath(full, root)
+
+
+def copy_assets(project, out_html, template_path=None):
+    """把图片资产复制到 <html所在目录>/assets/，返回缺失清单。
+
+    文件名/URL 与 tex2cards 渲染 HTML 时使用同一映射
+    （asset_bundle.image_asset：assets/<内容哈希>-<basename>），
+    同名不同内容的图互不覆盖，内容变化后按哈希更新。
+    同时把 KaTeX 静态资源复制到 <html所在目录>/katex/（见 copy_katex）。
+    """
+    outdir = os.path.dirname(os.path.abspath(out_html))
+    missing = asset_bundle.copy_images(project, os.path.join(outdir, "assets"))
+    n_katex, no_katex = copy_katex(out_html, template_path)
+    if no_katex:
+        print("[render_html] [警告] 未找到本地 KaTeX 资源目录（%s），"
+              "卡片将由浏览器尝试外部加载，离线环境下公式可能显示为源码"
+              % KATEX_SRC)
+    elif n_katex:
+        print("[render_html] KaTeX 本地资源已同步：%d 个文件" % n_katex)
     return missing
 
 
@@ -256,7 +289,10 @@ def render_toc(cards, version="student"):
                 label = title or kind_label
         else:
             label = "节标题"
-        out.append('<a class="qc-toc-item" href="#/%s" data-goto="%s">'
+        # 目录入口与卡片 DOM id 必须走同一约定：data-goto 携带完整 DOM id
+        # （qc-card-<cid>，见 render_card），href 仍保留既有外链语义 #/<cid>，
+        # 避免"两端各加一次前缀"导致的双前缀（NAV-01）。
+        out.append('<a class="qc-toc-item" href="#/%s" data-goto="qc-card-%s">'
                    '<span class="qc-toc-no">%02d</span>'
                    '<span class="qc-toc-label">%s</span></a>'
                    % (c["id"], c["id"], c.get("seq", 0),
@@ -295,6 +331,21 @@ def render_version(deck, project, version, out_path,
     title = deck.get("title", "自学案")
     meta_title = "%s（%s · qchain-html 题链 HTML）" % (title, version_label)
 
+    # 浏览器端严格渲染与 Python 端严格校验共用同一份 math-config.json，
+    # 内嵌进页面（file:// 下不能 fetch）。模版必须声明占位符，否则拒绝渲染。
+    if "{{MATH_CONFIG_JSON}}" not in tpl:
+        return False, ("模版缺少 {{MATH_CONFIG_JSON}} 占位符：浏览器端无法获得与"
+                       "服务端一致的数学配置（%s）" % template_path)
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(template_path)),
+                            "math-config.json")
+    if not os.path.exists(cfg_path):
+        cfg_path = math_fragments.DEFAULT_CONFIG_PATH
+    try:
+        math_config_json = math_fragments.math_config_script_json(
+            math_fragments.load_math_config(cfg_path))
+    except (OSError, ValueError) as exc:
+        return False, "数学配置无效 %s: %s" % (cfg_path, exc)
+
     text = tpl
     replacements = {
         "LANG": "zh-CN",
@@ -305,6 +356,7 @@ def render_version(deck, project, version, out_path,
         "GENERATED_AT": time.strftime("%Y-%m-%d %H:%M:%S"),
         "TOC_HTML": toc_html,
         "CARDS_HTML": cards_html,
+        "MATH_CONFIG_JSON": math_config_json,
     }
     for key, val in replacements.items():
         text = text.replace("{{%s}}" % key, val)
@@ -323,7 +375,7 @@ def render_version(deck, project, version, out_path,
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
-    missing = copy_assets(project, out_path)
+    missing = copy_assets(project, out_path, template_path)
     return True, ("%s 已生成（%d 张卡片）%s"
                   % (os.path.basename(out_path), total,
                      ("；缺失图片: " + ", ".join(missing)) if missing else ""))

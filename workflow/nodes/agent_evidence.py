@@ -61,6 +61,19 @@ FORBIDDEN_DIRECT_WRITES = ["主 Agent 直写 artifacts", "同会话自行撰写�
 #: 恢复侧协议白名单：None 表示旧 checkpoint（不拦截，向后兼容）
 ALLOWED_DISPATCH_PROTOCOLS = (None, DISPATCH_PROTOCOL)
 
+# ---------------------------------------------------------------------------
+# 批次索引（C12.2）：.pd/dispatch-batches/<batch_id>.json
+#   计划生产节点（T2_WRITE / T2_CHECK / T4）落盘后写索引；qchain_dispatch
+#   的 batch_id 解析优先读索引，从而一次取全同批请求、且可核对 run/stage/
+#   请求集合/计划摘要，避免「按文件名扫描全部历史 pending」的漏读与串批。
+# ---------------------------------------------------------------------------
+
+#: 批次索引目录（相对 self_dir）
+DISPATCH_BATCHES_REL = os.path.join(".pd", "dispatch-batches")
+
+#: 批次索引 schema 版本
+BATCH_INDEX_SCHEMA_VERSION = 1
+
 
 def _iso_now() -> str:
     """ISO8601 UTC 时间戳（带时区）。"""
@@ -265,13 +278,121 @@ def load_dispatch_policy(self_dir: str) -> Dict[str, Any]:
     }
 
 
-def dispatch_protocol_block() -> Dict[str, Any]:
-    """中断载荷顶层的派发协议三件套（收到 AGENT_DISPATCH 必须调 qchain_dispatch）。"""
-    return {
+def batch_index_path(self_dir: str, batch_id: str) -> str:
+    """批次索引绝对路径：<self_dir>/.pd/dispatch-batches/<batch_id>.json。"""
+    return os.path.join(self_dir or ".", DISPATCH_BATCHES_REL, "%s.json" % batch_id)
+
+
+def write_batch_index(
+    self_dir: str,
+    *,
+    batch_id: str,
+    run_id: str,
+    stage: str,
+    request_ids: List[str],
+    plan_rel: str,
+    plan_digest: Optional[str] = None,
+    sections: Optional[List[str]] = None,
+    required_scope_count: Optional[int] = None,
+    dispatch_contract_version: Optional[int] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    """原子写批次索引文件，返回相对 self_dir 的路径（POSIX 分隔）。
+
+    索引把「批次 ID → run/stage/请求集合/计划摘要」冻结为不可混用的单一事实，
+    供 index.js 的 batch_id 解析器核对归属与完整性。输入非法（空批次号、
+    空请求集合、重复请求 ID）直接抛 ValueError，绝不静默写出残缺索引。
+    """
+    if not batch_id or not str(batch_id).strip():
+        raise ValueError("batch_id 不能为空")
+    rid = [str(x) for x in (request_ids or [])]
+    if not rid:
+        raise ValueError("request_ids 不能为空")
+    if len(set(rid)) != len(rid):
+        raise ValueError("request_ids 含重复项: %r" % (rid,))
+    payload: Dict[str, Any] = {
+        "schema_version": BATCH_INDEX_SCHEMA_VERSION,
+        "batch_id": str(batch_id),
+        "run_id": str(run_id or ""),
+        "stage": str(stage or ""),
+        "created_at": _iso_now(),
+        "plan_rel": str(plan_rel or "").replace("\\", "/"),
+        "plan_digest": str(plan_digest or ""),
+        "request_ids": rid,
+        "request_refs": [os.path.join(".pd", "agent-requests", "%s.json" % x).replace("\\", "/")
+                         for x in rid],
+        "sections": [str(s) for s in (sections or [])],
+        "required_scope_count": required_scope_count,
+        "dispatch_contract_version": dispatch_contract_version,
+    }
+    if extra:
+        for key, val in extra.items():
+            payload.setdefault(key, val)
+    abs_path = batch_index_path(self_dir, batch_id)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    tmp = "%s.tmp-%s" % (abs_path, uuid4().hex)
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    os.replace(tmp, abs_path)
+    return os.path.join(DISPATCH_BATCHES_REL, "%s.json" % batch_id).replace("\\", "/")
+
+
+def load_batch_index(self_dir: str, batch_id: str) -> Optional[Dict[str, Any]]:
+    """读取批次索引；缺失或非法 JSON 返回 None（绝不抛异常污染图状态）。"""
+    if not batch_id:
+        return None
+    path = batch_index_path(self_dir, batch_id)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def dispatch_protocol_block(
+    batch_id: Optional[str] = None,
+    self_dir: Optional[str] = None,
+    request_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """中断载荷顶层的派发协议三件套（收到 AGENT_DISPATCH 必须调 qchain_dispatch）。
+
+    向后兼容：不传任何参数时只返回旧的三键（dispatch_protocol /
+    required_tool / forbidden）。传入 batch_id（批次入口）时追加可直接执行的
+    批次调用参数 ``dispatch_args={self_dir, batch_id}``，并给出一句「整批一次
+    调用」的协作指令；传入 request_ref（单请求返修入口）时给出单请求参数。
+    """
+    block: Dict[str, Any] = {
         "dispatch_protocol": DISPATCH_PROTOCOL,
         "required_tool": REQUIRED_DISPATCH_TOOL,
         "forbidden": list(FORBIDDEN_DIRECT_WRITES),
     }
+    if batch_id:
+        args: Dict[str, Any] = {}
+        if self_dir:
+            args["self_dir"] = str(self_dir)
+        args["batch_id"] = str(batch_id)
+        block["dispatch_args"] = args
+        block["dispatch_batch_mode"] = "single-call-per-batch"
+        block["dispatch_instructions"] = (
+            "本批为同一批次的多份独立产物：请在一次 qchain_dispatch 调用中带上 "
+            "batch_id=%s（并给 self_dir=%s）一次取全部派发单，切勿逐条按 "
+            "request_ref 单独调用；宿主并发池会按批内请求并行执行。"
+            % (batch_id, self_dir or "<self_dir>")
+        )
+    elif request_ref:
+        args = {}
+        if self_dir:
+            args["self_dir"] = str(self_dir)
+        args["request_ref"] = str(request_ref)
+        block["dispatch_args"] = args
+        block["dispatch_batch_mode"] = "single-request"
+        block["dispatch_instructions"] = (
+            "本派发单为单请求（局部返修）：请调用 qchain_dispatch 时带上 "
+            "request_ref=%s（并给 self_dir=%s）只派发这一份。" % (request_ref, self_dir or "<self_dir>")
+        )
+    return block
 
 
 def dispatch_protocol_violation(response: Any) -> Optional[str]:

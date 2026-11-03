@@ -65,7 +65,11 @@ def build_request(
     retry_class: str = "transient",
     batch_id: Optional[str] = None,
     status: str = "pending",
-    attempt: int = 0
+    attempt: int = 0,
+    digest_context: Optional[Dict[str, Any]] = None,
+    scopes: Optional[List[str]] = None,
+    scope_inputs: Optional[Dict[str, str]] = None,
+    artifact_scopes: Optional[Dict[str, str]] = None
 ) -> Dict[str, Any]:
     """Build a dispatch request carrying the FIXED P0 contract.
 
@@ -74,32 +78,79 @@ def build_request(
     dispatch_id/stage/role/artifacts/before/instruction/command/context/
     prompt_file/run_id keys). All new params are keyword-only with defaults so
     existing callers keep working unchanged.
+
+    digest_context (C7): 可选指纹补料。仅当调用方显式传入时追加进 input_digest
+    的载荷（图版本 / 执行策略摘要 / 来源清单摘要 / 提示词版本等"请求文本之外
+    但决定产物"的键）；传 None 时载荷逐字节与旧实现一致，旧缓存键不变。
+
+    scopes (C5)：一个作者 agent 允许一次写 1–2 个相邻节。传 ``scopes=[sec1,
+    sec2]`` 时产出 v2 派发单（``schema_version=2`` / ``scopes`` /
+    ``scope_inputs`` / ``artifact_scopes``），``scope`` 退化为 first-scope
+    兼容标签；**不传或只有一个 scope 时逐字节保持旧单 scope 契约**（旧派发单、
+    旧缓存键、T2_CHECK / T4 一节一请求全部不受影响）。
     """
     root = state.get("self_dir") or state.get("project_root", ".")
     stage_slug = stage.lower().replace("_", "-")
+
+    # --- C5：多 scope 正规化（整条链路唯一真源见 scripts/request_scopes.py）--
+    scope_list: List[str] = []
+    for item in (scopes or []):
+        if isinstance(item, str) and item.strip() and item.strip() not in scope_list:
+            scope_list.append(item.strip())
+    multi_scope = len(scope_list) >= 2
+    if multi_scope and not scope:
+        scope = scope_list[0]      # first-scope 兼容标签
+    if multi_scope:
+        inputs = {str(k): str(v) for k, v in (scope_inputs or {}).items()
+                  if isinstance(k, str) and isinstance(v, str) and v}
+        mapping = {str(k): str(v) for k, v in (artifact_scopes or {}).items()
+                   if isinstance(k, str) and isinstance(v, str) and k and v}
+        if not mapping and len(artifacts or []) == len(scope_list):
+            mapping = {rel: sec for rel, sec in zip(list(artifacts), scope_list)}
+        missing_inputs = [s for s in scope_list if s not in inputs]
+        if missing_inputs:
+            # C5：v2 派发单必须逐节携带来源指纹。缺失时宁可炸掉，也不能签发
+            # 一张"无法追溯是拿哪版来源写的"的合批单（也避免伪造空摘要）。
+            raise ValueError(
+                "多 scope 派发单缺少 scope_inputs: %s（C5 要求逐节来源指纹）"
+                % ",".join(missing_inputs))
+
     if input_digest is None:
         # 确定性输入指纹：同一组 (stage, role, scope, instruction, command,
         # context, artifacts, prompt_file) 必须得到同一 digest；
         # context 经 sort_keys 归一化，artifacts 保序序列化。
-        digest_payload = json.dumps(
-            [
-                stage,
-                role,
-                scope,
-                instruction,
-                command,
-                json.dumps(context or {}, sort_keys=True, ensure_ascii=False),
-                list(artifacts),
-                prompt_file,
-            ],
-            ensure_ascii=False
-        )
+        digest_fields: List[Any] = [
+            stage,
+            role,
+            scope,
+            instruction,
+            command,
+            json.dumps(context or {}, sort_keys=True, ensure_ascii=False),
+            list(artifacts),
+            prompt_file,
+        ]
+        if digest_context is not None:
+            # C7：决定产物但不体现在请求文本里的键（图版本、策略摘要、来源清单
+            # 摘要、提示词版本…）必须进入指纹，否则"换图/换来源却撞旧缓存"。
+            digest_fields.append(
+                json.dumps(digest_context, sort_keys=True, ensure_ascii=False))
+        if multi_scope:
+            # C5：合批请求的来源切片必须进入指纹——否则只改第二节的来源却撞
+            # 旧缓存键，会把上一版的产物当成这一版的结果。
+            digest_fields.append(json.dumps(scope_list, ensure_ascii=False))
+            digest_fields.append(
+                json.dumps(inputs, sort_keys=True, ensure_ascii=False))
+            digest_fields.append(
+                json.dumps(mapping, sort_keys=True, ensure_ascii=False))
+        digest_payload = json.dumps(digest_fields, ensure_ascii=False)
         input_digest = hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
     if batch_id is None:
         batch_id = f"bat-{stage_slug}-{uuid.uuid4().hex[:8]}"
     scope_suffix = f"-{scope}" if scope else ""
+    if multi_scope:
+        scope_suffix = "-" + "".join(s[3:] or s for s in scope_list)
     dispatch_id = f"dsp-{stage_slug}{scope_suffix}-{uuid.uuid4().hex[:10]}"
-    return {
+    request: Dict[str, Any] = {
         "dispatch_id": dispatch_id,
         "stage": stage,
         "role": role,
@@ -119,6 +170,12 @@ def build_request(
         "attempt": attempt,
         "status": status,
     }
+    if multi_scope:
+        request["schema_version"] = 2
+        request["scopes"] = list(scope_list)
+        request["scope_inputs"] = inputs
+        request["artifact_scopes"] = mapping
+    return request
 
 
 def write_request_file(root: str, request: Dict[str, Any]) -> str:
@@ -193,9 +250,19 @@ def _interrupt_payload(request: Dict[str, Any]) -> Dict[str, Any]:
         "request_ref": f"{REQUEST_DIR_REL}/{request['dispatch_id']}.json",
         "before_digests": request["before"],
         "context": request.get("context", {}),
+        # 逐尝试调度策略（卡09）：单请求派发必须与批次载荷
+        # （_batch_interrupt_payload / _t4_batch_interrupt_payload）同键，
+        # 否则宿主侧拿不到超时与重试分型，只能吃默认值。
+        "input_digest": request.get("input_digest"),
+        "timeout_seconds": request.get("timeout_seconds"),
+        "max_retries": request.get("max_retries"),
+        "retry_class": request.get("retry_class"),
         # 派发协议三件套（q_audit.md 根因治理）：收到 AGENT_DISPATCH 必须调
         # qchain_dispatch 派发宿主子 Agent，严禁主 Agent 单会话直写产物。
-        **agent_evidence.dispatch_protocol_block(),
+        # 卡20：单请求入口附 request_ref 调用参数（不含 batch_id）。
+        **agent_evidence.dispatch_protocol_block(
+            request_ref=f"{REQUEST_DIR_REL}/{request['dispatch_id']}.json",
+        ),
     }
 
 

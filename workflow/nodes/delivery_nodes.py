@@ -154,11 +154,27 @@ def node_t4_verify_acceptance(state: ShrinkCoursewareState) -> Dict[str, Any]:
                 "error_message": f"独立教学验收结论持续为 {conclusion} 且轮次超限",
                 "history": history
             }
+        target_sec = None
+        expected = state.get("expected_sections") or ["sec1", "sec2", "sec3"]
+        for iss in issues:
+            if str(iss.get("status") or "").lower() == "fixed":
+                continue
+            q = str(iss.get("qid") or "")
+            for s in expected:
+                if q.startswith(s + "-") or q == s:
+                    target_sec = s
+                    break
+            if target_sec:
+                break
+        if not target_sec and expected:
+            target_sec = expected[0]
+
         return {
             "acceptance_gate": gate,
             "acceptance_rounds": rounds,
             "stage": "REPAIR_LOOP",
             "routing_action": "REPAIR_SECTION",
+            "repair_target": target_sec,
             "repair_reason": f"教学验收未通过: {status}",
             "history": history
         }

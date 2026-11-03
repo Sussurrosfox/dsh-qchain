@@ -24,8 +24,8 @@ python workflow/runner.py --project . --input <原材料路径> --run --title "�
 ```powershell
 python workflow/runner.py --project . --resume --title "学案主标题" --profile self_study --format both
 ```
-- **交付模式 (`--profile`)**：
-  - `self_study`：自主学习模式（**默认模式**），侧重循序渐进探究，**不再设总时长上限**，自动启用自学规划红线（禁习题选讲独立成节、3 节精炼体系、核心推导长链题通过 `check_pedagogy` 门禁强制拆解为至少 4~7 个连续小问台阶及确定性结构估算确保认知密度下限，严禁为缩短篇幅省略推导台阶）；
+- **交付模式 (`--profile`)**（注意：此为 CLI 交付模式参数，与配置中的 `execution_profile` 执行图及 `agent_dispatch.profile` 并发档位正交，切勿混淆）：
+  - `self_study`：自主学习模式（**默认模式**），侧重循序渐进探究，**不再设总时长上限**。在 `legacy` 模式下受 3 节精炼体系与连续小问台阶刚性约束；在 `faithful_fast`（3.3.0）模式下不强制固定三节限制，教学法偏好与课时预算转为 advisory 建议（不阻断执行），但严格数学、忠实性与编号结构永远是硬门禁；
   - `teaching`（或 `classroom`）：课堂教学模式，保留课时时间预算刚性上限约束（默认 90 分钟，公式 `opening + closing + buffer + core + support_inclass <= lesson_minutes`，取消 20% 软顶豁免）。课时预算采用确定性结构估算（由 `scripts/estimate_minutes.py` 基于小问台阶与填空动作自动计算，非人工编数自报），真人确认的时长与配置落盘为 `.pd/confirmed-spec.json`（带有 SHA-256 签名），在门禁与交付脚本间实现双向防篡改对账。
 - **输出格式 (`--format`)**：
   - `both`：同时输出 XeLaTeX PDF 与 HTML 卡片自学案；
@@ -37,9 +37,80 @@ python workflow/runner.py --project . --resume --title "学案主标题" --profi
 python workflow/runner.py --project . --status
 ```
 
+### 4. 含 TikZ 源文档的前置处理
+
+源文档若含 `tikzcd` / `tikzpicture` 环境，切片子 Agent 无法直接处理这类图形代码，存在静默丢图风险。必须在 `run` 之前做**源文档侧预栅格化**：
+
+1. **勘察**：列出源文档中的全部 TikZ 块（环境名、行号、字符数），不编译：
+   ```powershell
+   python scripts/tikz_rasterize.py --source <源文档.tex> --list --json
+   ```
+2. **栅格化**：逐块编译为 PNG（默认输出到 `<源文档目录>/assets/`，命名 `<主名>-NN.png`，DPI 默认 300）：
+   ```powershell
+   python scripts/tikz_rasterize.py --source <源文档.tex>
+   ```
+   若个别块用到项目特有宏或额外 TikZ 库（如 `calc`）导致编译失败，把兜底定义写入一个文件并用 `--preamble` 注入后重跑（失败块会在报告中附 log 尾部 30 行，可用 `--only NN` 只重跑指定块）：
+   ```powershell
+   # preamble.tex 内容示例：\providecommand{\quotgrp}[2]{#1/#2} 与 \usetikzlibrary{calc}
+   python scripts/tikz_rasterize.py --source <源文档.tex> --only 8 --preamble preamble.tex
+   ```
+   全部成功退出码为 0，任一失败为 2；`--json` 输出机器可读报告。
+3. **替换引用**：人工或脚本把源文档中的 tikz 块替换为 `\includegraphics{assets/<主名>-NN.png}`（tex2cards 对 `\includegraphics` 已有成熟支持，流水线无需其他改动）。
+4. **正常跑流水线**：按本节第 1 步启动即可。
+
 ---
 
-## 二、 核心门禁体检中心 (Gate Inspector)
+## 二、 执行配置、预算模型与门禁分级 (v3.3.0)
+
+### 1. 四维配置与开关区分
+
+流水线包含四个维度的配置开关，职责正交，**绝对不能混用**：
+
+| 开关 | 典型取值 | 职责与决定内容 | 配置或调用位置 |
+|---|---|---|---|
+| `content_policy` | `faithful` / `authoring` | **内容取向**：原料是否原样忠实呈现（faithful）还是允许增删与重构创作（authoring） | `config.yaml` 扁平键；Phase 0 冻结进 `intent-contract.json` |
+| `execution_profile` | `legacy` / `faithful_fast` | **执行图版本**：编译哪张 StateGraph（`legacy-v1` 还是 `faithful-fast-v1`） | `config.yaml` 扁平键；Phase 0 冻结为执行元数据 |
+| `agent_dispatch.profile` | `interactive` / `safe` / `fast` / `budget` | **并发调度档位**：同批最大并发请求数（`fast` 目标 4，`safe`/`interactive` 目标 1） | `config.yaml` 的 `agent_dispatch:` 块，或扁平 `agent_max_concurrency` |
+| `--profile` (CLI) | `self_study` / `teaching` / `classroom` | **交付模式**：是否设总时长硬上限及课堂教案生成规则 | CLI 命令行参数 `--profile` |
+
+**缺省行为与旧会话兼容**：
+- `execution_profile` 缺省即为 `legacy`。未声明该字段的新旧项目、以及所有历史检查点，一律继续沿用 `legacy-v1` 图执行，**绝不做静默换图迁移**。
+- 旧检查点恢复逻辑：恢复流程优先从检查点快照读取冻结的 `graph_version`。无版本元数据的旧检查点按 `legacy-v1` 恢复；已冻结 `faithful_fast` 的检查点无法由旧代码（≤3.2.0）接管。
+
+### 2. 1+K+R 派发预算模型与实测值
+
+在 `faithful_fast` 模式下，冷缓存零返修的子 Agent 派发预算满足：
+$$\text{calls} = 1 + K + R$$
+- **1** = T1 统一规划：一次 Agent 调用直接产出小节计划、素材映射、验收要点三份映射表；
+- **$K$** = 作者批次数：$K = \lceil \text{节数} / \text{writer\_batch\_max\_sections} \rceil$（默认每批最多 2 个相邻节，单批超 16000 字符自动拆批）；
+- **$R$** = 终审轮次：$R = \lceil \text{节数} / 2 \rceil$（合并终审，每批最多审读 2 节）。
+
+**实测值与纠偏说明**（消除历史 “=4” 误读）：
+- 1 节：$1 + 1 + 1 = 3$ 次派发；
+- 2 节：$1 + 1 + 1 = 3$ 次派发；
+- 3 节：$1 + 2 + 2 = \mathbf{5}$ 次派发（T1 一次 + 两个作者批 + 两次终审批；历史文档草案中“三节=4”隐含了终审单批覆盖 3 节的错误假设，已在 3.3.0 正式纠偏为实测值 **5**）；
+- 长输入 3 节（超字符拆批）：$1 + 3 + 2 = 6$ 次派发；
+- 对照 legacy 模式：3 节共需 $3 + 3N = 12$ 次派发（节省超过 58% 派发调用）。
+
+### 3. 教学 Advisory 与刚性硬门禁分级
+
+流水线将门禁严格划分为**教学偏好建议 (Advisory)** 与**刚性一票否决门禁 (Hard Gates)**：
+
+- **教学建议项 (Advisory，仅在 faithful_fast 下生效)**：
+  - `pedagogy_policy: advisory`（自学小问台阶数、问题密度等教学偏好仅在报告中给建议，不阻断流程）；
+  - `budget_policy: advisory`（课时时间预算仅作估算报告，不阻断流程）；
+  - `require_classroom_plan: false`（不强求预先存在课堂教案）。
+  - 注：若显式配置 `pedagogy_policy: strict` 或 `budget_policy: strict`，则恢复阻断行为。
+- **刚性一票否决门禁 (Hard Gates，永远不可降级，任何模式均一票否决)**：
+  - **严格数学校验 (`validate_math.cjs` / KaTeX / TeX 公式解析)**：公式宏解析错误或渲染异常必阻断；
+  - **来源忠实性门禁 (`check_fidelity`)**：原文主体资产守恒、关键推导不漏项；
+  - **结构与编号门禁 (`check_numbering`)**：`% qid:` 唯一性、环境闭合与槽位配平；
+  - **必需资源完整性**：模板、字体、KaTeX 离线包、`math-config.json` 缺一不可；
+  - **构建与渲染门禁 (`build.py` / `check_render.py`)**：编译严重排版告警、丢失字符一律阻断。
+
+---
+
+## 三、 核心门禁体检中心 (Gate Inspector)
 
 切换至 **“🛡️ 质量门禁体检中心”** 选项卡，点击“刷新门禁报告”，可全景查看各项硬门禁的实时状态：
 
@@ -81,10 +152,11 @@ python workflow/runner.py --project . --status
 
 9. **最终原子交付门禁 (`deliver.py`)**
    - 先跑随机打乱（幂等）再跑编号/对话/构建/比对，核验 `.pd/confirmed-spec.json` 的 SHA-256 签名防篡改对账，汇总全部门禁证据，原子发布至 `release/`，生成具备密码学数字摘要的 `manifest.json`。
+   - **渲染冒烟硬门槛（复盘 §4.4.1）**：PDF 交付前自动执行 `render_smoke.py` 并校验冒烟证据（报告 pass 且截图 ≥1 张）；缺证据一律拒绝发布。`--skip-smoke` 可显式跳过（不推荐，跳过事实记入交付说明）。
 
 ---
 
-## 三、 双源 PDF 下载与查看
+## 四、 双源 PDF 下载与查看
 
 切换至 **“📦 双源 PDF 成果与交付”** 选项卡：
 - **学生版学案 (`student.pdf`)**：留有充足的书写空白框、姓名学号栏与微知识点卡片，隐藏解题步骤；
@@ -93,7 +165,7 @@ python workflow/runner.py --project . --status
 
 ---
 
-## 四、 命令行操作 (CLI) 快速查阅
+## 五、 命令行操作 (CLI) 快速查阅
 
 | 命令 | 描述 |
 |---|---|
@@ -101,6 +173,11 @@ python workflow/runner.py --project . --status
 | `python workflow/runner.py --resume --title "学案标题"` | 提交参数并从断点恢复 |
 | `python workflow/runner.py --status` | 查询流水线状态与检查点 |
 | `python workflow/runner.py --visualize` | 打印状态机 Mermaid 拓扑图 |
+| `python scripts/tikz_rasterize.py --source <源.tex> --list --json` | 勘察源文档 TikZ 块（env/行号/字符数） |
+| `python scripts/tikz_rasterize.py --source <源.tex>` | 预栅格化 TikZ 块为 PNG（`<源目录>/assets/`） |
+| `python scripts/tikz_rasterize.py --source <源.tex> --rewrite <源.raster.tex>` | 预栅格化 TikZ 块并生成重写源文件（tikz 块 → `\includegraphics`，块外逐字节不变；失败即闭） |
+| `python scripts/redeliver.py self/` | 一键重交付（build → review-pack（含冒烟自动挂接） → 证据哈希对齐 → deliver（含冒烟硬门槛）） |
+| `python scripts/render_smoke.py self/` | 手动双模视觉冒烟（PNG 落 .pd/review/smoke/；`--pdfs student` 可限定范围；审读包已自动调用） |
 | `python scripts/estimate_minutes.py self/` | 运行切片确定性结构耗时估算（提取小问/填空） |
 | `python scripts/check_budget.py self/` | 校验课时预算硬约束（取消 20% 软顶豁免） |
 | `python scripts/gen_classroom_plan.py self/ --check` | 教案纯只读体检（检测占位符残留，不覆盖手改教案） |

@@ -26,6 +26,7 @@ check_budget.py — 题链教学预算、长链密度与翻转教案完备性门
 退出码: 0=通过, 1=发现问题, 2=缺少输入。
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -41,17 +42,103 @@ import evidence  # noqa: E402
 import gen_config  # noqa: E402
 import gen_classroom_plan  # noqa: E402
 import estimate_minutes  # noqa: E402
+# 卡 11：预算/教案策略复用 C1 的解析器（check_pedagogy.load_policy →
+# workflow/execution_policy），不另造开关。
+import check_pedagogy  # noqa: E402
 
 PLACEHOLDER_WORDS = {"", "-", "--", "---", "无", "待定", "暂无", "略", "none", "null"}
+
+#: C10 教师课堂选用范围文件（相对项目目录）
+SELECTION_REL = os.path.join(".pd", "classroom-selection.json")
+#: 固定开场/收束/缓冲预算（与 estimate_minutes 的 DEFAULT_OPENING/CLOSING/BUFFER 一致）
+DEFAULT_SCOPE_OVERHEAD = 15.0
+
+
+def load_classroom_selection(pdir):
+    """读取 C10 教师课堂选用范围。
+
+    - 文件不存在 → ``state="unspecified"``（**不是**零题）：报告全量容量；
+    - 空数组 → ``state="specified"`` 且 0 题（教师明确选择不授课）；
+    - 只认 schema_version=1 的 ``selected_carriers[{section,qid}]``；
+    - 重复条目去重后计入 ``duplicates``；不存在项由调用方拒绝并定位。
+    """
+    path = os.path.join(pdir, SELECTION_REL)
+    info = {"state": "unspecified", "entries": [], "duplicates": 0,
+            "schema_version": None, "digest": None, "error": None}
+    if not os.path.isfile(path):
+        return info
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        info["error"] = "读取失败: %s" % e
+        return info
+    if not isinstance(data, dict):
+        info["error"] = "顶层必须是 JSON 对象"
+        return info
+    info["state"] = "specified"
+    info["schema_version"] = data.get("schema_version")
+    if info["schema_version"] != 1:
+        info["error"] = "schema_version 必须为 1（收到 %r）" % (info["schema_version"],)
+        return info
+    raw = data.get("selected_carriers")
+    if not isinstance(raw, list):
+        info["error"] = "缺少 selected_carriers 数组"
+        return info
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            info["error"] = "selected_carriers 条目必须是 {section, qid} 对象"
+            return info
+        sec = str(item.get("section") or "").strip()
+        qid = str(item.get("qid") or "").strip()
+        if not sec or not qid:
+            info["error"] = "selected_carriers 条目缺少 section 或 qid"
+            return info
+        if (sec, qid) in seen:
+            info["duplicates"] += 1
+            continue
+        seen.add((sec, qid))
+        info["entries"].append((sec, qid))
+    canon = json.dumps({"schema_version": 1,
+                        "selected_carriers": [{"section": s, "qid": q}
+                                              for s, q in info["entries"]]},
+                       ensure_ascii=False, sort_keys=True)
+    info["digest"] = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    return info
+
+
+def carrier_key(row):
+    """课堂任务的唯一标识：(section, carrier_qid)。"""
+    return (str(row.get("section") or "").strip(),
+            str(row.get("carrier_qid") or row.get("node_id") or "").strip())
+
+
+def unique_carrier_rows(rows):
+    """按 (section, carrier_qid) 去重，返回 (唯一载体行, 原文行数)。"""
+    seen = set()
+    out = []
+    for r in rows:
+        k = carrier_key(r)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+    return out, len(rows)
 
 
 class BudgetResult(tuple):
     """兼顾元组解包 (problems, warnings, stats) 与属性访问/分类访问的门禁结果类。"""
-    def __new__(cls, problems, warnings, stats, category="ok", estimates_ref=None):
+    def __new__(cls, problems, warnings, stats, category="ok", estimates_ref=None,
+                issue_meta=None):
         return super().__new__(cls, (problems, warnings, stats))
 
-    def __init__(self, problems, warnings, stats, category="ok", estimates_ref=None):
+    def __init__(self, problems, warnings, stats, category="ok", estimates_ref=None,
+                 issue_meta=None):
         self.problems = problems
+        # 卡 07：{problem 文本: {"code","artifact"}}——精确问题码 + 产物名，
+        # 供路由按“码 + 产物”分流，而不是按 category 猜文件。
+        self.issue_meta = dict(issue_meta or {})
         self.warnings = warnings
         self.stats = stats
         self.category = category
@@ -110,6 +197,34 @@ def check_budget_project(pdir, stage="planning"):
     coverage_problems = []
     section_problems = []
     artifact_problems = []
+    issue_meta = {}
+
+    def _tag(msg, code, artifact):
+        issue_meta[msg] = {"code": code, "artifact": artifact}
+
+    # 卡 11：预算/教案策略（faithful_fast 默认 advisory + 不要求教案；
+    # 缺新策略的旧项目 → legacy：strict + 要求教案，行为一字不变）。
+    try:
+        policy = check_pedagogy.load_policy(pdir)
+    except Exception as e:
+        policy = {"execution_profile": "legacy", "pedagogy_policy": "strict",
+                  "budget_policy": "strict", "require_classroom_plan": True,
+                  "sources": {}}
+        warnings.append(f"读取执行策略失败，按 legacy 严格语义处理: {e}")
+    advisory_budget = str(policy.get("budget_policy", "strict")).lower() != "strict"
+    stats["execution_profile"] = policy.get("execution_profile", "legacy")
+    stats["pedagogy_policy"] = policy.get("pedagogy_policy", "strict")
+    stats["budget_policy"] = policy.get("budget_policy", "strict")
+    stats["require_classroom_plan"] = bool(policy.get("require_classroom_plan", True))
+    stats["policy_sources"] = dict(policy.get("sources") or {})
+
+    def _limit(msg):
+        """容量/偏好类限制：advisory → 仅提示（教师自选范围）；strict → 阻断。"""
+        if advisory_budget:
+            warnings.append(msg)
+        else:
+            problems.append(msg)
+            coverage_problems.append(msg)
 
     # 1. 确认态对账（修复 F2）
     cfg_path = os.path.join(pdir, "config.yaml")
@@ -156,6 +271,12 @@ def check_budget_project(pdir, stage="planning"):
         max_student_pages = int(cfg.get("max_student_pages", 6))
     except (ValueError, TypeError):
         max_student_pages = 6
+
+    # 与 lesson_minutes 同理：self_study 模式不设学生版页面上限（自主学习
+    # 没有课时墙，排版微调——如 GR.4 修复 CJK 混排后 6→7 页——不应阻断交付）；
+    # teaching/classroom 模式保留 6 页硬顶（课时内必须发完）。
+    if not is_teaching:
+        max_student_pages = None
 
     # 2. coverage-map 检查
     estimates_ref = None
@@ -211,13 +332,83 @@ def check_budget_project(pdir, stage="planning"):
             if grand_total is None:
                 grand_total = core_minutes + support_minutes
 
-            stats["core_task_count"] = len(core_rows)
+            # 卡 11：课堂任务数按唯一 (section, carrier_qid) 统计——13 个原文
+            # 节点共用同一载体只算 1 道任务；不同 section 的同名 qid 算 2 道。
+            for r in rows:
+                if not r.get("carrier_explicit", True):
+                    msg = (
+                        f"coverage-map 节点 {r.get('node_id')} 的 carrier_qid 单元格为空："
+                        f"无法判定该节点对应哪一道课堂任务（数据不足，不能默认按独立任务计）"
+                    )
+                    problems.append(msg)
+                    coverage_problems.append(msg)
+                    _tag(msg, "BUDGET_CARRIER_MISSING", "coverage-map.md")
+            unique_core, core_row_count = unique_carrier_rows(core_rows)
+            unique_all, _all_row_count = unique_carrier_rows(core_rows + support_rows)
+
+            stats["core_task_count"] = len(unique_core)
+            stats["core_task_rows"] = core_row_count
             stats["core_minutes"] = core_minutes
             stats["support_minutes"] = support_minutes
             stats["grand_total"] = grand_total
             stats["lesson_minutes_budget"] = lesson_minutes
             stats["delivery_profile"] = profile
             stats["estimates_ref"] = estimates_ref
+
+            # 卡 11 / C10：教师课堂选用范围。文件缺失 ≠ 零题——缺失时报告
+            # 全量容量并标记“未指定课堂选择”，绝不臆测 optional 就是未选。
+            selection = load_classroom_selection(pdir)
+            row_keys = {carrier_key(r) for r in rows}
+            stats["classroom_selection"] = selection["state"]
+            stats["classroom_selection_duplicates"] = selection["duplicates"]
+            stats["selection_digest"] = selection["digest"]
+            if selection.get("error"):
+                msg = (f"课堂选用范围 {SELECTION_REL.replace(os.sep, '/')} 无效："
+                       f"{selection['error']}；请由教师重新选择授课范围")
+                problems.append(msg)
+                coverage_problems.append(msg)
+                _tag(msg, "SELECTION_INVALID", "classroom-selection.json")
+            selected_keys = set()
+            for sec, qid in selection["entries"]:
+                if (sec, qid) in row_keys:
+                    selected_keys.add((sec, qid))
+                else:
+                    msg = (
+                        f"课堂选用范围引用了不存在的载体 (section={sec}, qid={qid})："
+                        f"coverage-map 中无此 (section, qid)，拒绝按该范围计算预算"
+                    )
+                    problems.append(msg)
+                    coverage_problems.append(msg)
+                    _tag(msg, "SELECTION_CARRIER_UNKNOWN", "classroom-selection.json")
+            stats["classroom_selection_tasks"] = len(selected_keys)
+
+            # 容量基线：coverage-map 的教师计划分钟 + 固定开场/收束/缓冲
+            planned_core = sum(float(r.get("planned_minutes") or 0) for r in unique_core)
+            planned_support = sum(float(r.get("planned_minutes") or 0)
+                                  for r in unique_carrier_rows(support_rows)[0])
+            overhead = round(float(grand_total or 0) - float(core_minutes or 0)
+                             - float(support_minutes or 0), 2)
+            if overhead <= 0:
+                overhead = DEFAULT_SCOPE_OVERHEAD
+            full_capacity = round(planned_core + planned_support + overhead, 2)
+            if grand_total is not None:
+                full_capacity = max(full_capacity, round(float(grand_total), 2))
+            stats["full_capacity_minutes"] = full_capacity
+            stats["scope_overhead_minutes"] = overhead
+
+            selected_capacity = None
+            if selection["state"] == "specified":
+                sel_rows = [r for r in unique_all if carrier_key(r) in selected_keys]
+                selected_capacity = round(
+                    sum(float(r.get("planned_minutes") or 0) for r in sel_rows) + overhead, 2)
+                stats["selected_minutes"] = selected_capacity
+            else:
+                warnings.append(
+                    f"未指定课堂选择（{SELECTION_REL.replace(os.sep, '/')} 不存在）："
+                    f"按全部材料统计课堂容量 {full_capacity} 分钟"
+                    f"（core={planned_core}m, support={planned_support}m, 固定开场收束缓冲={overhead}m）。"
+                    f"请教师在真实 UI 中选择授课范围；未选内容一律保留，不得为凑预算删减原文。"
+                )
 
             # 3.1 覆盖身份精确匹配与防静默 fallback 拦截（修复 F4）
             if est_data:
@@ -252,6 +443,7 @@ def check_budget_project(pdir, stage="planning"):
                     warnings.append(msg)
 
             # 4. 推荐讲法与易错点非空校验 (N1 教师侧支撑)
+            # 卡 11：讲法/易错点属教学偏好——faithful_fast + advisory 只提示。
             for r in core_rows + support_rows:
                 qid = r.get("carrier_qid") or r.get("node_id")
                 method = (r.get("teach_method") or "").strip().lower()
@@ -259,43 +451,62 @@ def check_budget_project(pdir, stage="planning"):
 
                 if method in PLACEHOLDER_WORDS:
                     msg = f"{r.get('node_id')} ({qid}): 缺失“推荐讲法”（翻转课堂教师讲解必需支撑，严禁留空或填占位符）"
-                    problems.append(msg)
-                    coverage_problems.append(msg)
+                    _limit(msg)
                 if pitfall in PLACEHOLDER_WORDS:
                     msg = f"{r.get('node_id')} ({qid}): 缺失“易错点”（翻转课堂靶向突破必需支撑，严禁留空或填占位符）"
-                    problems.append(msg)
-                    coverage_problems.append(msg)
+                    _limit(msg)
 
             # 5. 课时总时长上限 (N2 总量上限：硬约束，取消 20% 软顶豁免，修复 F5)
+            # 卡 11：advisory 只提示教师缩小范围/调整预算，strict 才按已选范围阻断。
             if is_teaching and lesson_minutes is not None:
-                if grand_total > lesson_minutes:
-                    diff = round(grand_total - lesson_minutes, 2)
+                scope_minutes = selected_capacity if selected_capacity is not None else full_capacity
+                scope_desc = ("已选课堂范围" if selected_capacity is not None
+                              else "全部材料（尚未指定课堂选择）")
+                if scope_minutes > lesson_minutes:
+                    diff = round(scope_minutes - lesson_minutes, 2)
+                    if advisory_budget:
+                        tail = ("建议缩小授课范围或在 Phase 0 调整明确预算；原文与未选内容必须保留，"
+                                "不得为凑预算删减原文或压缩单题小问数。")
+                    else:
+                        tail = ("必须在 coverage-map 中删减题量、拆分切片或将次要变式转入拓展题库，"
+                                "严禁通过压缩单题小问数来凑预算！")
                     msg = (
-                        f"课堂教学耗时超标（总计 {grand_total} 分钟 > 教学预算 {lesson_minutes} 分钟，"
-                        f"超额 {diff} 分钟；其中 core={core_minutes}m, support_inclass={support_minutes}m）。"
-                        f"必须在 coverage-map 中删减题量、拆分切片或将次要变式转入拓展题库，严禁通过压缩单题小问数来凑预算！"
+                        f"课堂教学耗时超标（{scope_desc}合计 {scope_minutes} 分钟 > 教学预算 "
+                        f"{lesson_minutes} 分钟，超额 {diff} 分钟；其中 core={core_minutes}m, "
+                        f"support_inclass={support_minutes}m）。{tail}"
                     )
-                    problems.append(msg)
-                    coverage_problems.append(msg)
+                    _limit(msg)
 
-            # 6. 核心题量上限
-            if len(core_rows) > core_task_limit:
+            # 6. 核心题量上限（按唯一 (section, carrier_qid) 计，不按原文节点行数）
+            if len(unique_core) > core_task_limit:
                 msg = (
-                    f"core 核心任务数量超标（当前 {len(core_rows)} 道 > 上限 {core_task_limit} 道）。"
+                    f"core 核心任务数量超标（当前 {len(unique_core)} 道 > 上限 {core_task_limit} 道）。"
                     "认知负荷过大，建议将辅助练习题转入 self-study 角色或拆课。"
                 )
-                problems.append(msg)
-                coverage_problems.append(msg)
+                _limit(msg)
 
     # 7. Delivery 阶段扩展检查 (修复 F6, F7, F8)
     if stage == "delivery":
         # 检查 classroom-plan.md 是否已生成且填充实质内容
+        # 卡 11：教案是可选交付物——require_classroom_plan=false 时不要求额外
+        # 教案，也不因缺教案阻断；true 时走“先生成后检查”（build_nodes 已先跑
+        # gen_classroom_plan.py），仅模板转换失败才停。
         plan_path = os.path.join(pdir, "classroom-plan.md")
-        if not os.path.isfile(plan_path):
+        require_plan = bool(policy.get("require_classroom_plan", True))
+        if not require_plan:
+            stats["classroom_plan"] = "not-required"
+            warnings.append(
+                "未要求课堂计划（require_classroom_plan=false）：跳过 classroom-plan.md 的生成与"
+                "实质内容核验；教案属可选交付物，来源、数学与交付门禁不受影响。"
+            )
+        elif not os.path.isfile(plan_path):
+            stats["classroom_plan"] = "missing"
             msg = "缺失 classroom-plan.md 教师讲解方案，请先运行 gen_classroom_plan.py 自动生成"
             problems.append(msg)
             artifact_problems.append(msg)
+            _tag(msg, "CLASSROOM_PLAN_MISSING", "classroom-plan.md")
         else:
+            stats["classroom_plan"] = "present"
             plan_ok = True
             plan_errs = []
             if hasattr(gen_classroom_plan, "check_plan_file"):
@@ -340,6 +551,7 @@ def check_budget_project(pdir, stage="planning"):
                 for err in plan_errs:
                     problems.append(err)
                     artifact_problems.append(err)
+                    _tag(err, "CLASSROOM_PLAN_INVALID", "classroom-plan.md")
 
         # 检查 student.pdf 页数上限显式化 (修复 F8)
         pdf_path = os.path.join(pdir, "student.pdf")
@@ -351,13 +563,21 @@ def check_budget_project(pdir, stage="planning"):
             else:
                 stats["student_pdf_pages"] = pages
                 stats["student_pages"] = pages
-                if pages > max_student_pages:
+                if max_student_pages is None:
+                    stats["student_pages_limit"] = "unlimited"
+                    if pages > 6:
+                        warnings.append(
+                            f"self_study 模式不设学生版页面上限：当前 {pages} 页"
+                            "（仅提示，不阻断交付）。"
+                        )
+                elif pages > max_student_pages:
                     msg = (
                         f"student.pdf 实际页数超标（当前 {pages} 页 > 允许上限 {max_student_pages} 页）。"
                         "请检查排版溢出或拆减切片题目，严禁使用密集字号硬塞。"
                     )
                     problems.append(msg)
                     artifact_problems.append(msg)
+                    _tag(msg, "STUDENT_PDF_PAGE_OVERFLOW", "student.pdf")
 
     # 确定 category 分类（优先级: config > coverage > section > artifact > ok）
     if config_problems:
@@ -372,7 +592,8 @@ def check_budget_project(pdir, stage="planning"):
         category = "ok"
 
     stats["category"] = category
-    return BudgetResult(problems, warnings, stats, category=category, estimates_ref=estimates_ref)
+    return BudgetResult(problems, warnings, stats, category=category,
+                        estimates_ref=estimates_ref, issue_meta=issue_meta)
 
 
 def main(argv=None):
@@ -401,11 +622,19 @@ def main(argv=None):
         "warnings": warnings,
         "estimates_ref": estimates_ref,
         "scope": {"workdir": workdir, "stage": args.stage},
+        "policy": {
+            "execution_profile": stats.get("execution_profile", "legacy"),
+            "pedagogy_policy": stats.get("pedagogy_policy", "strict"),
+            "budget_policy": stats.get("budget_policy", "strict"),
+            "require_classroom_plan": stats.get("require_classroom_plan", True),
+            "sources": stats.get("policy_sources", {}),
+        },
         "input_digest": digest,
         "pdf_sha256": None,
         "status": "pass" if len(problems) == 0 else "fail",
         "issues": [
-            {"severity": "error", "message": p} for p in problems
+            dict({"severity": "error", "message": p}, **res.issue_meta.get(p, {}))
+            for p in problems
         ] + [
             {"severity": "warning", "message": w} for w in warnings
         ],

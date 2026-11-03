@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""test_runtime.py — F05–F08 运行时证据链回归测试（unittest + 临时目录）
 
@@ -15,10 +15,16 @@ T14（构建过程中输入变化）说明：真实 xelatex 编译太慢，这�
 import hashlib
 import json
 import os
+import re
 
 # 测试套件是可信证据构造方：deliver.py 的 --skip-checks 自 D1 起需环境变量
 # 二次确认（QCHAIN_ALLOW_SKIP_CHECKS=1），此处为测试进程统一声明。
 os.environ["QCHAIN_ALLOW_SKIP_CHECKS"] = "1"
+# 本文件的合成工程用的是假 HTML（<html>fake-student.html</html>），只验证发布
+# 控制流与回滚，不能也不该通过卡 04 引入的"staging 实际包浏览器验收"；因此
+# 所有 deliver 调用显式带 --skip-html-smoke，并在此声明其环境变量二次确认。
+# 真实的离线包浏览器验收见 scripts/test_html_delivery.py。
+os.environ["QCHAIN_ALLOW_SKIP_HTML_SMOKE"] = "1"
 import shutil
 import subprocess
 import sys
@@ -201,6 +207,8 @@ def seed_reports(d, compare_status="pass"):
              "check_provenance.json": ("check_provenance.py", "1.0"),
              "check_budget.json": ("check_budget.py", "1.0"),
              "build.json": ("build.py", "3.0"),
+         # §19 渲染质量门禁：合成工程产物与源级 \fillin 一致，预置 PASS
+         "check_render.json": ("check_render.py", "1.0"),
              "compare.json": ("compare_versions.py", "3.0"),
              # q_audit.md 多 Agent 证据链门禁：无派发单时对账 0/0 通过
              "check_agent_audit.json": ("check_agent_audit.py", "1.0")}
@@ -495,7 +503,7 @@ class T08_T12_Records(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             make_project(d)
             cmp_issues = seed_all(d, compare_status="review")
-            r = run_cli("deliver.py", d, "--skip-checks")
+            r = run_cli("deliver.py", d, "--skip-checks", "--skip-smoke", "--skip-html-smoke")
             self.assertEqual(r.returncode, 0, r.stdout)  # 先确认可发布
             # 修改 PDF；报告重新绑定新 PDF，但 review-notes 仍绑旧 PDF
             open(os.path.join(d, "student.pdf"), "wb").write(b"%PDF-NEW")
@@ -517,7 +525,7 @@ class T08_T12_Records(unittest.TestCase):
             notes["input_digest"] = digest
             with open(np, "w", encoding="utf-8") as f:
                 json.dump(notes, f, ensure_ascii=False)
-            r = run_cli("deliver.py", d, "--skip-checks")
+            r = run_cli("deliver.py", d, "--skip-checks", "--skip-smoke", "--skip-html-smoke")
             self.assertEqual(r.returncode, 1)
             self.assertIn("student.pdf", r.stdout)
             self.assertTrue(cmp_issues)  # 疑似项确实存在
@@ -590,7 +598,7 @@ class T13_T16_Release(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             make_project(d)
             seed_all(d)
-            r = run_cli("deliver.py", d, "--skip-checks")
+            r = run_cli("deliver.py", d, "--skip-checks", "--skip-smoke", "--skip-html-smoke")
             self.assertEqual(r.returncode, 0, r.stdout)
             old = {f: sha(os.path.join(d, "release", f))
                    for f in ("student.pdf", "teacher.pdf", "manifest.json")}
@@ -599,7 +607,7 @@ class T13_T16_Release(unittest.TestCase):
                 raise OSError("模拟目标文件占用/权限错误")
 
             old_argv = sys.argv
-            sys.argv = ["deliver.py", d, "--skip-checks"]
+            sys.argv = ["deliver.py", d, "--skip-checks", "--skip-smoke", "--skip-html-smoke"]
             try:
                 with mock.patch.object(deliver.shutil, "copy2", boom):
                     rc = deliver.main()
@@ -615,7 +623,7 @@ class T13_T16_Release(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             make_project(d)
             seed_all(d)
-            r = run_cli("deliver.py", d, "--skip-checks")
+            r = run_cli("deliver.py", d, "--skip-checks", "--skip-smoke", "--skip-html-smoke")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             m = json.load(open(os.path.join(d, "release", "manifest.json"),
                                encoding="utf-8"))
@@ -710,6 +718,77 @@ class T17_AgentEvidenceGate(unittest.TestCase):
             r = run_cli("check_agent_audit.py", d)
             self.assertEqual(r.returncode, 1, r.stdout)
             self.assertIn("EVIDENCE_STALE", r.stdout)
+
+
+class T18_SublistSlotRegistration(unittest.TestCase):
+    """§19.1 题内 \\item 子列表的 \\fillin 必须登记进牌组（GR.4 回归）。
+
+    缺陷复盘：close_cur_item() 用 InlineCtx(card.get("id", "item")) 渲染
+    列表条目，却从不把 ctx.slots 回灌给题目卡 —— HTML 渲染出选项组、
+    cards.json 不登记，data-slot 退化为重复的 item-sN，check_html 报
+    「选项组 69 个与牌组槽位 66 个不一致」（student.html 69 / deck 66）。
+    根治：子列表槽位归属当前题目卡，槽位 id 与牌组登记同源。
+    """
+
+    SEC = r"""\section*{I 子列表填空}
+    \begin{probchain}
+    % qid: sec1-entry
+    \item \qtype{综合题} 对左陪集 $A, B$ 试算：
+    \begin{itemize}
+    \item 若取代表元 $a \in A, b \in B$，算得 $(ab)H = \fillin[(2\ 3)H]{1.8cm}[(2\ 3)H/eH/(1\ 3)H]$；
+    \item 若改选 $a' \in A$，算得 $(a'b)H = \fillin[eH]{1.8cm}[(2\ 3)H/(1\ 3)H/eH]$。
+    \end{itemize}
+    续写顶层空 $\fillin[良定]{20mm}[良定/病态/无法判定]$，并留作答区 \ansspace{0.5cm}。
+    \begin{solution}
+    略。
+    \end{solution}
+    \begin{teacherNote}
+    观察代表元敏感性。
+    \end{teacherNote}
+    \end{probchain}
+    """
+
+    def test_t18_sublist_fillin_registered_in_deck(self):
+        import tex2cards
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "main.tex"), "w",
+                      encoding="utf-8", newline="") as f:
+                f.write("\\begin{document}\n\\input{sec1.tex}\n")
+            with open(os.path.join(d, "sec1.tex"), "w",
+                      encoding="utf-8", newline="") as f:
+                f.write(self.SEC)
+            deck, issues = tex2cards.parse_project(d)
+            counts = deck.get("counts", {})
+            self.assertEqual(counts.get("slots"), 3, counts)
+            ids = [s["id"] for c in deck["cards"]
+                   for s in (c.get("slots") or [])]
+            self.assertEqual(len(ids), len(set(ids)),
+                             "槽位 id 必须唯一（子列表曾退化为 item-sN）")
+            self.assertTrue(all(i.startswith("sec1-") for i in ids), ids)
+            self.assertEqual(tex2cards.validate_deck(deck), [])
+
+    def test_t18b_html_data_slot_matches_deck(self):
+        import render_html
+        import tex2cards
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "main.tex"), "w",
+                      encoding="utf-8", newline="") as f:
+                f.write("\\begin{document}\n\\input{sec1.tex}\n")
+            with open(os.path.join(d, "sec1.tex"), "w",
+                      encoding="utf-8", newline="") as f:
+                f.write(self.SEC)
+            deck, _ = tex2cards.parse_project(d)
+            out = os.path.join(d, "student.html")
+            ok, msg = render_html.render_version(
+                deck, d, "student", out, render_html.DEFAULT_TEMPLATE)
+            self.assertTrue(ok, msg)
+            with open(out, encoding="utf-8") as f:
+                html = f.read()
+            html_ids = re.findall(r'data-slot="([^"]+)"', html)
+            deck_ids = [s["id"] for c in deck["cards"]
+                        for s in (c.get("slots") or [])]
+            self.assertEqual(sorted(html_ids), sorted(deck_ids))
+            self.assertEqual(len(html_ids), len(set(html_ids)))
 
 
 if __name__ == "__main__":

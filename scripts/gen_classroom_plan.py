@@ -34,6 +34,19 @@ for stream in (sys.stdout, sys.stderr):
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPTS)
 import gen_config  # noqa: E402
+# 卡 11：教案是否必需由 C1 的 require_classroom_plan 决定（策略解析复用
+# check_pedagogy.load_policy → workflow.execution_policy，不另造开关）。
+import check_pedagogy  # noqa: E402
+
+
+def load_plan_policy(pdir):
+    """读取项目策略（缺 config.yaml 的旧项目 → legacy：要求教案）。"""
+    try:
+        return check_pedagogy.load_policy(pdir)
+    except Exception:
+        return {"execution_profile": "legacy", "pedagogy_policy": "strict",
+                "budget_policy": "strict", "require_classroom_plan": True,
+                "sources": {}}
 
 MARKER_PATTERN = re.compile(
     r"<!--\s*generated-by:\s*gen_classroom_plan(?:\s+v\d+)?\s+digest=([0-9a-fA-F]+)\s*-->\r?\n?"
@@ -132,6 +145,14 @@ def parse_coverage_map(coverage_path):
             "teach_method": get_val("teach_method"),
             "pitfall": get_val("pitfall"),
         }
+        # 卡 11：显式载体标记。carrier 列存在但单元格留空 → False（数据不足，
+        # 由 check_budget 报 BUDGET_CARRIER_MISSING 并定位，绝不伪装成一道题）；
+        # 整表没有 carrier 列 → True（沿用旧回落 node_id，不新增阻断）。
+        carrier_cell = get_val("carrier_qid") if col_map.get("carrier_qid") is not None else None
+        row_data["carrier_explicit"] = (True if carrier_cell is None
+                                        else bool(str(carrier_cell).strip()))
+        if not str(row_data["carrier_qid"] or "").strip():
+            row_data["carrier_qid"] = node_id
         rows.append(row_data)
 
     return rows
@@ -257,17 +278,31 @@ def generate_plan_markdown(pdir, rows, cfg):
 
 
 def generate(pdir, force=False):
-    """由项目目录的 coverage-map.md 与 config.yaml 生成/更新 classroom-plan.md。"""
+    """由项目目录的 coverage-map.md 与 config.yaml 生成/更新 classroom-plan.md。
+
+    卡 11：``require_classroom_plan=false``（faithful_fast 默认）时，教案是**可选
+    交付物**——缺覆盖表/无有效节点只提示并返回 0，不再让确定性步骤 HALT；
+    legacy（要求教案）保持原退出码 2/1 语义。
+    """
     pdir = os.path.abspath(pdir)
+    required = bool(load_plan_policy(pdir).get("require_classroom_plan", True))
     cov_path = os.path.join(pdir, "coverage-map.md")
     if not os.path.isfile(cov_path):
-        print(f"[gen_classroom_plan] 未找到 {cov_path}，无法生成课堂计划")
-        return 2
+        msg = f"[gen_classroom_plan] 未找到 {cov_path}，无法生成课堂计划"
+        if required:
+            print(msg)
+            return 2
+        print(msg + "（require_classroom_plan=false：不要求额外教案，跳过生成）")
+        return 0
 
     rows = parse_coverage_map(cov_path)
     if not rows:
-        print(f"[gen_classroom_plan] {cov_path} 中未解析到有效的规划节点表格")
-        return 1
+        msg = f"[gen_classroom_plan] {cov_path} 中未解析到有效的规划节点表格"
+        if required:
+            print(msg)
+            return 1
+        print(msg + "（require_classroom_plan=false：不要求额外教案，跳过生成）")
+        return 0
 
     cfg_path = os.path.join(pdir, "config.yaml")
     cfg = {}

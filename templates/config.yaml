@@ -52,11 +52,22 @@ dialogue_student_reveal: prompt_only   # prompt_only（学生版隐藏 \dlgteach
 dialogue_require_coverage_hook: true   # 对话块必须在 coverage-map.md 有承接记录
 
 # --- Agent 派发参数（T1/T2/T4 fan-out；q_audit.md 多 Agent 证据链）---
-# agent_dispatch 支持两种写法（等价）：
-#   ① 映射块（推荐，可配证据链逃生阀与子 Agent 路由表）：
+# 任务19（C12）派发契约：并发是「同时活跃的请求数」，不是「必须派发的请求数」。
+# 优先级（dispatch_contract_version=2）：
+#   本次 qchain_dispatch 显式正整数 > agent_dispatch.max_concurrency(>0)
+#   > agent_max_concurrency(>0) > 档位表（interactive=1 / safe=1 / fast=4 / budget=2）
+# 0 = 自动（按档位表取），负数/小数/布尔/大于 16 一律拒绝；嵌套与扁平同时为正
+# 且不一致 → CONFIG_CONCURRENCY_CONFLICT（不静默挑一个）。
+# 档位缺省推导：run_scope=full 或 execution_profile=faithful_fast → fast(4)，
+# focused/edit → interactive(1)，其余 → safe(1)。本模板**故意不预填 profile**：
+# 预填 safe 会把新工程的默认并发压回串行，且无法与「用户显式选 safe」区分。
+# 迁移提示：旧工程没有 dispatch_contract_version 时按 legacy(1) 解释——保留
+# 旧的「扁平 agent_max_concurrency 优先」语义，不会被静默放大；显式写 2 才启用
+# 上面的新优先级与冲突诊断。
+dispatch_contract_version: 2
 agent_dispatch:
-  profile: safe               # safe(调试/串行, 并发1) / fast(均衡, 并发4) / budget(成本受限, 并发2)
-  max_concurrency: 0          # 0=按档位自动；>0 固定并发上限
+  # profile: fast              # 取消注释 = 显式选择档位（可选 interactive/safe/fast/budget）
+  max_concurrency: 0          # 0=按档位自动；>0 固定并发上限（1..16）
   allow_unattested: false     # 证据链逃生阀：true=无代理证据（.pd/agent-calls/ 缺台账）的产物降级放行并打 unattested 标记；false=判 ok_unattested 失败并进入返修环（默认从严，严禁在生产环境开启）
   model_map:                  # 子 Agent 路由表 {阶段: {provider, model}}；缺省继承父 Agent 路由
     # T1: { provider: <provider>, model: <model> }    # 映射表阶段
@@ -64,8 +75,8 @@ agent_dispatch:
     # T4: { provider: <provider>, model: <model> }    # 验收阶段：应显式配置与 T2 不同的路由（创审分离 INV-2）
 #   ② 标量档位（旧写法，等价于映射块仅设 profile）：
 # agent_dispatch: safe
-agent_max_concurrency: 0      # 扁平兜底键（映射块未设 max_concurrency 时生效）
-agent_batch_window: 2         # 批次窗口倍数: batch_size = min(并发*窗口, 待写节数)
+agent_max_concurrency: 0      # 扁平兜底键（v2：嵌套为正时以嵌套为准；legacy：扁平优先）
+agent_batch_window: 2         # 批次窗口倍数: batch_size = min(并发*窗口, 待写节数)；排队请求数可以大于并发槽位
 agent_timeout_seconds: 900    # 单请求超时（秒）
 agent_max_retries: 2          # transient 故障重试次数（content/contract 类不重试）
 agent_allow_unattested: false # 扁平兜底逃生阀（等价 agent_dispatch.allow_unattested；映射块优先）

@@ -1,4 +1,4 @@
-"""check_fidelity.py — 来源忠实性确定性门禁（audit §18.6）。
+r"""check_fidelity.py — 来源忠实性确定性门禁（audit §18.6）。
 
 七项确定性检查（第一版不要求理解全部数学语义，先阻断可确定的来源漂移）：
 
@@ -12,7 +12,13 @@
                     立即 FAIL；
 6. exclusion check  EXCLUDED_BY_USER 不计覆盖缺口，但不得被正文
                     偷偷引用；
-7. approval check   所有 bridge/extension 必须有批准记录和理由。
+7. approval check   所有 bridge/extension 必须有批准记录和理由；
+8. asset check      源文档视觉/结构资产守恒对账：源侧非 excluded 单元
+                    内的图形类资产（\includegraphics / tikzcd /
+                    tikzpicture，按出现次数计）与表格类资产（tabular /
+                    tabular*）总数，不得多于产物 sec*.tex 中的同类总数
+                    （tikz 栅格化为 PNG 后以 \includegraphics 计入同类，
+                    属合法置换）。少于即 FIDELITY_ASSET_LOST。
 
 输入（workdir = self/ 目录）：
 - .pd/source-manifest.json   Phase 0 冻结的输入清单（digest 对账）
@@ -46,7 +52,7 @@ if HERE not in sys.path:
 import evidence  # noqa: E402（scripts/ 已在 sys.path）
 
 TOOL_NAME = "check_fidelity.py"
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 
 MANIFEST_REL = os.path.join(".pd", "source-manifest.json")
 CONTRACT_REL = os.path.join(".pd", "intent-contract.json")
@@ -64,6 +70,19 @@ RE_QID_LINE = re.compile(r"^\s*%\s*qid:\s*([^\s%|]+)", re.MULTILINE)
 RE_SEC_TEX = re.compile(r"^sec[0-9A-Za-z_-]+\.tex$")
 RE_BEGIN_ENV = re.compile(r"\\begin\{(microknowledge|knowledgebox|solution)\}")
 RE_END_ENV = re.compile(r"\\end\{(microknowledge|knowledgebox|solution)\}")
+
+#: 第 8 项资产守恒对账：图形类（\includegraphics / \begin{tikzcd} /
+#: \begin{tikzpicture}，精确环境名，tikzcd 不会误匹配 tikzpicture，
+#: 反之亦然——花括号闭界定）；tikz 栅格化为 PNG 后在产物侧表现为
+#: \includegraphics，源/产物两侧同口径计入同一图形类。
+RE_ASSET_FIGURE = re.compile(
+    r"\\includegraphics(?=[\[{])|\\begin\{(?:tikzcd|tikzpicture)\}")
+#: 表格类资产：\begin{tabular} / \begin{tabular*}（不含 array/tabularx）。
+RE_ASSET_TABLE = re.compile(r"\\begin\{tabular\*?\}")
+#: 单元 locator 的行号区间（如 "§ 2.4.1 定义 L12-80"）。
+RE_LOCATOR_LINES = re.compile(r"L(\d+)-(\d+)\s*$")
+
+ASSET_KIND_LABEL = {"figure": "图形", "table": "表格"}
 
 ACTIONS = ("PRESERVE", "EXPLAIN", "BRIDGE", "EXTEND")
 STATUSES = ("PRESERVED", "EXPLAINED", "BRIDGED",
@@ -252,6 +271,123 @@ def parse_anchors(self_dir):
         result[name] = {"anchors": anchors, "qid_lines": qid_lines,
                         "blocks": blocks, "qid_ranges": qid_ranges}
     return result
+
+
+def _scan_asset_lines(text):
+    """逐行统计两类资产出现位置（TeX 注释感知：% 注释行不计，\\% 转义
+    不误判，与 evidence._strip_comments 同口径）。
+
+    返回 {"figure": [lineno, ...], "table": [lineno, ...]}，同一行出现
+    多次则重复记录（按 \\begin / \\includegraphics 次数计）。
+    """
+    stripped = evidence._strip_comments(text)
+    found = {"figure": [], "table": []}
+    for lineno, line in enumerate(stripped.splitlines(), 1):
+        found["figure"].extend([lineno] * len(RE_ASSET_FIGURE.findall(line)))
+        found["table"].extend([lineno] * len(RE_ASSET_TABLE.findall(line)))
+    return found
+
+
+def check_asset_conservation(workdir, manifest, units):
+    """第 8 项：源文档视觉/结构资产守恒对账。
+
+    源侧：按 manifest 读取各 include 源文件原文，统计两类资产行号；用
+    inventory 单元 locator 的 L起-止 行号区间把资产归属到单元，
+    disposition == "excluded" 单元内的资产不计入"应保留资产"。locator
+    解析失败的文件降级为整体按非 excluded 处理并记 warning（不 FAIL）。
+    产物侧：连接 self/sec*.tex 同口径统计。守恒判定：产物侧各类总数
+    >= 源侧应保留总数，否则 FIDELITY_ASSET_LOST。
+
+    返回 (problems, warnings, stats)；stats = {"source_kept": {...},
+    "output": {...}}（各类计数），供报告 checked 区入账。
+    """
+    problems, warnings = [], []
+    project_root = manifest.get("project_root") or os.path.dirname(workdir)
+
+    # 单元 locator → 每文件行号区间表
+    ranges = {}        # source_file -> [(lo, hi, source_id, disposition)]
+    bad_files = set()
+    for u in units:
+        sf = u.get("source_file") or ""
+        m = RE_LOCATOR_LINES.search(str(u.get("locator") or ""))
+        if not m:
+            bad_files.add(sf)
+            continue
+        ranges.setdefault(sf, []).append((int(m.group(1)), int(m.group(2)),
+                                          u.get("source_id"),
+                                          u.get("disposition")))
+    for sf in sorted(bad_files):
+        warnings.append({
+            "code": "FIDELITY_ASSET_LOCATOR_UNKNOWN",
+            "detail": "源文件 %s 存在 locator 行号无法解析的单元，该文件"
+                      "整体按非 excluded 处理（资产全部计入应保留）" % sf})
+
+    # ---- 源侧计数 ----
+    kept = {"figure": [], "table": []}   # [(source_file, lineno, source_id)]
+    for s in (manifest.get("sources") or []):
+        if not s.get("include", True):
+            continue
+        src = s.get("path") or ""
+        full = src if os.path.isabs(src) else os.path.join(project_root, src)
+        try:
+            with open(full, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            warnings.append({
+                "code": "FIDELITY_ASSET_SOURCE_UNREADABLE",
+                "detail": "源文件 %s 读取失败（%s），资产对账跳过该文件"
+                          % (src, e)})
+            continue
+        found = _scan_asset_lines(text)
+        file_ranges = [] if src in bad_files else ranges.get(src, [])
+        for kind in ("figure", "table"):
+            for ln in found[kind]:
+                owner, excluded = None, False
+                for lo, hi, sid, disp in file_ranges:
+                    if lo <= ln <= hi:
+                        owner = sid
+                        excluded = disp == "excluded"
+                        break
+                # 不在任何单元区间的资产（理论上是空白行，防御性兜底）
+                # 按应保留处理——宁可多报也不漏报
+                if not excluded:
+                    kept[kind].append((src, ln, owner))
+
+    # ---- 产物侧计数 ----
+    prod = {"figure": [], "table": []}   # [(sec_file, lineno)]
+    if os.path.isdir(workdir):
+        for name in sorted(os.listdir(workdir)):
+            if not RE_SEC_TEX.match(name) or name == "sec_template.tex":
+                continue
+            path = os.path.join(workdir, name)
+            with open(path, encoding="utf-8", errors="replace") as f:
+                found = _scan_asset_lines(f.read())
+            for kind in ("figure", "table"):
+                prod[kind].extend((name, ln) for ln in found[kind])
+
+    # ---- 守恒判定 ----
+    for kind in ("figure", "table"):
+        need, got = len(kept[kind]), len(prod[kind])
+        if got < need:
+            listing = "; ".join(
+                "%s L%d%s" % (sf, ln,
+                              "（单元 %s）" % sid if sid else "（未归属单元）")
+                for sf, ln, sid in kept[kind][:20])
+            more = " …（共 %d 处，仅列前 20）" % len(kept[kind]) \
+                if len(kept[kind]) > 20 else ""
+            problems.append({
+                "code": "FIDELITY_ASSET_LOST",
+                "detail": "%s类资产不守恒：源侧应保留 %d 个，产物 sec*.tex "
+                          "仅 %d 个，缺失 %d 个。源侧资产清单（请人工核对 "
+                          "tikz 栅格化等合法置换）: %s%s"
+                          % (ASSET_KIND_LABEL[kind], need, got, need - got,
+                             listing, more)})
+
+    stats = {
+        "source_kept": {k: len(kept[k]) for k in kept},
+        "output": {k: len(prod[k]) for k in prod},
+    }
+    return problems, warnings, stats
 
 
 def check_fidelity_project(workdir):
@@ -493,6 +629,12 @@ def check_fidelity_project(workdir):
                           "（期望 %s，实际 %s）"
                           % (src, s.get("digest"), actual)})
 
+    # ---- 8. 资产守恒对账（源文档视觉/结构资产 vs 产物 sec*.tex）----
+    asset_problems, asset_warnings, asset_stats = check_asset_conservation(
+        workdir, manifest, units)
+    errors.extend(asset_problems)
+    warnings.extend(asset_warnings)
+
     bridges = sorted({
         bid for info in anchors_by_sec.values()
         for _, kind, bid in info["anchors"] if kind == "bridge"})
@@ -506,6 +648,7 @@ def check_fidelity_project(workdir):
             "sections": len(anchors_by_sec),
             "content_policy": policy,
             "bridges": bridges,
+            "assets": asset_stats,
         },
         "workdir": workdir,
     }
@@ -560,6 +703,12 @@ def main(argv=None):
           % (checked["sources"], checked["units"], checked["rows"],
              checked["sections"], checked["content_policy"],
              len(checked["bridges"])))
+    assets = checked.get("assets")
+    if assets:
+        print("[check_fidelity] 资产守恒：图形 源 %d → 产物 %d；表格 源 %d "
+              "→ 产物 %d。"
+              % (assets["source_kept"]["figure"], assets["output"]["figure"],
+                 assets["source_kept"]["table"], assets["output"]["table"]))
     return 0
 
 

@@ -42,7 +42,8 @@ RE_QID_SRC = re.compile(r"(?m)^\s*%\s*qid:\s*([^\s%|]+)")
 
 REQUIRED_IDS = ("qc-btn-prev", "qc-btn-next", "qc-btn-answer",
                 "qc-btn-toc", "qc-indicator", "qc-stage", "qc-progress")
-REQUIRED_JS = ("qc-option", "data-correct", "hidden", "renderMathInElement")
+REQUIRED_JS = ("qc-option", "data-correct", "hidden", "katex.render",
+               "data-math-status", "qc-math-config")
 
 
 def read(path):

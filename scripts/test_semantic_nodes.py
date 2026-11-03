@@ -498,19 +498,45 @@ class T04_JoinCheck(unittest.TestCase):
         self.assertEqual(patch["repair_target"], "sec2")
 
     def test_under_parallelism_halts(self):
+        """任务21（C12.4）：低峰值只警告，不再 HALT/返修（原缺陷已移除）。"""
         for sec in ("sec1", "sec2"):
             write_check_result(self.d, sec)
         results = {req["dispatch_id"]: self._ok_result(req)
                    for req in self.requests}
-        # 计划承诺 min_parallelism=2，实际 max_in_flight=1 → 伪装完成
         state = dict(self.state)
         plan = dict(state["dispatch_plan"])
         plan["min_parallelism"] = 2
         state["dispatch_plan"] = plan
         self._install_pool(results, stats={"deferred": 0, "ok": 2, "max_in_flight": 1})
         patch = node_t2_join_check(state)
+        self.assertEqual(patch["stage"], "T2_SECTIONS_STAGED")
+        self.assertEqual(patch["routing_action"], "PROCEED")
+        metrics = patch["dispatch_metrics"]
+        self.assertEqual(metrics["max_in_flight"], 1)
+        self.assertEqual(metrics["observed_scope"], "host_call")
+        self.assertEqual(metrics["max_in_flight_source"], "worker_pool_stats")
+        warning = metrics["parallelism_warning"]
+        self.assertEqual(warning["code"], "PARALLELISM_BELOW_DECLARED")
+        self.assertEqual(warning["observed"], 1)
+        self.assertEqual(warning["declared"], 2)
+        self.assertIs(warning["content_rework_allowed"], False)
+        self.assertEqual(len(patch["dispatch_results"]), 2)
+
+    def test_peak_over_cap_still_halts(self):
+        """cap 越界仍属正确性阻断。"""
+        for sec in ("sec1", "sec2"):
+            write_check_result(self.d, sec)
+        results = {req["dispatch_id"]: self._ok_result(req)
+                   for req in self.requests}
+        state = dict(self.state)
+        plan = dict(state["dispatch_plan"])
+        plan["max_concurrency"] = 1
+        plan["min_parallelism"] = 1
+        state["dispatch_plan"] = plan
+        self._install_pool(results, stats={"deferred": 0, "ok": 2, "max_in_flight": 2})
+        patch = node_t2_join_check(state)
         self.assertEqual(patch["stage"], "HALTED")
-        self.assertIn("并发度", patch["error_message"])
+        self.assertIn("并发越界", patch["error_message"])
 
     def test_manual_interrupt_once_then_disk_rederive(self):
         captured = []

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "engine": "katex",
+  "macros": {
+    "\\linf": "\\ell_\\infty",
+    "\\bm": "\\boldsymbol",
+    "\\quotgrp": "#1/#2",
+    "\\quotring": "#1/#2"
+  },
+  "trust": false,
+  "maxExpand": 1000,
+  "maxSize": 20,
+  "strict": "ignore",
+  "errorColor": "#fe01fe"
+}

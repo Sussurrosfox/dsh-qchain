@@ -567,6 +567,231 @@ _ACCEPTANCE_REQUIRED = ("schema_version", "scope", "reviewed_qids",
 _ISSUE_REQUIRED = ("id", "qid", "part", "code", "evidence", "status",
                    "resolution", "verified_digest")
 
+# ---------------------------------------------------------------------------
+# 修复卡 14：合并终审投影（v2）验收证据
+# ---------------------------------------------------------------------------
+# 判别式刻意用 review_kind 而**不是** schema_version：旧 v1 记录的
+# schema_version 本来就是 SCHEMA_VERSION(=2)，拿版本号当判别式会把历史记录
+# 误判成新格式、进而放松旧校验。因此：
+#   - 记录里出现 review_kind  → 走 v2 分支（合并终审确定性投影）；
+#   - 否则                    → 走下面原封不动的 v1 分支（历史档仍须满足它
+#                                自己的全部字段，绝不被新格式放松）。
+_ACCEPTANCE_V2_REQUIRED = ("schema_version", "review_kind", "scope",
+                           "reviewed_qids", "content_digest", "output_format",
+                           "conclusion", "reviewer_role", "issues",
+                           "source_comparison", "content_review_refs",
+                           "delivery_check_ref", "derived_from")
+#: 已知审读种类（未知种类显式拒绝，避免未来种类被旧校验默默放过）
+_ACCEPTANCE_REVIEW_KINDS = ("combined_source_fidelity",)
+#: 各输出格式必备交付产物（html-only 不含 PDF：不得用零 hash 伪造 PDF 证明）
+_ACCEPTANCE_FORMAT_ARTIFACTS = {
+    "html": ("student.html",),
+    "pdf": ("student.pdf",),
+    "both": ("student.pdf", "student.html"),
+}
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_ZERO_DIGEST = "0" * 64
+
+
+def _is_real_digest(value):
+    """真实指纹：64 位小写十六进制且不是全零占位。"""
+    return (isinstance(value, str) and bool(_DIGEST_RE.match(value))
+            and value != _ZERO_DIGEST)
+
+
+def _issue_lifecycle_problems(issues, scope, required=None):
+    """issue 追溯字段 + 生命周期（v1/v2 同一口径）。"""
+    problems = []
+    keys = required or _ISSUE_REQUIRED
+    for it in issues or []:
+        if not isinstance(it, dict):
+            problems.append("验收记录 %s 的 issue 必须是对象: %r" % (scope, it))
+            continue
+        missing = [k for k in keys if k not in it]
+        if missing:
+            problems.append("验收记录 %s 的 issue 缺少字段 %s: %r"
+                            % (scope, ",".join(missing), it.get("id")))
+            continue
+        status = it.get("status")
+        if status == "open":
+            continue
+        if status == "fixed":
+            if not it.get("resolution") or not it.get("verified_digest"):
+                problems.append("issue %s 标记 fixed 但缺少改后位置或复验摘要"
+                                % it.get("id"))
+        elif status == "withdrawn":
+            res = str(it.get("resolution") or "").strip()
+            if not res or res in ("综合考虑", "已处理"):
+                problems.append("issue %s 标记 withdrawn 但未说明误报依据"
+                                % it.get("id"))
+        else:
+            problems.append("issue %s 状态非法: %r（允许 open/fixed/withdrawn）"
+                            % (it.get("id"), status))
+    return problems
+
+
+def _validate_acceptance_v2(rec, current_digest=None, student_pdf_sha=None,
+                            student_html_sha=None):
+    """校验合并终审投影的验收证据（v2）。
+
+    与 v1 的差别只有「证据从哪来」：v1 是审读员直接写的盲审记录，v2 是宿主从
+    合并终审主产物确定性投影出来的记录，因此**不要求** stage1_record /
+    stage2_record（不得伪造旧盲审体验），但要求更强的可核性：
+
+      - 显式声明 review_kind（未知种类拒绝）；
+      - content_review_refs（审读员当时看到的产物指纹）与 delivery_check_ref
+        （本轮磁盘实测指纹）**必须分离**：前者是历史，后者是本轮机械验收；
+      - 两份引用都必须携带真实 64 位摘要（零 hash / 占位摘要按伪造证据失败）；
+      - derived_from 必须能对回父主产物与派发身份；
+      - html-only 显式不含 PDF 证明：不得出现 student.pdf 指纹。
+    """
+    problems = []
+    scope = (rec or {}).get("scope", "?")
+    for k in _ACCEPTANCE_V2_REQUIRED:
+        if k not in rec:
+            problems.append("验收记录 %s.json 缺少字段 %s（v2 合并终审投影）"
+                            % (scope, k))
+    if problems:
+        return problems
+
+    kind = str(rec.get("review_kind") or "")
+    if kind not in _ACCEPTANCE_REVIEW_KINDS:
+        problems.append("验收记录 %s 的 review_kind=%r 不受支持（已知 %s）"
+                        % (scope, kind, "/".join(_ACCEPTANCE_REVIEW_KINDS)))
+    fmt = str(rec.get("output_format") or "")
+    if fmt not in _ACCEPTANCE_FORMAT_ARTIFACTS:
+        problems.append("验收记录 %s 的 output_format=%r 非法（允许 %s）"
+                        % (scope, rec.get("output_format"),
+                           "/".join(_ACCEPTANCE_FORMAT_ARTIFACTS)))
+    if rec.get("conclusion") not in ("PASS", "REVISE", "NEEDS_EVIDENCE"):
+        problems.append("验收记录 %s 结论非法: %r" % (scope, rec.get("conclusion")))
+    if not isinstance(rec.get("reviewed_qids"), list):
+        problems.append("验收记录 %s 的 reviewed_qids 必须是数组" % scope)
+    if not str(rec.get("reviewer_role") or "").strip():
+        problems.append("验收记录 %s 缺少 reviewer_role（审读身份必须角色化）"
+                        % scope)
+    text = rec.get("source_comparison")
+    if not isinstance(text, str) or len(text.strip()) < 8:
+        problems.append("验收记录 %s 缺少 source_comparison（忠实性审读证据不得为空）"
+                        % scope)
+    problems.extend(_issue_lifecycle_problems(rec.get("issues"), scope))
+
+    # ---- derived_from：投影必须能对回父主产物与派发身份 ----
+    derived = rec.get("derived_from")
+    if not isinstance(derived, dict):
+        problems.append("验收记录 %s 的 derived_from 必须是对象（投影必须可溯源）"
+                        % scope)
+        derived = {}
+    else:
+        version = derived.get("projection_schema_version")
+        if not (isinstance(version, int) and not isinstance(version, bool)):
+            problems.append("验收记录 %s 的 derived_from.projection_schema_version"
+                            " 缺失或非法：%r（不兼容旧档必须显式拒绝）"
+                            % (scope, version))
+        if str(derived.get("scope") or "") != str(scope):
+            problems.append("验收记录 %s 的 derived_from.scope=%r 与记录 scope 不一致"
+                            % (scope, derived.get("scope")))
+        for key in ("review_artifact", "dispatch_id"):
+            if not str(derived.get(key) or "").strip():
+                problems.append("验收记录 %s 的 derived_from 缺少 %s"
+                                % (scope, key))
+        if not _is_real_digest(derived.get("review_artifact_sha256")):
+            problems.append("验收记录 %s 的 derived_from.review_artifact_sha256 不是"
+                            "真实摘要（不得用零 hash 冒充父产物）" % scope)
+
+    # ---- content_review_refs vs delivery_check_ref：双重证据必须分离 ----
+    content = rec.get("content_review_refs")
+    if not isinstance(content, dict) or not content:
+        problems.append("验收记录 %s 缺少 content_review_refs（内容审读引用不可缺）"
+                        % scope)
+        content = {}
+    if not _is_real_digest(content.get("review_artifact_sha256")):
+        problems.append("验收记录 %s 的 content_review_refs.review_artifact_sha256 "
+                        "不是真实摘要" % scope)
+    content_digests = content.get("artifact_digests")
+    if not isinstance(content_digests, dict) or not content_digests:
+        problems.append("验收记录 %s 的 content_review_refs.artifact_digests 必须是"
+                        "非空对象（审读员当时看到的交付产物指纹）" % scope)
+        content_digests = {}
+    if derived and str(content.get("review_artifact_sha256") or "") != str(
+            derived.get("review_artifact_sha256") or ""):
+        problems.append("验收记录 %s 的 content_review_refs 与 derived_from 指向的"
+                        "父产物摘要不一致" % scope)
+    if derived and str(content.get("dispatch_id") or "") != str(
+            derived.get("dispatch_id") or ""):
+        problems.append("验收记录 %s 的 content_review_refs 与 derived_from 的派发"
+                        "身份不一致" % scope)
+
+    delivery = rec.get("delivery_check_ref")
+    if not isinstance(delivery, dict) or not delivery:
+        problems.append("验收记录 %s 缺少 delivery_check_ref（本轮机械验收引用不可缺）"
+                        % scope)
+        delivery = {}
+    delivery_digests = delivery.get("artifact_digests")
+    if not isinstance(delivery_digests, dict) or not delivery_digests:
+        problems.append("验收记录 %s 的 delivery_check_ref.artifact_digests 必须是"
+                        "非空对象（本轮磁盘实测产物指纹）" % scope)
+        delivery_digests = {}
+    # C7 的「分离」是**溯源分离**，不是「指纹数值必须不同」：同一轮里审读员
+    # 看到的正是本轮产物，两份指纹本就应当相等；若强行要求不等，只会把人逼去
+    # 伪造第二套指纹（或把正常同轮审读判死）。真正的分离要求是：内容审读引用
+    # 必须能追到父主产物 + 派发身份 + 当时的切片指纹（历史），交付核验引用
+    # 必须显式标明「本轮磁盘实测」来源（当下）。二者混淆/缺失即失败。
+    for key in ("review_artifact", "dispatch_id", "section_digest"):
+        if not str(content.get(key) or "").strip():
+            problems.append("验收记录 %s 的 content_review_refs 缺少 %s（内容审读"
+                            "引用必须可溯源到父产物/派发/切片）" % (scope, key))
+    if not str(delivery.get("source") or "").strip():
+        problems.append("验收记录 %s 的 delivery_check_ref 缺少 source（交付核验"
+                        "必须标明是本轮机械实测，不得与历史审读混淆）" % scope)
+    if rec.get("content_review_reused") is True and content_digests and \
+            delivery_digests and content_digests == delivery_digests:
+        problems.append("验收记录 %s 声明 content_review_reused=true，但内容审读"
+                        "指纹与本轮交付实测完全相同（复用标记与证据自相矛盾）"
+                        % scope)
+
+    for label, digests in (("content_review_refs", content_digests),
+                           ("delivery_check_ref", delivery_digests)):
+        for rel, value in sorted(digests.items()):
+            if not _is_real_digest(value):
+                problems.append("验收记录 %s 的 %s[%s]=%r 不是真实摘要（零 hash/"
+                                "占位摘要按伪造证据失败）" % (scope, label, rel, value))
+
+    wanted = _ACCEPTANCE_FORMAT_ARTIFACTS.get(fmt, ())
+    for rel in wanted:
+        if not _is_real_digest(delivery_digests.get(rel)):
+            problems.append("验收记录 %s 的 delivery_check_ref 缺少 %s 的实测指纹"
+                            "（%s 格式必须绑定该交付产物）" % (scope, rel, fmt))
+    if fmt == "html":
+        if rec.get("student_pdf_sha256"):
+            problems.append("验收记录 %s 为 html-only，却带 student_pdf_sha256"
+                            "（不得伪造 PDF 交付证明）" % scope)
+        if "student.pdf" in delivery_digests or "student.pdf" in content_digests:
+            problems.append("验收记录 %s 为 html-only，却声明 student.pdf 指纹"
+                            "（PDF 按格式显式不适用）" % scope)
+
+    if rec.get("conclusion") == "PASS":
+        open_ids = [str(it.get("id")) for it in (rec.get("issues") or [])
+                    if isinstance(it, dict) and it.get("status") == "open"]
+        if open_ids:
+            problems.append("验收记录 %s 结论为 PASS，但存在未处理的 open issue: %s"
+                            % (scope, ", ".join(open_ids)))
+        if current_digest is not None and rec.get("content_digest") != current_digest:
+            problems.append("验收记录 %s 绑定的内容摘要与当前摘要不一致"
+                            "（旧 PASS 不能冒充当前结果）" % scope)
+        if student_pdf_sha is not None:
+            bound = delivery_digests.get("student.pdf") or rec.get("student_pdf_sha256")
+            if bound and bound != student_pdf_sha:
+                problems.append("验收记录 %s 绑定的 student.pdf 哈希与当前构建不一致"
+                                % scope)
+        if student_html_sha is not None:
+            bound = (delivery_digests.get("student.html")
+                     or rec.get("student_html_sha256"))
+            if bound and bound != student_html_sha:
+                problems.append("验收记录 %s 绑定的 student.html 哈希与当前构建不一致"
+                                % scope)
+    return problems
+
 
 def validate_acceptance_json(rec, current_digest=None, student_pdf_sha=None, student_html_sha=None):
     """校验 .pd/acceptance/<scope>.json 的记录一致性（不代替实际审读）。
@@ -579,6 +804,15 @@ def validate_acceptance_json(rec, current_digest=None, student_pdf_sha=None, stu
         （verified_digest）；status=withdrawn 必须给出误报依据
         （resolution 非空且不得只填“综合考虑”）。
     """
+    # 卡14：v2 = 合并终审确定性投影（判别式 review_kind，不看 schema_version：
+    # 旧 v1 记录的 schema_version 本来就是 2，拿版本号判别会放松历史档校验）。
+    if isinstance(rec, dict) and "review_kind" in rec:
+        return _validate_acceptance_v2(
+            rec,
+            current_digest=current_digest,
+            student_pdf_sha=student_pdf_sha,
+            student_html_sha=student_html_sha,
+        )
     problems = []
     scope = (rec or {}).get("scope", "?")
     for k in _ACCEPTANCE_REQUIRED:

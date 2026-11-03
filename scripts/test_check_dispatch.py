@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 r"""test_check_dispatch.py — T2 fan-out 派发计划硬门禁回归测试（unittest + 临时目录）
 
-覆盖 T17–T28：只在临时目录合成 `.pd/dispatch-plan.json`，不触碰真实 self/
+覆盖 T17–T29：只在临时目录合成 `.pd/dispatch-plan.json`，不触碰真实 self/
 工程，也不依赖 xelatex 与网络。
 
   T17 3 小节 + 3 个有效请求 → pass（退出码 0）
@@ -18,6 +18,9 @@ r"""test_check_dispatch.py — T2 fan-out 派发计划硬门禁回归测试（un
   T26 计划 JSON 畸形 → PLAN_BAD_JSON
   T27 --json 报告在 pass/fail 两种情形下都落盘且 status 正确
   T28 子进程冒烟：真实退出码与 stdout 摘要
+  T29 R10 源资产计数（仅 T2 写作轮；复盘报告 §4.3.3）：请求缺 source_assets
+      或计数类型非法 → BAD_SOURCE_ASSETS；合法计数 → pass；
+      available=false → pass + 警告；stage=T4 等非 T2 轮次不误伤
 
 运行: python -m unittest discover scripts -p "test_check_dispatch.py" -v
 """
@@ -35,6 +38,9 @@ import check_dispatch  # noqa: E402
 DIGEST = "a" * 64
 DIGEST_OTHER = "0123456789abcdef" * 4
 
+#: 合法源资产计数（R10 / 复盘报告 §4.3.3：派发单必须携带源侧对账基线）
+SOURCE_ASSETS = {"figure": 3, "table": 1, "tikz": 1, "available": True}
+
 
 def make_plan(**overrides):
     """一份 3 小节 / 3 请求的合法派发计划；overrides 逐键覆盖。"""
@@ -49,13 +55,16 @@ def make_plan(**overrides):
         "requests": [
             {"dispatch_id": "dsp-t2-sec0-0000000001", "scope": "sec0",
              "role": "writer", "input_digest": DIGEST,
-             "artifacts": ["sec0.tex"], "status": "pending"},
+             "artifacts": ["sec0.tex"], "status": "pending",
+             "source_assets": dict(SOURCE_ASSETS)},
             {"dispatch_id": "dsp-t2-sec1-0000000002", "scope": "sec1",
              "role": "writer", "input_digest": DIGEST,
-             "artifacts": ["sec1.tex"], "status": "pending"},
+             "artifacts": ["sec1.tex"], "status": "pending",
+             "source_assets": dict(SOURCE_ASSETS)},
             {"dispatch_id": "dsp-t2-sec2-0000000003", "scope": "sec2",
              "role": "writer", "input_digest": DIGEST,
-             "artifacts": ["sec2.tex"], "status": "pending"},
+             "artifacts": ["sec2.tex"], "status": "pending",
+             "source_assets": dict(SOURCE_ASSETS)},
         ],
     }
     plan.update(overrides)
@@ -124,7 +133,8 @@ class T17_T19_Parallelism(unittest.TestCase):
                 max_concurrency=1,
                 requests=[{"dispatch_id": "dsp-t2-sec0-1", "scope": "sec0",
                            "role": "writer", "input_digest": DIGEST_OTHER,
-                           "artifacts": ["sec0.tex"], "status": "pending"}])
+                           "artifacts": ["sec0.tex"], "status": "pending",
+                           "source_assets": dict(SOURCE_ASSETS)}])
             write_plan(d, plan)
             rc = run_gate(d)
             self.assertEqual(rc, 0)
@@ -187,12 +197,57 @@ class T20_T23_FieldRules(unittest.TestCase):
             res = check_dispatch.check_dispatch_project(d)
             self.assertIn("DUPLICATE_SCOPE", [e["code"] for e in res["errors"]])
 
-    def test_t23_over_concurrency_fails(self):
+    def test_t23_queued_batch_may_exceed_concurrency_slots(self):
+        """任务19 / PARCFG-04 回归：排队请求数 > 并发槽位是合法的。
+
+        旧规则把「请求数 ≤ max_concurrency」当硬约束，逼得派发计划用
+        max(请求数, 并发上限) 冒充并发上限（真实限流因此不可审计）。现在
+        3 个请求 + max_concurrency=2 必须通过——批次窗口允许排队。
+        """
         with tempfile.TemporaryDirectory() as d:
             write_plan(d, make_plan(max_concurrency=2))
+            self.assertEqual(run_gate(d), 0)
+            res = check_dispatch.check_dispatch_project(d)
+            self.assertEqual(res["errors"], [])
+            self.assertEqual(res["warnings"], [])
+
+    def test_t23b_batch_size_must_match_request_count(self):
+        """任务19：batch_size 是队列长度，必须等于实际请求数（自相矛盾要拦）。"""
+        with tempfile.TemporaryDirectory() as d:
+            write_plan(d, make_plan(max_concurrency=2, batch_size=9))
             self.assertEqual(run_gate(d), 1)
             res = check_dispatch.check_dispatch_project(d)
-            self.assertIn("OVER_CONCURRENCY", [e["code"] for e in res["errors"]])
+            self.assertIn("BATCH_SIZE_MISMATCH",
+                          [e["code"] for e in res["errors"]])
+
+    def test_t23c_effective_concurrency_cannot_exceed_cap(self):
+        """任务19：有效并发不得高于执行上限（否则上限形同虚设）。"""
+        with tempfile.TemporaryDirectory() as d:
+            write_plan(d, make_plan(max_concurrency=2, effective_concurrency=4))
+            self.assertEqual(run_gate(d), 1)
+            res = check_dispatch.check_dispatch_project(d)
+            self.assertIn("BAD_CONCURRENCY", [e["code"] for e in res["errors"]])
+
+    def test_t23d_executor_kind_and_version_validated(self):
+        """任务19：executor_kind 枚举与 dispatch_contract_version 版本必须合法。"""
+        with tempfile.TemporaryDirectory() as d:
+            write_plan(d, make_plan(executor_kind="thread_pool"))
+            self.assertEqual(run_gate(d), 1)
+            res = check_dispatch.check_dispatch_project(d)
+            self.assertIn("BAD_EXECUTOR_KIND", [e["code"] for e in res["errors"]])
+        with tempfile.TemporaryDirectory() as d:
+            write_plan(d, make_plan(dispatch_contract_version=9))
+            self.assertEqual(run_gate(d), 1)
+            res = check_dispatch.check_dispatch_project(d)
+            self.assertIn("BAD_DISPATCH_VERSION", [e["code"] for e in res["errors"]])
+
+    def test_t23e_concurrency_above_client_limit_rejected(self):
+        """任务19：max_concurrency > 16 一律拒绝（不接受无上限批次）。"""
+        with tempfile.TemporaryDirectory() as d:
+            write_plan(d, make_plan(max_concurrency=32))
+            self.assertEqual(run_gate(d), 1)
+            res = check_dispatch.check_dispatch_project(d)
+            self.assertIn("BAD_CONCURRENCY", [e["code"] for e in res["errors"]])
 
 
 class T24_OtherRules(unittest.TestCase):
@@ -245,6 +300,18 @@ class T24_OtherRules(unittest.TestCase):
             self.assertEqual(res["errors"], [])
             self.assertEqual([w["code"] for w in res["warnings"]],
                              ["LOW_PARALLELISM"])
+
+    def test_t24d2_low_parallelism_detail_names_reason_not_zero(self):
+        """任务21（C12.4）：低并行警告必须给原因码，且峰值标 unknown 而非 0。"""
+        with tempfile.TemporaryDirectory() as d:
+            write_plan(d, make_plan(min_parallelism=8))
+            res = check_dispatch.check_dispatch_project(d)
+            detail = res["warnings"][0]["detail"]
+            self.assertIn("原因", detail)
+            self.assertIn("unknown", detail)          # 计划期无运行事件
+            self.assertIn("dispatch-runs", detail)    # 指向真实批摘要
+            # 不得把计划期缺数据说成实测 0
+            self.assertNotIn("实测峰值 0", detail)
 
     def test_t24e_request_batch_id_absent_is_allowed(self):
         with tempfile.TemporaryDirectory() as d:
@@ -353,6 +420,90 @@ class T28_Smoke(unittest.TestCase):
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertIn("[FAIL] UNDER_DISPATCH", r.stdout)
             self.assertIn("[FAIL] BAD_CONCURRENCY", r.stdout)
+
+
+class T29_SourceAssets(unittest.TestCase):
+    """R10 源资产计数（复盘报告 §4.3.3 内容审计前置，仅 T2 写作轮）。"""
+
+    def _codes(self, d):
+        return [e["code"] for e in check_dispatch.check_dispatch_project(d)["errors"]]
+
+    def test_t29a_missing_source_assets_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            reqs = make_plan()["requests"]
+            bad = {k: v for k, v in reqs[0].items() if k != "source_assets"}
+            write_plan(d, make_plan(requests=[bad] + reqs[1:]))
+            self.assertEqual(run_gate(d), 1)
+            res = check_dispatch.check_dispatch_project(d)
+            codes = [e["code"] for e in res["errors"]]
+            self.assertIn("BAD_SOURCE_ASSETS", codes)
+            # 一条请求一条错误：另外两个请求合法，不得连带报错
+            self.assertEqual(codes.count("BAD_SOURCE_ASSETS"), 1)
+            self.assertIn("requests[0]", res["errors"][0]["detail"])
+
+    def test_t29b_non_integer_counts_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            reqs = make_plan()["requests"]
+            bad = dict(reqs[0], source_assets="3 个图形")
+            write_plan(d, make_plan(requests=[bad] + reqs[1:]))
+            self.assertEqual(run_gate(d), 1)
+            self.assertIn("BAD_SOURCE_ASSETS", self._codes(d))
+
+    def test_t29c_negative_counts_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            reqs = make_plan()["requests"]
+            bad = dict(reqs[0], source_assets={"figure": -1, "table": 1,
+                                               "tikz": 0, "available": True})
+            write_plan(d, make_plan(requests=[bad] + reqs[1:]))
+            self.assertEqual(run_gate(d), 1)
+            res = check_dispatch.check_dispatch_project(d)
+            self.assertIn("BAD_SOURCE_ASSETS", self._codes(d))
+            self.assertIn("figure", res["errors"][0]["detail"])
+
+    def test_t29d_bool_is_not_a_valid_count(self):
+        """bool 是 int 子类，但 True 不是资产计数（与 BAD_CONCURRENCY 同口径）。"""
+        with tempfile.TemporaryDirectory() as d:
+            reqs = make_plan()["requests"]
+            bad = dict(reqs[0], source_assets={"figure": True, "table": 0,
+                                               "tikz": 0, "available": True})
+            write_plan(d, make_plan(requests=[bad] + reqs[1:]))
+            self.assertEqual(run_gate(d), 1)
+            self.assertIn("BAD_SOURCE_ASSETS", self._codes(d))
+
+    def test_t29e_valid_source_assets_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_plan(d, make_plan())
+            self.assertEqual(run_gate(d), 0)
+            res = check_dispatch.check_dispatch_project(d)
+            self.assertEqual(res["errors"], [])
+            self.assertEqual(res["warnings"], [])
+
+    def test_t29f_unavailable_is_warning_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            reqs = make_plan()["requests"]
+            unavailable = {"figure": 0, "table": 0, "tikz": 0,
+                           "available": False}
+            patched = [dict(r, source_assets=dict(unavailable))
+                       for r in reqs]
+            write_plan(d, make_plan(requests=patched))
+            self.assertEqual(run_gate(d), 0)  # 仅警告，不失败
+            res = check_dispatch.check_dispatch_project(d)
+            self.assertEqual(res["errors"], [])
+            self.assertEqual([w["code"] for w in res["warnings"]],
+                             ["SOURCE_ASSETS_UNAVAILABLE"] * 3)
+
+    def test_t29g_non_t2_stage_not_affected(self):
+        """T2_CHECK / T4 等轮次不携带源资产计数，不得误伤。"""
+        with tempfile.TemporaryDirectory() as d:
+            reqs = make_plan()["requests"]
+            stripped = [{k: v for k, v in r.items() if k != "source_assets"}
+                        for r in reqs]
+            for stage in ("T2_CHECK", "T4", "T2_SECTIONS"):
+                write_plan(d, make_plan(stage=stage, requests=stripped))
+                res = check_dispatch.check_dispatch_project(d)
+                self.assertEqual(res["errors"], [], msg=stage)
+                self.assertNotIn("BAD_SOURCE_ASSETS",
+                                 [e["code"] for e in res["errors"]])
 
 
 if __name__ == "__main__":

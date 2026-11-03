@@ -19,18 +19,26 @@
    - 检查点持久化 `SqliteSaver`：断点与执行快照跨进程落盘，随时支持进程退出、重启与多端恢复推进。
 
 2. **算力与认知层 (Cognitive Workers) — 专职子 Agent**
-   - 严格执行“一节一写作者”边界与独占 attempt 契约。
-   - 认知派发统一抽象为 `*_request`（记录修改前摘要快照）与 `*_await`（比对快照，杜绝无变更空转）。
+   - `execution_profile=legacy`（缺省，3.3.0 之前的全部行为）：严格执行**“一节一写作者”**边界与独占 attempt 契约，逐节双审。
+   - `execution_profile=faithful_fast`（3.3.0 新增）：一个作者可写**最多 2 个相邻节**（`writer_batch_max_sections=2`），
+     T1 一次调用产出三份映射，终审合并为一次（`1+K+R` 派发预算）。教学偏好与课时预算转为 advisory，但数学/忠实性/必需资源仍是硬门禁。
+   - 认知派发统一抽象为 `*_request`（记录修改前摘要快照）与 `*_await`（比对快照，杜绝无变更空转）；
+     并发档位（`interactive`/`safe`/`fast`/`budget`）与执行图**分开配置**，详见 [docs/faithful-fast-migration.md](docs/faithful-fast-migration.md)。
 
 3. **安全与执行基底 (Execution Enclave) — 只读工具基底**
+   - `tikz_rasterize.py`：源文档侧 TikZ 预栅格化（run 之前把源文档中的 tikzcd/tikzpicture 逐块编译为 PNG 进 assets/，切片改以 `\includegraphics` 引用（`--rewrite OUT.tex` 一键生成重写源文件：块替换为引用、块外逐字节不变、失败即闭不写文件；源导言区宏定义与 `\usetikzlibrary` 依赖默认自动提取注入，`--no-auto-preamble` 可关），杜绝切片子 Agent 静默丢图）；
    - `pdstate.py`：运行契约、独占 attempt、原子提升；
    - `shuffle_options.py`：选择题选项随机打乱（确定性/幂等，防“所有答案都是 A”）；
    - `estimate_minutes.py` & `check_budget.py`：确定性结构耗时估算引擎（基于切片小问与填空）与课时预算刚性硬约束（取消 20% 软顶豁免）；
    - `gen_classroom_plan.py`：教案门禁纯只读体检（`--check`），检测教案占位符残留，绝不破坏性覆盖教师手改教案；
    - `check_numbering.py` & `check_dialogue.py`：结构合规与防泄露硬门禁；
+   - `check_fidelity.py`（1.1）：来源忠实性门禁——升级后新增**资产守恒对账**：核对源文档图/表/TikZ/公式环境数量与切片保留数量，gap 清单非空或缺失即拦截；
    - `build.py`：XeLaTeX 双遍编译与排版告警校验（编译前先校验打乱机制生效）；
+   - `check_render.py`（1.1）：渲染质量门禁（§19）——结构门禁只查“卡片数/槽位数对得上”，本门禁查“渲染出来的字是不是字”：HTML 双重转义、center/tabular 压平残留、.qc-math 段 $ 不成对、KaTeX 宏白名单、选项汉字守恒（源级 \fillin 汉字必须出现在 HTML 按钮与 PDF 文本层中）、KaTeX 本地自足（禁外网 CDN），以及 PDF 日志 Missing character、U+FFFD 不可见字形、空选项组；1.1 起新增 H7 槽位守恒、CJK 缺字聚合与 tikz 泄漏检测（切片残留的 tikzcd/tikzpicture 环境直接拦截）。须在 build.py 之后运行，一票否决；
+   - `render_smoke.py`：构建后双模（PDF/HTML）视觉冒烟——渲染 student/teacher 关键页（首页 + 首个含选项组的页）截图 PNG 落 `.pd/review/smoke/`（`--pdfs` 可选 PDF 子集）；`make_review_pack.py` 自动调用并把结果记入审读包 manifest 的 smoke 区（最佳努力，不阻断审读包）；`deliver.py` 将其作为硬门槛——PDF 交付缺冒烟证据（报告非 pass 或零截图）一律拒绝发布
    - `compare_versions.py`：学生版答案与教师标记防泄露比对；
-   - `deliver.py`：schema_version 2 全证据门禁汇总与原子发布到 `release/`（双向核验 `.pd/confirmed-spec.json` 的 SHA-256 签名）。
+   - `redeliver.py`：一键重交付——串联 build → review-pack → 证据哈希对齐 → deliver，返修后一条命令重走交付链；
+   - `deliver.py`：schema_version 2 全证据门禁汇总与原子发布到 `release/`（双向核验 `.pd/confirmed-spec.json` 的 SHA-256 签名）；含渲染冒烟硬门槛（`--skip-smoke` 可显式跳过，跳过事实须记入交付说明，不推荐）
 
 ---
 
@@ -86,7 +94,26 @@ python workflow/runner.py --project . --status
 python workflow/runner.py --visualize
 ```
 
-**交付模式与课时预算机制**：
+**执行配置（3.3.0）：`content_policy` 与 `execution_profile` 是两个开关**
+```yaml
+# <self>/config.yaml
+content_policy: faithful          # faithful | authoring —— 内容取向（是否原样忠实呈现）
+execution_profile: faithful_fast  # legacy | faithful_fast —— 编译哪张执行图
+agent_dispatch:
+  profile: fast                   # interactive | safe | fast | budget —— 并发档位（与执行图无关）
+  max_concurrency: 0              # 0=自动；显式正整数优先；非法值硬拒绝
+```
+- **缺省即 `legacy`**：不写 `execution_profile` 的新旧项目、以及全部旧检查点，继续 `legacy-v1` 旧图，
+  不做静默迁移。旧会话只能由冻结版本 legacy 图恢复；已冻结 `faithful_fast` 的会话不能被旧代码接管。
+- 新项目想要“忠实 + 轻量”：`content_policy: faithful` + `execution_profile: faithful_fast`，
+  Phase 0 由真人确认后冻结（新 run 的建议值，不自动生效）。
+- 新 fast 全量请求的目标并发为 4（`fast`）；担心宿主承压就显式写 `safe`（=1）。
+  **本插件只保证宿主调用窗口重叠，不承诺供应商必然同时推理**（该项为环境限制，见下）。
+- 派发预算 `1+K+R`（1 次统一规划 + K 个作者批 + R 次终审）的适用条件、实测值（1 节=3、2 节=3、3 节=5、长输入 3 节=6，
+  旧图对照 12）、串行诊断六码与检查点兼容规则：见 [docs/faithful-fast-migration.md](docs/faithful-fast-migration.md)。
+- 逐卡验收清单、真实三格式构建结论与全量回归数值：见 [docs/repair-validation.md](docs/repair-validation.md)。
+
+
 - `self_study`（自主学习模式，默认）：侧重循序渐进探究，**不再设总时长上限**，自动启用自学规划红线；核心推导长链题通过 `check_pedagogy` 门禁（强制拆解为至少 4~7 个连续小问台阶）及确定性结构估算确保认知密度下限，严禁为缩短篇幅省略推导台阶。
 - `teaching` / `classroom`（课堂教学模式）：保留课时时间预算刚性上限约束（默认 90 分钟，公式 `opening + closing + buffer + core + support_inclass <= lesson_minutes`，取消 20% 软顶豁免）。课时预算采用确定性结构估算（由 `scripts/estimate_minutes.py` 基于小问台阶与填空动作自动计算，非人工编数自报），真人确认的时长与配置落盘为 `.pd/confirmed-spec.json`（带有 SHA-256 签名），在门禁与交付脚本间实现双向防篡改对账。
 

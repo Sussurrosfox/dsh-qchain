@@ -1,0 +1,392 @@
+{
+  "note": "任务19 / C12 派发并发策略的跨语言共享 fixtures。Python(scripts/test_dispatch_policy.py) 与 JS(node --test scripts/test_dispatch_policy.mjs) 必须逐例产出与 expect 完全一致的策略字段（PARCFG-06）。expect 只写语义字段（profile/来源/并发/执行器/错误码），完整对象一致性由 Python 测试跑 node 快照比对。任何规则改动都必须两边同步并补 case。",
+  "fields": ["dispatch_contract_version", "profile", "profile_source",
+             "configured_concurrency", "concurrency_source", "concurrency_limit",
+             "executor_kind", "worker_max_concurrency", "capability_verified",
+             "effective_concurrency", "diagnostic_codes"],
+  "cases": [
+    {
+      "name": "v2_template_default_full_scope",
+      "why": "PARCFG-01：模板默认（不预填 profile）+ dispatch_contract_version=2 + run_scope=full → fast/4",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "max_concurrency": 0, "allow_unattested": false },
+        "agent_max_concurrency": 0
+      },
+      "run_scope": "full",
+      "execution_profile": "faithful_fast",
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "fast",
+        "profile_source": "run_scope:full", "configured_concurrency": 0,
+        "concurrency_source": "auto", "concurrency_limit": 4,
+        "executor_kind": "host_subagent", "worker_max_concurrency": null,
+        "capability_verified": false, "effective_concurrency": 4,
+        "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "v2_faithful_fast_without_scope",
+      "why": "PARCFG-01：新 faithful_fast 未显式选择档位（run_scope 空）→ fast/4",
+      "config": { "dispatch_contract_version": 2 },
+      "run_scope": "",
+      "execution_profile": "faithful_fast",
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "fast",
+        "profile_source": "execution_profile:faithful_fast",
+        "configured_concurrency": 0, "concurrency_source": "auto",
+        "concurrency_limit": 4, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 4, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "v2_explicit_safe_kept",
+      "why": "PARCFG-01：显式 safe 保持串行 1（faithful_fast 也不放大）",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "profile": "safe" }
+      },
+      "run_scope": "full",
+      "execution_profile": "faithful_fast",
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "safe",
+        "profile_source": "config:agent_dispatch.profile",
+        "configured_concurrency": 0, "concurrency_source": "auto",
+        "concurrency_limit": 1, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 1, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "v2_explicit_scalar_tier",
+      "why": "标量形态 agent_dispatch: budget 仍是显式选择",
+      "config": { "dispatch_contract_version": 2, "agent_dispatch": "budget" },
+      "run_scope": "full",
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "budget",
+        "profile_source": "config:agent_dispatch",
+        "configured_concurrency": 0, "concurrency_source": "auto",
+        "concurrency_limit": 2, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 2, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "v2_nested_wins_over_flat",
+      "why": "PARCFG-02：嵌套 4 与扁平 2 同时为正且不一致 → 冲突点名，不静默挑一个",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "max_concurrency": 4 },
+        "agent_max_concurrency": 2
+      },
+      "run_scope": "full",
+      "error": "CONFIG_CONCURRENCY_CONFLICT"
+    },
+    {
+      "name": "v2_nested_only",
+      "why": "嵌套块正向值优先于档位表",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "profile": "safe", "max_concurrency": 4 }
+      },
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "safe",
+        "profile_source": "config:agent_dispatch.profile",
+        "configured_concurrency": 4,
+        "concurrency_source": "config:agent_dispatch.max_concurrency",
+        "concurrency_limit": 4, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 4, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "v2_flat_only",
+      "why": "仅扁平键时用扁平键（嵌套缺省不冲突）",
+      "config": { "dispatch_contract_version": 2, "agent_max_concurrency": 3 },
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "safe",
+        "profile_source": "default", "configured_concurrency": 3,
+        "concurrency_source": "config:agent_max_concurrency",
+        "concurrency_limit": 3, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 3, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "v2_zero_is_auto",
+      "why": "PARCFG-02：0 = 自动，不产生正向覆盖效果（回落档位表）",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "max_concurrency": 0 },
+        "agent_max_concurrency": 0
+      },
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "safe",
+        "profile_source": "default", "configured_concurrency": 0,
+        "concurrency_source": "auto", "concurrency_limit": 1,
+        "executor_kind": "host_subagent", "worker_max_concurrency": null,
+        "capability_verified": false, "effective_concurrency": 1,
+        "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "v2_negative_rejected",
+      "why": "PARCFG-02：负数显式拒绝（不静默夹取）",
+      "config": { "dispatch_contract_version": 2, "agent_max_concurrency": -2 },
+      "error": "CONFIG_CONCURRENCY_INVALID"
+    },
+    {
+      "name": "v2_decimal_rejected",
+      "why": "PARCFG-02：小数显式拒绝",
+      "config": { "dispatch_contract_version": 2, "agent_max_concurrency": 2.5 },
+      "error": "CONFIG_CONCURRENCY_INVALID"
+    },
+    {
+      "name": "v2_bool_rejected",
+      "why": "PARCFG-02：布尔不是整数（bool 是 int 子类，必须显式排除）",
+      "config": { "dispatch_contract_version": 2, "agent_max_concurrency": true },
+      "error": "CONFIG_CONCURRENCY_INVALID"
+    },
+    {
+      "name": "v2_over_limit_rejected",
+      "why": "PARCFG-02：> 16 显式拒绝",
+      "config": { "dispatch_contract_version": 2, "agent_max_concurrency": 32 },
+      "error": "CONFIG_CONCURRENCY_OUT_OF_RANGE"
+    },
+    {
+      "name": "v2_invalid_profile_rejected",
+      "why": "未知档位在 v2 硬拒绝（不静默回落 safe）",
+      "config": { "dispatch_contract_version": 2, "agent_dispatch": "turbo" },
+      "error": "INVALID_DISPATCH_PROFILE"
+    },
+    {
+      "name": "legacy_flat_overrides_nested",
+      "why": "PARCFG-03：旧契约保持旧优先级（扁平 1 覆盖嵌套 4），只加诊断",
+      "config": {
+        "agent_dispatch": { "max_concurrency": 4 },
+        "agent_max_concurrency": 1
+      },
+      "run_scope": "full",
+      "expect": {
+        "dispatch_contract_version": 1, "profile": "fast",
+        "profile_source": "run_scope:full", "configured_concurrency": 1,
+        "concurrency_source": "config:agent_max_concurrency",
+        "concurrency_limit": 1, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 1,
+        "diagnostic_codes": ["CONFIG_CONCURRENCY_SHADOWED"]
+      }
+    },
+    {
+      "name": "legacy_missing_version_full_scope",
+      "why": "PARCFG-03：旧工程 run_scope=full 仍推导 fast（旧行为不变）",
+      "config": {},
+      "run_scope": "full",
+      "expect": {
+        "dispatch_contract_version": 1, "profile": "fast",
+        "profile_source": "run_scope:full", "configured_concurrency": 0,
+        "concurrency_source": "auto", "concurrency_limit": 4,
+        "executor_kind": "host_subagent", "worker_max_concurrency": null,
+        "capability_verified": false, "effective_concurrency": 4,
+        "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "legacy_safe_stays_serial",
+      "why": "PARCFG-03：旧 safe 不因 execution_profile=faithful_fast 变成 fast",
+      "config": { "agent_dispatch": { "profile": "safe" } },
+      "run_scope": "",
+      "execution_profile": "faithful_fast",
+      "expect": {
+        "dispatch_contract_version": 1, "profile": "safe",
+        "profile_source": "config:agent_dispatch.profile",
+        "configured_concurrency": 0, "concurrency_source": "auto",
+        "concurrency_limit": 1, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 1, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "legacy_bad_scalar_tolerated",
+      "why": "PARCFG-03：旧契约非法标量仍按旧行为回落自动档位（只留诊断，不失败）",
+      "config": { "agent_max_concurrency": "not-a-number" },
+      "expect": {
+        "dispatch_contract_version": 1, "profile": "safe",
+        "profile_source": "default", "configured_concurrency": 0,
+        "concurrency_source": "auto", "concurrency_limit": 1,
+        "executor_kind": "host_subagent", "worker_max_concurrency": null,
+        "capability_verified": false, "effective_concurrency": 1,
+        "diagnostic_codes": ["CONFIG_CONCURRENCY_INVALID"]
+      }
+    },
+    {
+      "name": "legacy_invalid_profile_falls_back",
+      "why": "PARCFG-03：旧契约未知档位回落 safe",
+      "config": { "agent_dispatch": "turbo" },
+      "expect": {
+        "dispatch_contract_version": 1, "profile": "safe",
+        "profile_source": "default", "configured_concurrency": 0,
+        "concurrency_source": "auto", "concurrency_limit": 1,
+        "executor_kind": "host_subagent", "worker_max_concurrency": null,
+        "capability_verified": false, "effective_concurrency": 1,
+        "diagnostic_codes": ["INVALID_DISPATCH_PROFILE"]
+      }
+    },
+    {
+      "name": "tool_override_wins",
+      "why": "PARCFG-01：本次工具调用正整数覆盖优先于配置，并记录来源",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "max_concurrency": 4 }
+      },
+      "tool_override": 2,
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "safe",
+        "profile_source": "default", "configured_concurrency": 2,
+        "concurrency_source": "tool:max_concurrency", "concurrency_limit": 2,
+        "executor_kind": "host_subagent", "worker_max_concurrency": null,
+        "capability_verified": false, "effective_concurrency": 2,
+        "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "tool_zero_is_auto",
+      "why": "工具传 0 = 自动，不覆盖配置",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "max_concurrency": 4 }
+      },
+      "tool_override": 0,
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "safe",
+        "profile_source": "default", "configured_concurrency": 4,
+        "concurrency_source": "config:agent_dispatch.max_concurrency",
+        "concurrency_limit": 4, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 4, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "tool_negative_rejected",
+      "why": "PARCFG-02：工具负数显式拒绝",
+      "config": { "dispatch_contract_version": 2 },
+      "tool_override": -1,
+      "error": "TOOL_CONCURRENCY_INVALID"
+    },
+    {
+      "name": "tool_decimal_rejected",
+      "why": "PARCFG-02：工具小数显式拒绝",
+      "config": { "dispatch_contract_version": 2 },
+      "tool_override": 1.5,
+      "error": "TOOL_CONCURRENCY_INVALID"
+    },
+    {
+      "name": "tool_over_limit_rejected",
+      "why": "PARCFG-02：工具 > 16 显式拒绝",
+      "config": { "dispatch_contract_version": 2 },
+      "tool_override": 17,
+      "error": "TOOL_CONCURRENCY_OUT_OF_RANGE"
+    },
+    {
+      "name": "unknown_contract_version_rejected",
+      "why": "未知契约版本硬拒绝（不按最新版本解释旧计划）",
+      "config": { "dispatch_contract_version": 3 },
+      "error": "DISPATCH_CONTRACT_VERSION_UNSUPPORTED"
+    },
+    {
+      "name": "host_unknown_capability_null",
+      "why": "PARCFG-05：宿主通道能力未知 → worker_max_concurrency=null，仍按配置上限执行",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "max_concurrency": 4 }
+      },
+      "worker_capabilities": null,
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "safe",
+        "profile_source": "default", "configured_concurrency": 4,
+        "concurrency_source": "config:agent_dispatch.max_concurrency",
+        "concurrency_limit": 4, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 4, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "python_worker_cap_one",
+      "why": "PARCFG-05：已注册 Python worker 声明 1 不被突破",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "max_concurrency": 4 }
+      },
+      "worker_capabilities": { "max_concurrency": 1, "sync": true },
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "safe",
+        "profile_source": "default", "configured_concurrency": 4,
+        "concurrency_source": "config:agent_dispatch.max_concurrency",
+        "concurrency_limit": 4, "executor_kind": "python_registry",
+        "worker_max_concurrency": 1, "capability_verified": true,
+        "effective_concurrency": 1, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "python_worker_cap_four",
+      "why": "已知能力 → effective = min(配置 8, 能力 4)",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_max_concurrency": 8
+      },
+      "worker_capabilities": { "max_concurrency": 4, "sync": true },
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "safe",
+        "profile_source": "default", "configured_concurrency": 8,
+        "concurrency_source": "config:agent_max_concurrency",
+        "concurrency_limit": 8, "executor_kind": "python_registry",
+        "worker_max_concurrency": 4, "capability_verified": true,
+        "effective_concurrency": 4, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "frozen_legacy_not_widened",
+      "why": "PARCFG-03：旧检查点冻结的 safe/1 不因当前配置 8 被放大",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_dispatch": { "max_concurrency": 8 }
+      },
+      "frozen": {
+        "dispatch_contract_version": 1,
+        "profile": "safe",
+        "configured_concurrency": 1,
+        "concurrency_source": "config:agent_max_concurrency"
+      },
+      "expect": {
+        "dispatch_contract_version": 1, "profile": "safe",
+        "profile_source": "frozen:dispatch.profile", "configured_concurrency": 1,
+        "concurrency_source": "config:agent_max_concurrency",
+        "concurrency_limit": 1, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 1, "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "frozen_v2_kept",
+      "why": "已冻结 v2 契约在 resume 时保持冻结值（配置漂移不得改写运行中批次）",
+      "config": {
+        "dispatch_contract_version": 2,
+        "agent_max_concurrency": 2
+      },
+      "frozen": {
+        "dispatch_contract_version": 2,
+        "profile": "fast",
+        "configured_concurrency": 4,
+        "concurrency_source": "config:agent_dispatch.max_concurrency"
+      },
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "fast",
+        "profile_source": "frozen:dispatch.profile", "configured_concurrency": 4,
+        "concurrency_source": "config:agent_dispatch.max_concurrency",
+        "concurrency_limit": 4, "executor_kind": "host_subagent",
+        "worker_max_concurrency": null, "capability_verified": false,
+        "effective_concurrency": 4, "diagnostic_codes": []
+      }
+    }
+  ]
+}

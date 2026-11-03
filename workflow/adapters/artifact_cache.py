@@ -118,42 +118,68 @@ class ArtifactCache:
                artifacts: Optional[List[str]] = None
                ) -> Optional[Dict[str, Any]]:
         """按键查询并校验全部 digest；命中返回条目（含 restored 标记），
-        未命中/失效返回 None。"""
+        未命中/失效返回 None。
+
+        需要知道**为什么**没命中（C7「算 miss 并给出原因」、复核台账与
+        命中报告）时用 :meth:`lookup_with_reason`。
+        """
+        entry, _reason = self.lookup_with_reason(
+            stage=stage, scope=scope, input_digest=input_digest,
+            config_digest=config_digest, prompt_version=prompt_version,
+            artifacts=artifacts)
+        return entry
+
+    def lookup_with_reason(self, *, stage: str, scope: str, input_digest: str,
+                           config_digest: str, prompt_version: str,
+                           artifacts: Optional[List[str]] = None
+                           ) -> "tuple[Optional[Dict[str, Any]], str]":
+        """按键查询并校验全部 digest。
+
+        返回 ``(entry, "")`` 表示命中（entry 含 ``restored=False`` 标记）；
+        返回 ``(None, 原因)`` 表示 miss，原因串直接可写进台账/报告——
+        缓存失效必须是**可复核的事实**，不能只留一个 None 让人猜。
+        """
         key = cache_key(stage=stage, scope=scope, input_digest=input_digest,
                         config_digest=config_digest,
                         prompt_version=prompt_version)
         entry_path = self._entry_path(key)
         if not os.path.isfile(entry_path):
-            return None
+            return None, "无缓存条目（首次生成或缓存已清理）"
         try:
             with open(entry_path, "r", encoding="utf-8-sig") as f:
                 entry = json.load(f)
         except (OSError, ValueError):
             self._drop(key)
-            return None
-        if not isinstance(entry, dict) or entry.get("key") != key:
+            return None, "缓存条目损坏（entry.json 无法解析，已删除该条目）"
+        if not isinstance(entry, dict):
             self._drop(key)
-            return None
+            return None, "缓存条目损坏（结构不是对象，已删除该条目）"
+        if entry.get("key") != key:
+            self._drop(key)
+            return None, "缓存条目键与当前摘要不符（条目被替换或损坏，已删除）"
         arts = entry.get("artifacts")
         if not isinstance(arts, dict) or not arts:
             self._drop(key)
-            return None
+            return None, "缓存条目缺少产物清单（已删除该条目）"
         if artifacts is not None and sorted(arts.keys()) != sorted(artifacts):
             # 产物清单与本次请求不一致 → 不是本 scope 的缓存
-            return None
+            return None, "缓存条目产物清单与本次请求不符（拒绝复用，保留条目待排查）"
         # 先校验所有 digest 再返回：缓存副本必须与记录逐一吻合
         cache_dir = os.path.join(self.root, key)
         for rel, expected in arts.items():
             if self._safe_target(rel) is None:
                 self._drop(key)
-                return None
+                return None, "缓存条目含越界产物路径（%s，已删除该条目）" % rel
             cached = os.path.join(cache_dir, *str(rel).split("/"))
             actual = file_digest(cached)
-            if actual is None or actual != expected:
+            if actual is None:
                 self._drop(key)
-                return None
+                return None, "缓存副本缺失（%s，已删除该条目）" % rel
+            if actual != expected:
+                self._drop(key)
+                return None, "缓存副本摘要与记录不一致（%s 被改动，已删除该条目）" % rel
         entry["restored"] = False
-        return entry
+        return entry, ""
 
     def restore(self, entry: Dict[str, Any]) -> bool:
         """把命中条目中的产物副本写回 self_dir（原子替换）。"""

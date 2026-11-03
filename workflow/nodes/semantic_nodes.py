@@ -31,19 +31,25 @@ from .agent_nodes import (
     REQUEST_DIR_REL,
     _write_worker_files,
     build_request,
+    sha256_file,
     write_request_file,
 )
 from . import agent_evidence
 from .section_batch_nodes import (
+    _disk_metrics,
     _disk_plan,
     _get_pool,
     _join_timeout,
     _live_pool,
     _load_dispatch_config,
+    _load_dispatch_run,
+    _parallelism_check,
     _plan_allow_unattested,
+    _pool_metrics_attribution,
     _result_field,
     _shrink_output,
     _write_json_atomic,
+    dispatch_run_rel,
 )
 
 #: 语义审读结果目录（每 scope 一个 JSON，worker 唯一可写路径）
@@ -147,6 +153,24 @@ def _shuffle_lineage_ok(self_dir: str, record_digest: str,
         return False
 
 
+def _projection_problems(self_dir: str, data: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """语义投影认证（卡 14）：投影必须能回到父审读产物与真实回执复算。
+
+    投影文件是**宿主确定性生成**的派生物，不是独立证据。只要记录里带
+    ``derived_from``，就必须重新核对父产物摘要、派发回执、worker 身份，
+    并重算投影内容；任何不符一律判为不可认证（不得「文件在就算过」）。
+    """
+    try:
+        import review_projection
+    except Exception as exc:                      # pragma: no cover - 防御性
+        return False, [f"review_projection 不可用: {exc}"]
+    try:
+        problems = review_projection.verify_projection(self_dir, data, "semantic")
+    except Exception as exc:                      # pragma: no cover - 防御性
+        return False, [f"语义投影认证异常: {exc}"]
+    return (not problems), list(problems)
+
+
 def evaluate_checker_result(
     self_dir: str,
     sec: str,
@@ -172,21 +196,32 @@ def evaluate_checker_result(
     if str(data.get("scope") or "") != sec:
         return "invalid_result", (
             f"语义审读结果 scope={data.get('scope')!r} 与本节 {sec!r} 不符")
+    lineage_bound = False
     if expected_digest and str(data.get("section_digest") or "") != expected_digest:
         # 打乱血缘豁免：候选经确定性选项重排后摘要必变，血缘台账证明
-        # 当前切片源自被审读候选（shuffle 是语义中性变换）
+        # 当前切片源自被审读候选（shuffle 是语义中性变换）。
+        # 血缘只豁免“摘要不一致”这一项；审读结论 / blocking issue / schema
+        # 仍须逐项判定（卡 05：不得早退 ok，否则 REVISE/NEEDS_EVIDENCE 被吞）。
         if _shuffle_lineage_ok(self_dir, str(data.get("section_digest") or ""),
                                expected_digest):
-            return "ok", "打乱血缘有效（候选经确定性选项重排）"
-        return "stale_digest", (
-            "语义审读绑定的候选摘要与当前切片不一致"
-            "（候选已变更，旧审读结果不得复用）")
+            lineage_bound = True
+        else:
+            return "stale_digest", (
+                "语义审读绑定的候选摘要与当前切片不一致"
+                "（候选已变更，旧审读结果不得复用）")
     conclusion = str(data.get("conclusion") or "")
     if conclusion not in SEMANTIC_CONCLUSIONS:
         return "invalid_result", f"语义审读结论 {conclusion!r} 不在合法集合内"
     issues = data.get("issues")
     if issues is not None and not isinstance(issues, list):
         return "invalid_result", "语义审读 issues 必须是列表"
+    if isinstance(data.get("derived_from"), dict):
+        # 卡 14：合并终审投影必须先复算认证，再谈结论。投影不是独立证据，
+        # 缺父产物 / 父产物被篡改 / 无真实派发回执 / 创审同体 一律非法。
+        ok, reasons = _projection_problems(self_dir, data)
+        if not ok:
+            return "invalid_result", (
+                "合并终审投影不可认证: " + "; ".join(reasons[:3]))
     blocking = [
         i for i in (issues or [])
         if isinstance(i, dict) and str(i.get("severity") or "") == "blocking"
@@ -198,6 +233,8 @@ def evaluate_checker_result(
         return "revise", detail
     if conclusion == "NEEDS_EVIDENCE":
         return "needs_evidence", "审读员判定证据不足（NEEDS_EVIDENCE）"
+    if lineage_bound:
+        return "ok", "打乱血缘有效（候选经确定性选项重排）"
     return "ok", ""
 
 
@@ -312,7 +349,10 @@ def node_t2_plan_check(state: ShrinkCoursewareState) -> Dict[str, Any]:
 
     batch: List[str] = []
     for sec in expected_sections:
-        if statuses.get(sec) == "staged" or sec == repair_target or needs_check(self_dir, sec):
+        # 仅补派缺结果/过期/schema 非法的 scope（needs_check 已覆盖全部
+        # 需派发情形）；staged 状态本身不构成派发理由——已有匹配 PASS 审读
+        # 的切片零派发放行（audit §14「无改动重跑不调 LLM」）。
+        if sec == repair_target or needs_check(self_dir, sec):
             batch.append(sec)
     if repair_target and repair_target in expected_sections and repair_target not in batch:
         batch.insert(0, repair_target)
@@ -386,6 +426,30 @@ def node_t2_plan_check(state: ShrinkCoursewareState) -> Dict[str, Any]:
             "stage": "HALTED",
             "routing_action": "HALT",
             "error_message": f"语义审读派发门禁未通过: {report.get('status')}",
+            "history": history,
+        }
+
+    # 卡20（C12.2）：语义审读批次同样写批次索引，否则 index.js 的 batch_id
+    # 解析漏读 .pd/dispatch-plan-semantic.json，同批独立 section 无法一次取全。
+    try:
+        agent_evidence.write_batch_index(
+            self_dir,
+            batch_id=batch_id,
+            run_id=state.get("run_id", ""),
+            stage="T2_CHECK",
+            request_ids=[req.get("dispatch_id") for req in requests],
+            plan_rel=CHECK_PLAN_REL.replace("\\", "/"),
+            plan_digest=sha256_file(os.path.join(self_dir, CHECK_PLAN_REL)),
+            sections=list(batch),
+            required_scope_count=plan_disk.get("required_scope_count"),
+            dispatch_contract_version=plan_disk.get("dispatch_contract_version"),
+        )
+        history.append(f"T2 Check: 已写批次索引（batch_id={batch_id}）")
+    except ValueError as exc:
+        return {
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": f"批次索引写入失败: {exc}",
             "history": history,
         }
 
@@ -528,7 +592,10 @@ def _check_interrupt_payload(
         ],
         "before_digests": before_digests,
         "context": {"sections": sections, "user_spec": state.get("user_spec", {})},
-        **agent_evidence.dispatch_protocol_block(),
+        # 卡20（C12.2）：批次入口附可直接执行的 dispatch_args（一次取全批）。
+        **agent_evidence.dispatch_protocol_block(
+            batch_id=batch_id, self_dir=state.get("self_dir") or "",
+        ),
         "max_concurrency": plan.get("max_concurrency"),
         "min_parallelism": plan.get("min_parallelism"),
         "requests": [
@@ -710,24 +777,55 @@ def node_t2_join_check(state: ShrinkCoursewareState) -> Dict[str, Any]:
                 "history": history,
             }
 
-    # ---- 硬门禁：实际并发度不得低于计划值（仅 parallel 模式） -------------
+    # ---- 度量：并行路径取活池观测；manual 路径只认本批真实批摘要 --------
+    # 任务21（C12.4）：manual/恢复路径没有活池，峰值只能来自
+    # .pd/dispatch-runs/<batch_id>.json；读不到就是 unknown(None) + 诊断来源，
+    # 绝不写死 0 冒充实测。
     if parallel_mode:
-        min_parallel = int(plan.get("min_parallelism") or 1)
-        actual = int((stats or {}).get("max_in_flight", 0) or 0)
-        if actual < min_parallel:
+        metrics = _pool_metrics_attribution(
+            stats, requests, plan,
+            reused=int((state.get("dispatch_metrics") or {}).get("reused", 0) or 0))
+    else:
+        metrics = _disk_metrics(
+            requests, ok_scopes, failures,
+            reused=int((state.get("dispatch_metrics") or {}).get("reused", 0) or 0),
+            self_dir=self_dir, batch_id=batch_id)
+        if metrics.get("max_in_flight") is None:
             history.append(
-                "T2 Check: 批次 %s 实际并发度 %d 低于计划值 %d，判定伪装完成"
-                % (batch_id, actual, min_parallel))
-            return {
-                "stage": "HALTED",
-                "routing_action": "HALT",
-                "error_message": (
-                    f"语义审读实际并发度 {actual} 低于计划值 {min_parallel}，"
-                    "禁止伪装完成"),
-                "dispatch_results": results,
-                "dispatch_metrics": stats,
-                "history": history,
-            }
+                "T2 Check: 本批并发峰值 unknown（%s，来源 %s；批摘要 %s），"
+                "不据未知判定「伪装完成」，也不返修正文"
+                % (metrics.get("diagnostics") or "no_run_record",
+                   metrics.get("max_in_flight_source"),
+                   metrics.get("batch_run_rel") or dispatch_run_rel(batch_id)))
+        else:
+            history.append(
+                "T2 Check: 本批并发观测 峰值=%d（口径 %s，来源 %s，原因 %s/%s）"
+                % (int(metrics["max_in_flight"]), metrics.get("observed_scope"),
+                   metrics.get("max_in_flight_source"),
+                   metrics.get("serial_reason_code"),
+                   metrics.get("serial_reason_source")))
+
+    # ---- 并发门禁（任务21 / C12.4）：越界才阻断，低峰值只记原因 ---------
+    parallelism = _parallelism_check(plan, metrics, batch_id or "")
+    if parallelism["halt"]:
+        history.append("T2 Check: 批次 %s %s" % (batch_id, parallelism["halt"]))
+        return {
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": parallelism["halt"],
+            "dispatch_results": results,
+            "dispatch_metrics": metrics,
+            "history": history,
+        }
+    if parallelism["warning"]:
+        warning = parallelism["warning"]
+        metrics = dict(metrics or {})
+        metrics["parallelism_warning"] = warning
+        history.append(
+            "T2 Check: 批次 %s 并发告警 %s（声明 %d，实测 %s，原因 %s/%s）："
+            "仅记录原因，不返修正文"
+            % (batch_id, warning["code"], warning["declared"], warning["observed"],
+               warning["serial_reason_code"], warning["serial_reason_source"]))
 
     if failures:
         repair_target = next(
@@ -753,7 +851,7 @@ def node_t2_join_check(state: ShrinkCoursewareState) -> Dict[str, Any]:
                 + (f"；父子链 {parent_note}" if parent_note else "")),
             "stage": "REPAIR_LOOP",
             "dispatch_results": results,
-            "dispatch_metrics": stats,
+            "dispatch_metrics": metrics,
             "history": history,
         }
         if redispatch:
@@ -770,7 +868,7 @@ def node_t2_join_check(state: ShrinkCoursewareState) -> Dict[str, Any]:
         "routing_action": "PROCEED",
         "stage": "T2_SECTIONS_STAGED",
         "dispatch_results": results,
-        "dispatch_metrics": stats,
+        "dispatch_metrics": metrics,
         "semantic_repair_target": None,
         "history": history,
     }

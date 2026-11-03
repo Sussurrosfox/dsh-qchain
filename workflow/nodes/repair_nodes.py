@@ -1,11 +1,30 @@
 """repair_nodes.py — Targeted repair dispatch and verification loop.
 Dispatches specific repair instructions to the problematic section,
 and halts if no artifact changes are made.
+
+卡 06（DATA-CONTRACTS C3）：内容返修有**持久**上限与无进展熔断——
+计数 / 前次 issue 指纹 / 前次产物摘要全部写进 checkpoint 状态（见
+``workflow/repair_budget.py``）；dispatch 返回 ok **不清零**，只有相关门禁真正
+PASS 才解除“本次未解决”标记；全局累计永不重置。
 """
 
 from typing import Dict, Any, List
 from ..state import ShrinkCoursewareState
-from .agent_nodes import build_request, write_request_file, run_dispatch
+from .. import repair_budget
+from .agent_nodes import build_request, write_request_file, run_dispatch, snapshot
+
+
+def _halt_repair(state: ShrinkCoursewareState, history: List[str], plan: Dict[str, Any],
+                 reason: str) -> Dict[str, Any]:
+    """无进展 / 预算耗尽 → HALT，并附未解决 issue、最后产物、attempt 来源。"""
+    history.append(f"Repair: {plan['detail']}，熔断停止 [{plan['halt_reason']}]")
+    return {
+        "stage": "HALTED",
+        "routing_action": "HALT",
+        "error_message": f"{plan['detail']}: {reason}",
+        "repair_halt": plan["halt"],
+        "history": history,
+    }
 
 
 def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
@@ -21,22 +40,24 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
         or "sec1"
     )
     reason = state.get("repair_reason", "需要修复门禁未通过项")
-    retry_count = state.get("retry_count", 0) + 1
     history = list(state.get("history", []))
-
-    if retry_count > 3:
-        history.append(f"Repair: 重试次数超限 ({retry_count} > 3)，熔断停止")
-        return {
-            "stage": "HALTED",
-            "routing_action": "HALT",
-            "error_message": f"返修重试次数超限: {reason}",
-            "history": history
-        }
 
     if any(target_sec.endswith(ext) for ext in (".md", ".tex", ".json", ".yaml")):
         tex_filename = target_sec
     else:
         tex_filename = f"{target_sec}.tex"
+
+    # C3：先判无进展/额度，再安排返修。输入摘要 = 返修前该产物的 sha256。
+    input_digest = snapshot(self_dir, [tex_filename]).get(tex_filename)
+    plan = repair_budget.plan_repair(
+        state, target_sec, reason, input_digest,
+        issues=state.get("repair_issues"), artifact=tex_filename)
+    if plan["action"] == "HALT":
+        return _halt_repair(state, history, plan, reason)
+
+    # retry_count 保留为 legacy 展示字段（本回路累计安排的返修次数）；
+    # 熔断判定已改由持久计数承担，dispatch ok 不再把它清零。
+    retry_count = state.get("retry_count", 0) + 1
     req = build_request(
         state,
         stage="REPAIR",
@@ -49,9 +70,20 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
         scope=target_sec
     )
     req_ref = write_request_file(self_dir, req)
-    history.append(f"Repair: 已派发 {target_sec} 返修任务 (第 {retry_count} 次，派发单: {req_ref})")
+    history.append(
+        f"Repair: 已派发 {target_sec} 返修任务 (第 {plan['attempt_no']} 次/本 scope，"
+        f"全局第 {plan['patch']['repair_attempts_total']} 次，派发单: {req_ref})")
 
+    # 计数 + 指纹 + 输入摘要与派发单在**同一次**状态更新里落盘（先持久化后派发）。
+    budget_patch = plan["patch"]
+    budget_patch["repair_attempt_log"] = list(budget_patch["repair_attempt_log"]) + [
+        repair_budget.attempt_log_entry(
+            target_sec, plan["attempt_no"], budget_patch["repair_attempts_total"],
+            req["dispatch_id"], plan["fingerprint"], input_digest, reason)
+    ]
     return {
+        **budget_patch,
+        "repair_halt": None,
         "pending_dispatch": req,
         "retry_count": retry_count,
         "active_section": target_sec,
@@ -62,7 +94,12 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
 
 
 def node_repair_await(state: ShrinkCoursewareState) -> Dict[str, Any]:
-    """Wait for repaired artifacts to be produced and modified."""
+    """Wait for repaired artifacts to be produced and modified.
+
+    本节点**只**执行一次 run_dispatch：内容失败（缺产物/无变更/无证据）由派发层
+    直接返回 HALTED，不在同一 prompt 上重试；也不动任何返修计数——
+    成功派发不清零 retry_count / repair_*，门禁 PASS 才解除未解决标记。
+    """
     req = state.get("pending_dispatch")
     expected_sections = state.get("expected_sections") or []
     target_sec = state.get("repair_target") or state.get("active_section") or "sec1"
@@ -76,7 +113,7 @@ def node_repair_await(state: ShrinkCoursewareState) -> Dict[str, Any]:
         success_history=f"Repair: 产物 {target_sec} 已完成定点修改"
     )
     if res.get("stage") != "HALTED":
-        res["retry_count"] = 0
+        # 卡 06：不再 res["retry_count"] = 0（dispatch ok ≠ 问题已解决）。
         if target_sec in expected_sections:
             res["active_section"] = target_sec
             res["semantic_check_rounds"] = 0
