@@ -942,6 +942,105 @@ export function tolerantJsonParse(s) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// 8b. 输出截断判据（N5）
+// ---------------------------------------------------------------------------
+// 审计发现：子 Agent 输出被 max_tokens 截断时，只要全文没有 <<<END>>>，0b 宽松分支
+// 就会把截断的正文当成完整产物接收（LaTeX 环境都不配平也照样落盘），要么污染切片，
+// 要么等下游渲染/门禁才炸。这里给宽松分支加一道结构判据：不完整就不算产物。
+
+/** 去掉 TeX 注释（保留 \% 与转义序列），避免注释里的花括号干扰配平判定。 */
+function stripTexComments(text) {
+  return String(text).split(/\r?\n/).map((line) => {
+    let out = '';
+    for (let i = 0; i < line.length; i += 1) {
+      const ch = line[i];
+      if (ch === '\\' && i + 1 < line.length) { out += ch + line[i + 1]; i += 1; continue; }
+      if (ch === '%') break;
+      out += ch;
+    }
+    return out;
+  }).join('\n');
+}
+
+function braceDepth(text) {
+  let depth = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '\\') { i += 1; continue; }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth < 0) return { depth, negative: true };
+    }
+  }
+  return { depth, negative: false };
+}
+
+function unbalancedEnvs(text) {
+  const open = {};
+  const close = {};
+  for (const m of text.matchAll(/\\begin\s*\{([^}]+)\}/g)) open[m[1]] = (open[m[1]] || 0) + 1;
+  for (const m of text.matchAll(/\\end\s*\{([^}]+)\}/g)) close[m[1]] = (close[m[1]] || 0) + 1;
+  const bad = [];
+  for (const k of new Set([...Object.keys(open), ...Object.keys(close)])) {
+    if ((open[k] || 0) !== (close[k] || 0)) bad.push(`${k} ${open[k] || 0}/${close[k] || 0}`);
+  }
+  return bad;
+}
+
+/**
+ * 判断一段被宽松分支切出来的正文是否"中途截断"。
+ * 返回 '' 表示结构完整；返回非空字符串表示截断原因（用于证据台账）。
+ * 判据只认结构性事实（环境/花括号/JSON 收尾/代码围栏），不做长度猜测。
+ */
+export function looksTruncated(name, body) {
+  const n = String(name || '').toLowerCase();
+  const text = String(body || '');
+  if (!text.trim()) return '空内容';
+  if (n.endsWith('.tex')) {
+    const clean = stripTexComments(text);
+    if (!/\\[A-Za-z]/.test(clean)) return '不含任何 LaTeX 命令（疑似正文被截去）';
+    const b = braceDepth(clean);
+    if (b.negative) return '花括号提前闭合';
+    if (b.depth !== 0) return `花括号未配平（余 ${b.depth} 个未闭合的 { ）`;
+    const envs = unbalancedEnvs(clean);
+    if (envs.length) return `环境未配平（${envs.slice(0, 3).join(', ')}）`;
+    return '';
+  }
+  if (n.endsWith('.json')) {
+    const t = text.trim();
+    if (!/^[[{]/.test(t)) return '不是 JSON 开头';
+    if (!/[\]}]\s*$/.test(t)) return 'JSON 未收尾';
+    return '';
+  }
+  if (n.endsWith('.md')) {
+    const fences = (text.match(/^```/gm) || []).length;
+    if (fences % 2 === 1) return '代码围栏未闭合';
+    return '';
+  }
+  return '';
+}
+
+/** 宿主/适配器侧的截断信号（有则直接用，比结构推断更可靠）。 */
+function truncationHint(raw) {
+  if (!raw || typeof raw !== 'object') return false;
+  if (raw.truncated === true) return true;
+  for (const k of ['stop_reason', 'stopReason', 'finish_reason', 'finishReason']) {
+    const v = String(raw[k] || '').toLowerCase();
+    if (v === 'max_tokens' || v === 'length' || v === 'truncated') return true;
+  }
+  const inner = raw.result && typeof raw.result === 'object' ? raw.result : null;
+  if (inner) {
+    if (inner.truncated === true) return true;
+    for (const k of ['stop_reason', 'stopReason', 'finish_reason', 'finishReason']) {
+      const v = String(inner[k] || '').toLowerCase();
+      if (v === 'max_tokens' || v === 'length' || v === 'truncated') return true;
+    }
+  }
+  return false;
+}
+
 export function parseSubagentFiles(raw, artifacts) {
   if (!raw) return { files: null, runId: '', error: '子 Agent 无返回' };
   let runId = '';
@@ -1007,7 +1106,22 @@ export function parseSubagentFiles(raw, artifacts) {
         collected[name] = body;
         looseFound += 1;
       }
-      if (looseFound > 0) parsed = { files: collected };
+      if (looseFound > 0) {
+        // N5：宽松分支不认"没写 END"就当完整——逐块做结构判据，截断的一律剔除。
+        const truncatedFiles = [];
+        for (const [name, body] of Object.entries(collected)) {
+          const why = looksTruncated(name, body);
+          if (why) {
+            truncatedFiles.push(`${name}（${why}）`);
+            delete collected[name];
+          }
+        }
+        parsed = {
+          files: collected,
+          truncated: truncatedFiles.length > 0,
+          truncatedFiles,
+        };
+      }
     }
   } catch (_) { /* 落到 JSON 解析 */ }
 
@@ -1066,7 +1180,16 @@ export function parseSubagentFiles(raw, artifacts) {
       error: `子 Agent 返回不可解析为 {"files": {...}}：${trimmed.slice(0, 200)}`,
     };
   }
-  return { files: parsed.files, runId, error: '' };
+  const out = { files: parsed.files, runId, error: parsed.error || '' };
+  if (parsed.truncated) {
+    out.truncated = true;
+    out.truncatedFiles = Array.isArray(parsed.truncatedFiles) ? parsed.truncatedFiles : [];
+  } else if (truncationHint(raw)) {
+    // 解析看似成功，但适配器明确报告了 max_tokens 截断：产物完整性不可信
+    out.truncated = true;
+    out.truncatedFiles = [];
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

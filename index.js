@@ -178,6 +178,84 @@ function qdAtomicWrite(absPath, content) {
   fs.renameSync(tmp, absPath);
 }
 
+/**
+ * 修复 D3：白名单产物的双阶段提交。
+ *
+ * 阶段 1「准备」：全部内容写进同目录 tmp 文件（此时工作区里没有任何产物被改动）；
+ * 阶段 2「备份」：读走每个目标文件的原始内容（含"原本不存在"的事实）；
+ * 阶段 3「提交」：逐个 renameSync；任一 rename 抛错 ⇒ 还原所有已提交文件、删净 tmp。
+ *
+ * 之所以必须先备份再 rename：rename 是逐文件的，一旦第 2 个目标失败，第 1 个已经
+ * 落在磁盘上；没有备份就只能把工作区留在"一半新一半旧"的状态。
+ * 返回 {ok, digests, error, rolled_back}；digests 只在 ok 时可用。
+ */
+function qdCommitArtifacts(selfDir, pending) {
+  const tmps = [];
+  const backups = [];
+  const committed = [];
+  try {
+    for (const item of pending) {
+      assertWithin(selfDir, item.abs, `产物 ${item.rel}`);
+      const dir = path.dirname(item.abs);
+      if (dir && !fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+        assertWithin(selfDir, dir, `产物目录 ${item.rel}`);
+      }
+      const tmp = `${item.abs}.tmp-${crypto.randomBytes(4).toString('hex')}`;
+      fs.writeFileSync(tmp, item.toWrite, 'utf8');
+      tmps.push(tmp);
+    }
+    for (const item of pending) {
+      const prev = fs.existsSync(item.abs) ? fs.readFileSync(item.abs) : null;
+      backups.push({ abs: item.abs, prev });
+    }
+    for (let i = 0; i < pending.length; i += 1) {
+      fs.renameSync(tmps[i], pending[i].abs);
+      committed.push(pending[i].abs);
+    }
+    const digests = {};
+    for (const item of pending) digests[item.rel] = qdSha256File(item.abs);
+    return { ok: true, digests, error: '', rolled_back: false };
+  } catch (err) {
+    let rollbackErr = '';
+    for (const b of backups) {
+      if (!committed.includes(b.abs)) continue;
+      try {
+        if (b.prev === null) fs.rmSync(b.abs, { force: true });
+        else fs.writeFileSync(b.abs, b.prev);
+      } catch (e2) {
+        rollbackErr += ` ${b.abs}: ${e2 && e2.message}`;
+      }
+    }
+    for (const t of tmps) {
+      try { fs.rmSync(t, { force: true }); } catch (_) { /* 清 tmp 失败不影响回滚结论 */ }
+    }
+    const base = err && err.message ? err.message : String(err);
+    return {
+      ok: false,
+      digests: {},
+      error: rollbackErr ? `${base} [回滚异常:${rollbackErr}]` : base,
+      rolled_back: !rollbackErr,
+    };
+  }
+}
+
+/** 请求指纹：同一 dispatch_id 只有在「请求内容完全一致」时才允许复用旧产出。 */
+function qdRequestFingerprint(request) {
+  const canon = {
+    stage: String(request.stage || ''),
+    role: String(request.role || ''),
+    scope: String(request.scope || ''),
+    prompt_file: String(request.prompt_file || ''),
+    instruction: String(request.instruction || ''),
+    input_path: String(request.input_path || ''),
+    artifacts: (Array.isArray(request.artifacts) ? request.artifacts : [])
+      .map((a) => String(a).replace(/\\/g, '/')).sort(),
+    context: request.context === undefined ? null : request.context,
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(canon)).digest('hex');
+}
+
 // ---- 批次选择（任务20，C12.2） ------------------------------------------
 // 解析待派发请求时必须「批次索引优先、语义计划兼容、绝不扫描全部历史 pending」。
 // 一切异常一律以带 code 的显式错误返回（由 execute 包装为 success:false），
@@ -371,16 +449,36 @@ function qdReceiptOk(selfDir, dispatchId) {
   return !!(ev && String(ev.status || '') === 'ok');
 }
 
+/**
+ * 修复 D4（A15 未闭合）：同一个 dispatch_id 的旧产出能否复用。
+ *
+ * 旧实现只遍历 existing.output_digests 的键比对当前文件摘要，于是三种情况都会被
+ * 误判为"可复用"：①本次白名单新增了产物（新键没有旧摘要，循环压根不看它）；
+ * ②换了 run（跨轮复用上一轮的结果）；③改了 instruction/prompt 但 id 没变。
+ * 现在四个条件全部满足才复用：同 status=done、同 run_id、同请求指纹、
+ * 本次白名单是旧摘要键的**子集**且摘要逐一同值。
+ * 用户拍板：严格口径，无宽限——缺指纹（历史 claim）一律视为不可复用。
+ */
 function qdClaimIsReusable(selfDir, request, existing) {
   if (!existing || String(existing.status || '') !== 'done') return false;
   const dispatchId = String(request.dispatch_id || '');
   if (!qdReceiptOk(selfDir, dispatchId)) return false;
+  if (!(dispatchId && !qdFirstInvalidArtifact(selfDir, request))) return false;
+  if (String(existing.run_id || '') !== String(request.run_id || '')) return false;
+  const fingerprint = String(existing.request_fingerprint || '');
+  if (!fingerprint || fingerprint !== qdRequestFingerprint(request)) return false;
   const expected = (existing.output_digests && typeof existing.output_digests === 'object')
     ? existing.output_digests : {};
-  const actual = qdCurrentDigests(selfDir, request);
   const keys = Object.keys(expected);
   if (keys.length === 0) return false;
-  for (const k of keys) {
+  const arts = (Array.isArray(request.artifacts) ? request.artifacts : [])
+    .filter((a) => typeof a === 'string' && a);
+  if (arts.length === 0) return false;
+  for (const rel of arts) {
+    if (!Object.prototype.hasOwnProperty.call(expected, rel)) return false;
+  }
+  const actual = qdCurrentDigests(selfDir, request);
+  for (const k of Object.keys(expected)) {
     if (String(actual[k] || '') !== String(expected[k] || '')) return false;
   }
   return true;
@@ -407,6 +505,7 @@ function qdAcquireClaim(selfDir, request) {
       batch_id: String(request.batch_id || ''),
       run_id: String(request.run_id || ''),
       status,
+      request_fingerprint: qdRequestFingerprint(request),
       host: os.hostname(),
       pid: process.pid,
       claimed_at: new Date().toISOString(),
@@ -430,6 +529,7 @@ function qdAcquireClaim(selfDir, request) {
         status: 'active', host: os.hostname(), pid: process.pid,
         claimed_at: new Date().toISOString(), heartbeat_at: new Date().toISOString(),
         attempt: Number(request.attempt || 0), receipt_rel: '', output_digests: {},
+        request_fingerprint: qdRequestFingerprint(request),
       }, null, 2)}\n`);
     } finally {
       fs.closeSync(fd);
@@ -1613,6 +1713,11 @@ export function apply(ctx, config = {}) {
               return undefined;
             };
 
+            // 修复 D3：双阶段提交。旧实现逐个 qdAtomicWrite，后一个产物失败只 break，
+            // 前面的产物已经落到工作区（部分写脏），而证据台账只记 artifacts_written、
+            // output_digests 为空——磁盘与台账互相矛盾。现在：全部内容先落 tmp →
+            // 备份原文件 → 逐个 rename；任一环节失败全量回滚，工作区回到调用前状态。
+            const pending = [];
             for (const rel of artifacts) {
               const content = findContent(rel);
               if (content === undefined) continue;
@@ -1624,39 +1729,47 @@ export function apply(ctx, config = {}) {
                 feedback = error;
                 break;
               }
-              try {
-                let toWrite = '';
-                if (typeof content === 'string') {
-                  if (rel.toLowerCase().endsWith('.json')) {
+              let toWrite = '';
+              if (typeof content === 'string') {
+                if (rel.toLowerCase().endsWith('.json')) {
+                  try {
+                    // 验证是否已为标准 JSON
+                    toWrite = JSON.stringify(JSON.parse(content), null, 2);
+                  } catch (_) {
                     try {
-                      // 验证是否已为标准 JSON
-                      toWrite = JSON.stringify(JSON.parse(content), null, 2);
+                      // 尝试修复未转义反斜杠（如 LaTeX 宏）
+                      const sanitized = content.replace(/\\([^"\\/bfnrtu])/g, '\\\\$1');
+                      toWrite = JSON.stringify(JSON.parse(sanitized), null, 2);
                     } catch (_) {
-                      try {
-                        // 尝试修复未转义反斜杠（如 LaTeX 宏）
-                        const sanitized = content.replace(/\\([^"\\/bfnrtu])/g, '\\\\$1');
-                        toWrite = JSON.stringify(JSON.parse(sanitized), null, 2);
-                      } catch (_) {
-                        toWrite = content;
-                      }
+                      toWrite = content;
                     }
-                  } else {
-                    toWrite = content;
                   }
                 } else {
-                  toWrite = JSON.stringify(content, null, 2);
+                  toWrite = content;
                 }
-                assertWithin(selfDir, abs, `产物 ${rel}`);
-                qdAtomicWrite(abs, toWrite);
-                written.push(rel);
-                allWritten.push(rel);
-                outputChars += typeof toWrite === 'string' ? toWrite.length : 0;
-                outputDigests[rel] = qdSha256File(abs);
-              } catch (err) {
+              } else {
+                toWrite = JSON.stringify(content, null, 2);
+              }
+              outputChars += typeof toWrite === 'string' ? toWrite.length : 0;
+              pending.push({ rel, abs, toWrite });
+            }
+            if (status === 'ok' && pending.length > 0) {
+              const commit = qdCommitArtifacts(selfDir, pending);
+              if (commit.ok) {
+                for (const item of pending) {
+                  written.push(item.rel);
+                  allWritten.push(item.rel);
+                  outputDigests[item.rel] = commit.digests[item.rel];
+                }
+              } else {
                 status = 'worker_error';
                 errorClass = 'unknown';
-                error = `写入 ${rel} 失败: ${err && err.message ? err.message : String(err)}`;
-                break;
+                error = `产物提交失败（${commit.rolled_back ? '已全量回滚，工作区未改变' : '回滚不完整'}）: ${commit.error}`;
+                appendDebugRecord(selfDir, {
+                  event: 'artifact_commit_failed', dispatch_id: dispatchId, attempt,
+                  rolled_back: commit.rolled_back, error: commit.error,
+                  artifacts: pending.map((p) => p.rel),
+                });
               }
             }
             if (status === 'ok') {
@@ -1679,6 +1792,29 @@ export function apply(ctx, config = {}) {
                 // 产物与原文件内容一致，属于合法产出，不判为错误
                 status = 'ok';
                 error = '';
+              }
+            }
+            // 修复 N5：输出被截断时，不完整内容已在解析层丢弃；这里把截断事实
+            // 升级为「补齐轮」（narrowMissing），而不是静默当作成功或笼统报缺失。
+            if (parsed.truncated) {
+              const listed = Array.isArray(parsed.truncatedFiles) ? parsed.truncatedFiles : [];
+              const affected = listed.length ? listed
+                : artifacts.filter((rel) => !allWritten.includes(rel));
+              const note = `OUTPUT_TRUNCATED: ${affected.join(', ')}`
+                + '（输出在产物中途截断，不完整内容已丢弃，未写入工作区）';
+              appendDebugRecord(selfDir, {
+                event: 'output_truncated', dispatch_id: dispatchId, attempt,
+                truncated_files: affected, source: listed.length ? 'structure' : 'host_hint',
+              });
+              if (status === 'missing_artifacts' || status === 'content_error') {
+                error = `${error}；${note}`;
+                feedback = feedback ? `${feedback}；${note}` : note;
+              } else if (status === 'ok') {
+                status = 'missing_artifacts';
+                errorClass = 'content';
+                error = note;
+                feedback = `上一轮输出被截断，请只补交以下产物（其余已完成）：${affected.join(', ')}`;
+                narrowMissing = affected.slice();
               }
             }
           }
@@ -1958,6 +2094,7 @@ export function apply(ctx, config = {}) {
         qdFinishClaim(selfDir, dispatchId, okDone ? 'done' : 'failed', {
           receipt_rel: (result && result.evidence) || '',
           output_digests: qdCurrentDigests(selfDir, request),
+          request_fingerprint: qdRequestFingerprint(request),
           error: (result && result.error) || '',
         });
         return result;
