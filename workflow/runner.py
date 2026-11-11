@@ -127,7 +127,10 @@ def resume_target(db_path: Optional[str] = None,
             values, values.get("intent_contract"))
         execution_policy.assert_profile_not_overriding(policy, requested_profile)
         self_dir = values.get("self_dir")
-        if self_dir:
+        # F1：Phase 0 尚未确认时（contract_pending），本次确认的 spec 才是权威，
+        # config.yaml 里还是上一轮的旧值——此刻拿 YAML 去比对会把「Phase 0 确认
+        # 自己」判成漂移，形成和原来一样的死锁。契约落盘后才开始比对。
+        if self_dir and not policy.get("contract_pending"):
             execution_policy.assert_config_not_overriding(self_dir, policy)
     except execution_policy.ExecutionPolicyError as exc:
         raise SystemExit(
@@ -212,6 +215,16 @@ def run_pipeline(
         "run_scope": run_scope,
         "target_sections": normalize_targets(spec.get("target_sections")),
         "target_qids": normalize_targets(spec.get("target_qids")),
+        # F1：执行契约**必须在第一次 invoke 就进 checkpoint**。旧实现只把
+        # profile/graph 写在 history 里，冻结只发生在 Phase 0 确认返回中，
+        # 而 Phase 0 恰在 resume 之前——于是 resume 时检查点没有任何执行字段，
+        # 被解释成 legacy：编译 legacy 图，且显式重申 faithful_fast 又被
+        # 「不得覆盖已冻结的 legacy」拒绝，形成死锁。
+        "execution_schema_version": exec_policy["execution_schema_version"],
+        "execution_profile": exec_policy["execution_profile"],
+        "graph_version": exec_policy["graph_version"],
+        "policy_digest": exec_policy["policy_digest"],
+        "execution_config": dict(exec_policy["execution_config"]),
         "history": [
             f"Runner: 启动题链流水线 (工作区强制锁定于: {self_dir})...",
             "Runner: 执行策略 profile=%s / graph=%s（Phase 0 确认后冻结，旧会话不受影响）"

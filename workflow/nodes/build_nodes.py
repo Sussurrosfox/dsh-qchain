@@ -169,13 +169,24 @@ def _routed_failure(gate_patch: Dict[str, Any], history: List[str], gate: str,
     }
 
 
-def _require_classroom_plan(self_dir: str) -> bool:
+def _require_classroom_plan(self_dir: str,
+                            execution_config: Optional[Dict[str, Any]] = None) -> bool:
     """卡 11：课堂计划是否必需（教案是可选交付物）。
 
+    F3（冻结优先）：checkpoint 里的 ``execution_config`` 是 Phase 0 冻结值，
+    优先级高于当前 config.yaml——否则把 YAML 改一行就能让已开始的会话不再
+    要求课堂计划。旧检查点（无冻结块）仍按 YAML/legacy 默认判定。
     缺 execution_profile 的旧项目 → legacy 默认（要求教案）；faithful_fast 默认
     不要求，此时既不预生成也不因缺教案阻断，来源/数学门禁照旧。
     """
     from .. import execution_policy as ep
+    frozen = execution_config if isinstance(execution_config, dict) else {}
+    if frozen.get("require_classroom_plan") is not None:
+        try:
+            return ep.normalize_bool(frozen["require_classroom_plan"],
+                                     "require_classroom_plan")
+        except Exception:
+            return True
     try:
         values = ep.read_execution_overrides(os.path.join(self_dir, "config.yaml")) or {}
     except Exception:
@@ -192,7 +203,8 @@ def _require_classroom_plan(self_dir: str) -> bool:
     return bool(defaults.get("require_classroom_plan", True))
 
 
-def _pregenerate_classroom_plan(self_dir: str, history: List[str]
+def _pregenerate_classroom_plan(self_dir: str, history: List[str],
+                                execution_config: Optional[Dict[str, Any]] = None
                                 ) -> Optional[Dict[str, Any]]:
     """卡 07（ART-01）：delivery 预算检查之前先确定性生成课堂计划。
 
@@ -202,7 +214,7 @@ def _pregenerate_classroom_plan(self_dir: str, history: List[str]
 
     卡 11：require_classroom_plan=false 时教案非必需——不生成、不检查、不阻断。
     """
-    if not _require_classroom_plan(self_dir):
+    if not _require_classroom_plan(self_dir, execution_config):
         history.append("T3: require_classroom_plan=false，课堂计划为可选交付物，"
                        "不预生成也不检查")
         return None
@@ -345,7 +357,8 @@ def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
     # → semantic → provenance → budget；XeLaTeX 编译与版本比对仍在后续
     # 节点走子进程（进程不内联编译器）。
     # 卡 07：delivery 预算检查需要课堂计划，先确定性生成再检查（不是检查失败后补救）。
-    gen_halt = _pregenerate_classroom_plan(self_dir, history)
+    gen_halt = _pregenerate_classroom_plan(
+        self_dir, history, state.get("execution_config"))
     if gen_halt is not None:
         return gen_halt
 

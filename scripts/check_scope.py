@@ -43,9 +43,14 @@ if hasattr(sys.stderr, "reconfigure"):
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+PLUGIN_ROOT = os.path.dirname(HERE)
+if PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, PLUGIN_ROOT)
 
 import evidence  # noqa: E402（scripts/ 已在 sys.path）
 import section_scan  # noqa: E402
+import frozen_policy  # noqa: E402（F3：冻结合同优先）
+from workflow import execution_policy as ep  # noqa: E402
 
 TOOL_NAME = "check_scope.py"
 TOOL_VERSION = "1.0"
@@ -216,6 +221,27 @@ def check_scope_project(workdir):
             "code": "SCOPE_POLICY_DRIFT",
             "detail": "config.yaml content_policy=%s 与冻结合同 %s 不一致"
                       % (cfg_policy, contract_policy)})
+
+    # ---- 5b. 执行策略漂移（F3）----
+    # 执行契约与内容契约同在 Phase 0 冻结。旧实现只比对 content_policy，
+    # 于是把 config.yaml 的 pedagogy_policy/budget_policy 改成 advisory、
+    # require_classroom_plan 改成 false、repair_max_* 改大，都不报警——
+    # 已冻结的严格策略被当前 YAML 悄悄放宽。这里逐键比对，漂移即阻断。
+    try:
+        declared_exec = ep.read_execution_overrides(
+            os.path.join(self_dir, CONFIG_REL))
+    except Exception:
+        declared_exec = {}
+    frozen_exec = frozen_policy.frozen_execution_config(self_dir)
+    if frozen_exec is not None:
+        for entry in frozen_policy.policy_drift(self_dir, declared_exec):
+            errors.append({
+                "code": "SCOPE_EXECUTION_POLICY_DRIFT",
+                "detail": "config.yaml 的 %s=%r 与冻结合同 %r 不一致"
+                          "（执行策略在 Phase 0 已冻结，改 YAML 不生效；"
+                          "须新 thread 或显式重新确认）"
+                          % (entry.get("key"), entry.get("config"),
+                             entry.get("frozen"))})
 
     # ---- 6. 范围变更请求必须停在人工确认点 ----
     scope_change = _load_json(os.path.join(self_dir, SCOPE_CHANGE_REL))

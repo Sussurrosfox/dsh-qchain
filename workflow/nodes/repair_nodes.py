@@ -100,6 +100,19 @@ def node_repair_await(state: ShrinkCoursewareState) -> Dict[str, Any]:
     直接返回 HALTED，不在同一 prompt 上重试；也不动任何返修计数——
     成功派发不清零 retry_count / repair_*，门禁 PASS 才解除未解决标记。
     """
+    # F2（defense in depth）：上游 repair_section 熔断时 state 已是 HALTED，
+    # 这里绝不能把 stage 改写成 T2_SECTIONS_STAGED/PROCEED——那会把"预算耗尽"
+    # 变成"返修成功"，让流水线带着未修的问题继续往交付走。原样传回 HALT。
+    if state.get("stage") == "HALTED" or state.get("routing_action") == "HALT":
+        history = list(state.get("history", []))
+        history.append("Repair: 上游已熔断（stage=HALTED），repair_await 不再改写状态")
+        return {
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "error_message": state.get("error_message") or "返修回路已熔断",
+            "repair_halt": state.get("repair_halt"),
+            "history": history,
+        }
     req = state.get("pending_dispatch")
     expected_sections = state.get("expected_sections") or []
     target_sec = state.get("repair_target") or state.get("active_section") or "sec1"

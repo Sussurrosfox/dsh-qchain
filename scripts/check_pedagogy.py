@@ -39,6 +39,7 @@ if PLUGIN_ROOT not in sys.path:
 
 import evidence  # noqa: E402
 import check_numbering  # noqa: E402
+import frozen_policy  # noqa: E402（F3：冻结契约优先于当前 config.yaml）
 # 卡 11：教学偏好是**可选策略**——策略字段与解析器全部复用 C1 的
 # workflow/execution_policy.py（卡 10 落地），本脚本不另造开关。
 from workflow import execution_policy as ep  # noqa: E402
@@ -114,9 +115,34 @@ def resolve_policy(values=None):
 
 
 def load_policy(project_dir):
-    """从项目 config.yaml 读取执行策略（缺文件=旧项目 → legacy）。"""
+    """读取执行策略：**冻结契约优先**，其次当前 config.yaml（F3）。
+
+    旧实现在这里直接读 config.yaml，于是 Phase 0 冻结成 strict 之后，把 YAML
+    改一行 advisory 就能让已开始的会话按 advisory 放行——冻结形同虚设。
+    现在：.pd/intent-contract.json 里有执行契约就用它的 execution_config
+    （并把每个键的来源标成 frozen），没有冻结契约（旧工程 / Phase 0 之前）
+    才回落 config.yaml。
+    """
     cfg_path = os.path.join(project_dir, "config.yaml")
-    return resolve_policy(ep.read_execution_overrides(cfg_path))
+    declared = ep.read_execution_overrides(cfg_path)
+    frozen = frozen_policy.frozen_execution_config(project_dir)
+    if not frozen:
+        policy = resolve_policy(declared)
+        policy["source"] = "config"
+        return policy
+    merged = dict(declared)
+    for key in ep.EXECUTION_KEYS:
+        if key in frozen:
+            merged[key] = frozen[key]
+    policy = resolve_policy(merged)
+    for key in ep.EXECUTION_KEYS:
+        if key in frozen:
+            policy["sources"][key] = "frozen"
+    policy["source"] = "frozen"
+    drift = frozen_policy.policy_drift(project_dir, declared)
+    if drift:
+        policy["drift"] = drift
+    return policy
 
 
 def check_pedagogy_slice(name, text, problems, warnings, policy=None):
@@ -455,6 +481,14 @@ def main(argv=None):
     files, problems, warnings, stats = scan_project_pedagogy(workdir, policy=policy)
     report["scope"]["files"] = files
     report["evidence"]["pedagogy_stats"] = stats
+
+    # F3：当前 config.yaml 与冻结合同漂移——判定已按冻结值执行，但漂移本身要
+    # 报出来（改 YAML 不生效这件事必须可见，不能靠人猜）。
+    for entry in (policy.get("drift") or []):
+        warnings.append(
+            "执行策略漂移：config.yaml 的 %s=%r 与冻结合同 %r 不一致——"
+            "本次仍按冻结值判定（改策略须新 thread 或显式重新确认）"
+            % (entry.get("key"), entry.get("config"), entry.get("frozen")))
 
     for p in problems:
         report["issues"].append({"severity": "error", "message": p})

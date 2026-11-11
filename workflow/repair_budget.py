@@ -108,17 +108,57 @@ def issue_fingerprint(scope: str, issues: Optional[List[Dict[str, Any]]] = None,
 
 
 def resolve_limits(state: Dict[str, Any]) -> Tuple[int, Optional[int], str]:
-    """(per_scope_limit, total_limit|None, profile)；显式 state 覆盖 > profile > legacy。"""
+    """(per_scope_limit, total_limit|None, profile)。
+
+    F4（冻结优先）：Phase 0 把 ``repair_max_per_scope`` / ``repair_max_total``
+    冻结进 ``state["execution_config"]``，但旧实现只读 profile 默认值与顶层
+    ``repair_per_scope_limit``/``repair_total_limit``——冻结的 1/1 被读成 2/6，
+    预算上限形同虚设。现在的优先级：
+      冻结 execution_config > 显式 state 覆盖 > profile 默认。
+    """
     profile = "fast" if state.get("execution_profile") == FAST_PROFILE else "legacy"
     per_scope = FAST_PER_SCOPE_LIMIT if profile == "fast" else LEGACY_PER_SCOPE_LIMIT
     total: Optional[int] = FAST_TOTAL_LIMIT if profile == "fast" else LEGACY_TOTAL_LIMIT
+    frozen = state.get("execution_config")
+    frozen = frozen if isinstance(frozen, dict) else {}
+
+    def _limit(key: str) -> Optional[int]:
+        value = frozen.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
+
+    frozen_scope = _limit("repair_max_per_scope")
+    frozen_total = _limit("repair_max_total")
+    if frozen_scope is not None:
+        per_scope = frozen_scope
+    if frozen_total is not None:
+        total = frozen_total
+    # 顶层显式覆盖只在没有冻结值时才生效（旧检查点 / 无执行契约的工程）
     ov_scope = state.get("repair_per_scope_limit")
-    if isinstance(ov_scope, int) and not isinstance(ov_scope, bool) and ov_scope >= 0:
+    if frozen_scope is None and isinstance(ov_scope, int) \
+            and not isinstance(ov_scope, bool) and ov_scope >= 0:
         per_scope = ov_scope
     ov_total = state.get("repair_total_limit")
-    if isinstance(ov_total, int) and not isinstance(ov_total, bool) and ov_total >= 0:
+    if frozen_total is None and isinstance(ov_total, int) \
+            and not isinstance(ov_total, bool) and ov_total >= 0:
         total = ov_total
     return per_scope, total, profile
+
+
+def limits_source(state: Dict[str, Any]) -> str:
+    """返修上限的生效来源：frozen / state / profile（排障用，进 HALT 证据）。"""
+    frozen = state.get("execution_config")
+    frozen = frozen if isinstance(frozen, dict) else {}
+    for key in ("repair_max_per_scope", "repair_max_total"):
+        value = frozen.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return "frozen"
+    for key in ("repair_per_scope_limit", "repair_total_limit"):
+        value = state.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return "state"
+    return "profile"
 
 
 def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Optional[str],
@@ -147,6 +187,7 @@ def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Op
     halt_ctx = {
         "scope": scope,
         "profile": profile,
+        "limits_source": limits_source(state),
         "scope_attempts": scope_attempts,
         "total_attempts": total,
         "per_scope_limit": per_scope,

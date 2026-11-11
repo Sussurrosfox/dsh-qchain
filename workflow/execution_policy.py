@@ -429,6 +429,19 @@ def resolve_resume(values: Optional[Mapping[str, Any]],
             "legacy": True,
             "frozen": None,
         }
+    if state_frozen is not None and contract_frozen is None:
+        # F1：Phase 0 还没确认——新建的 run 已经把执行契约写进 checkpoint
+        # （runner.init_state），但 intent-contract.json 要等 Phase 0 确认才落盘。
+        # 这个窗口里 checkpoint 才是唯一已冻结的真源，绝不能因"契约一方缺失"
+        # 就把会话判成 legacy（那会让 resume 编译 legacy 图，与首次运行实际
+        # 使用的图不一致）。
+        return {
+            "execution_profile": state_frozen["execution_profile"],
+            "graph_version": state_frozen["graph_version"],
+            "legacy": False,
+            "frozen": state_frozen,
+            "contract_pending": True,
+        }
     if state_frozen is None or contract_frozen is None:
         raise ExecutionPolicyError(
             "EXECUTION_CONTRACT_CONFLICT",
@@ -437,6 +450,15 @@ def resolve_resume(values: Optional[Mapping[str, Any]],
             % ("有" if state_frozen else "缺", "有" if contract_frozen else "缺"))
     for field in FROZEN_FIELDS:
         if field == "execution_config":
+            # F3：旧实现直接 continue，冻结的有效执行配置（策略/预算/批次上限）
+            # 与契约不一致时无人发现。逐键比对，任何漂移都显式拒绝。
+            if resolve_execution_config(state_frozen.get(field) or {}) != \
+                    resolve_execution_config(contract_frozen.get(field) or {}):
+                raise ExecutionPolicyError(
+                    "EXECUTION_CONTRACT_CONFLICT",
+                    "检查点与 intent-contract 的执行配置冲突："
+                    "checkpoint=%r contract=%r"
+                    % (state_frozen.get(field), contract_frozen.get(field)))
             continue
         if state_frozen.get(field) != contract_frozen.get(field):
             raise ExecutionPolicyError(
@@ -457,21 +479,46 @@ def assert_config_not_overriding(self_dir: Optional[str], policy: Mapping[str, A
 
     legacy 会话同样是「已冻结策略」：config.yaml 突然写 faithful_fast 必须显式
     重新确认（新 thread），否则旧会话会被当前 YAML 静默换图。
+
+    F3：不只比 execution_profile——``pedagogy_policy`` / ``budget_policy`` /
+    ``require_classroom_plan`` / ``repair_max_*`` 这些同样在 Phase 0 冻结，
+    改 YAML 让已开始的会话被放宽（strict→advisory、必需教案→可选）同样属于
+    「静默改写已确认策略」，必须显式拒绝。
     """
     if not self_dir:
         return
     frozen_profile = resolve_profile((policy or {}).get("execution_profile"))
     declared = read_execution_overrides(os.path.join(self_dir, "config.yaml"))
     profile = declared.get("execution_profile")
-    if profile is None:
+    if profile is not None:
+        declared_profile = coerce_enum(profile, "execution_profile", EXECUTION_PROFILES)
+        if declared_profile != frozen_profile:
+            raise ExecutionPolicyError(
+                "EXECUTION_PROFILE_OVERRIDE_REJECTED",
+                "config.yaml 的 execution_profile=“%s” 不能覆盖已冻结的 “%s”；"
+                "改冻结策略必须新 thread 或显式重新确认"
+                % (declared_profile, frozen_profile))
+    frozen_config = resolve_execution_config(
+        (policy or {}).get("frozen", {}).get("execution_config")
+        if isinstance((policy or {}).get("frozen"), Mapping) else {})
+    if not any(key in declared for key in EXECUTION_KEYS):
         return
-    declared_profile = coerce_enum(profile, "execution_profile", EXECUTION_PROFILES)
-    if declared_profile != frozen_profile:
+    merged = dict(frozen_config)
+    for key in EXECUTION_KEYS:
+        if key in declared and declared[key] is not None:
+            merged[key] = declared[key]
+    drift = {
+        key: (frozen_config.get(key), corrected)
+        for key, corrected in resolve_execution_config(merged).items()
+        if frozen_config.get(key) != corrected
+    } if frozen_config else {}
+    if drift:
         raise ExecutionPolicyError(
-            "EXECUTION_PROFILE_OVERRIDE_REJECTED",
-            "config.yaml 的 execution_profile=“%s” 不能覆盖已冻结的 “%s”；"
-            "改冻结策略必须新 thread 或显式重新确认"
-            % (declared_profile, frozen_profile))
+            "EXECUTION_CONFIG_OVERRIDE_REJECTED",
+            "config.yaml 的执行策略不能覆盖已冻结值: %s；"
+            "改策略必须新 thread 或显式重新确认"
+            % ", ".join("%s 冻结=%r 当前=%r" % (k, v[0], v[1])
+                        for k, v in sorted(drift.items())))
 
 
 def assert_profile_not_overriding(policy: Mapping[str, Any],

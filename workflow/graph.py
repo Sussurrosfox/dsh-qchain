@@ -698,7 +698,15 @@ def create_fast_graph(checkpointer: Optional[Any] = None) -> Any:
         })
     workflow.add_edge("t4_promote_and_deliver", END)
 
-    workflow.add_edge("repair_section", "repair_await")
+    # F2：repair_section 可能直接熔断（预算耗尽/无进展）并返回
+    # stage=HALTED/routing_action=HALT。旧实现这里是一条**无条件边**
+    # repair_section → repair_await，于是 repair_await 在 pending_dispatch
+    # 为空时把 stage 改写回 T2_SECTIONS_STAGED/PROCEED，熔断被抹掉、返修
+    # 被当成成功继续提交。改为与 legacy 一致的条件边：HALTED 直接 END。
+    workflow.add_conditional_edges("repair_section", route_after_repair_dispatch, {
+        "repair_await": "repair_await",
+        END: END,
+    })
     workflow.add_conditional_edges("repair_await", route_after_repair_await, {
         "t3_checks": "t3_checks",
         "t2_submit_and_check_sections": "t2_submit_and_check_sections",
