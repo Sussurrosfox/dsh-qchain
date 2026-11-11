@@ -1736,7 +1736,9 @@ def _verify_requests_from_disk(
 
     校验口径与 agent_nodes.run_dispatch 完全一致（q_audit.md 证据链治理）：
         - 任一产物缺失（sha256 为 None）→ missing_artifacts 失败；
-        - 全部产物均未变化 → no_change 失败；
+        - 全部产物均未变化 → no_change 失败；**A16 例外**：证据台账认证过
+          这次派发（子 Agent 跑了、写了盘、内容逐字节相同）时按 ok 收，
+          并在 ``entry.no_change_attested_scopes`` 里点名；
         - 部分产物已变化 → 查 .pd/agent-calls/<dispatch_id>.json：
             * 证据吻合 → ok（entries.verified_via="agent"）；
             * 无证据 → ok_unattested：allow_unattested=True 时放行并打
@@ -1776,6 +1778,7 @@ def _verify_requests_from_disk(
         digest_by_artifact: Dict[str, Optional[str]] = {}
         entry_error: Optional[str] = None
         unattested_any = False
+        no_change_scopes: List[str] = []
         for sec in scopes:
             sec_artifacts = scope_mod.artifacts_of_scope(req, sec) or [
                 rel for rel in artifacts
@@ -1795,6 +1798,17 @@ def _verify_requests_from_disk(
             sec_req["before"] = {rel: before.get(rel) for rel in sec_artifacts}
             status, _evidence = agent_evidence.check_request_attested(
                 self_dir, sec_req, sec_after, allow_unattested=allow_unattested)
+            # A16：全部产物未变化时先问「这次派发是否被证据台账认证过」。
+            # replan 类阶段逐字重写同一份文件是正确结果，认证过就按 ok 收，
+            # 不再判 no_change → HALTED（resume 从 HALTED 是 no-op）。
+            no_change_attested = False
+            if status == "no_change":
+                attested, _nc_ev = agent_evidence.no_change_is_attested(
+                    self_dir, sec_req, sec_after)
+                if attested:
+                    no_change_attested = True
+                    status = "ok"
+                    no_change_scopes.append(sec)
             scope_statuses[sec] = status
             if status == "ok":
                 ok_scopes.append(sec)
@@ -1848,6 +1862,10 @@ def _verify_requests_from_disk(
         if unattested_any and not entry_error:
             # 逃生阀放行：保留 unattested 标记，交付门禁 check_agent_audit 终裁
             entry["unattested"] = True
+        if no_change_scopes:
+            # A16：这些节的「无变化」是经证据台账认证的合法空转（子 Agent
+            # 跑了、写了盘、内容逐字节相同），不是主线程留存的陈旧产物。
+            entry["no_change_attested_scopes"] = no_change_scopes
         entries[dispatch_id] = entry
     return ok_scopes, failures, entries
 

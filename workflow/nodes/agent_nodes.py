@@ -372,13 +372,41 @@ def run_dispatch(
     # 无变更空转校验全模式生效（B2）：worker 与 interrupt 两种派发路径统一执行。
     # interrupt 模式是生产唯一真实路径，旧产物不得被静默接受；
     # 全部 artifacts 未变更即判失败，部分变更仍放行。
+    #
+    # A16 例外：子 Agent 确实跑了、也写了盘，只是写出来的内容和原来逐字节相同
+    # （dependency replan 逐字重写同一份 dependency-map.md 就是这种）。此时
+    # 「无变化」是本次派发的真实结果而不是空转，按证据台账认证后放行——否则
+    # 会被判 no_change → HALTED，而 resume 从 HALTED 是 no-op，只能删 checkpoint。
     if unchanged and len(unchanged) == len(artifacts):
-        detail = f"派发 {dispatch_id} 的产物未发生变化: {', '.join(unchanged)}"
-        results[dispatch_id] = {
-            "status": "no_change", "unchanged": unchanged, "dispatched_via": dispatched_via
+        attested, evidence = agent_evidence.no_change_is_attested(root, request, after)
+        if not attested:
+            detail = f"派发 {dispatch_id} 的产物未发生变化: {', '.join(unchanged)}"
+            results[dispatch_id] = {
+                "status": "no_change", "unchanged": unchanged, "dispatched_via": dispatched_via
+            }
+            history.append(f"Agent[{request['stage']}]: {detail}")
+            return _dispatch_failure(state, results, history, success_stage, detail)
+        worker = str((evidence or {}).get("worker") or "").strip() or "unknown"
+        history.append(
+            f"Agent[{request['stage']}]: 产物无变化，但已由 {worker} 认证"
+            f"（{', '.join(unchanged)} 逐字节重写，replan 类合法空转）"
+        )
+        entry_no_change: Dict[str, Any] = {
+            "status": "success",
+            "produced": [rel for rel in artifacts if after[rel] is not None],
+            "dispatched_via": dispatched_via,
+            "no_change": True,
+            "no_change_attested_by": worker,
+            "unchanged": list(unchanged),
         }
-        history.append(f"Agent[{request['stage']}]: {detail}")
-        return _dispatch_failure(state, results, history, success_stage, detail)
+        results[dispatch_id] = entry_no_change
+        return {
+            "stage": success_stage,
+            "routing_action": "PROCEED",
+            "dispatch_results": results,
+            "history": history + [success_history],
+            "pending_dispatch": None,
+        }
 
     # 证据链对账（q_audit.md 根因治理）：产物变化必须由
     # .pd/agent-calls/<dispatch_id>.json 的写入者身份背书；无证据 = 主线程

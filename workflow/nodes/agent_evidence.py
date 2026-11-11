@@ -185,6 +185,59 @@ def check_request_attested(self_dir: str, request: Dict[str, Any],
     return "attested_mismatch", evidence
 
 
+def no_change_is_attested(self_dir: str, request: Dict[str, Any],
+                          disk_digests: Dict[str, Optional[str]]
+                          ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """A16：判断「产物全部未变化」是否是一次**已认证的空转**。
+
+    背景（bug.md A16）：``run_dispatch`` 把 ``after == before`` 一律判
+    ``no_change`` → HALTED。可 dependency replan 这类阶段，子 Agent 逐字重写
+    同一份 ``dependency-map.md`` 是**正确结果**（依赖图本来就没变），却会被
+    这道闸门判死；而 resume 从 HALTED 出来是 no-op，只能删 checkpoint 链。
+
+    空转有两种，必须分开：
+
+    1. 真的没人干活——磁盘产物是上一轮留下的陈旧件，本次派发什么都没发生；
+    2. 子 Agent 跑了、也写了盘，只是写出来的内容和原来逐字节相同。
+
+    判别式只能是证据台账：``qchain_dispatch`` 在派发成功时会把
+    ``artifacts_written`` + ``output_digests``（写盘后立即算的 sha256）落进
+    ``.pd/agent-calls/<dispatch_id>.json``。因此当且仅当：
+
+    * 证据在案、``status == "ok"``、``worker`` 非空（半伪造不放行）；
+    * 本次请求的**每一个**产物都出现在 ``artifacts_written`` 或
+      ``output_digests`` 里（覆盖，不是部分）；
+    * 每个产物的证据摘要等于磁盘当前摘要；
+
+    才能说「无变化」是本次派发的真实结果。其余一切（无证据、证据状态非 ok、
+    覆盖不全、摘要不符）都仍然按空转失败处理——安全方向不变。
+    """
+    request = request or {}
+    artifacts = _artifact_list(request)
+    if not artifacts:
+        return False, None
+    if any(disk_digests.get(rel) is None for rel in artifacts):
+        return False, None
+    evidence = load_evidence(self_dir, request.get("dispatch_id"))
+    if not isinstance(evidence, dict):
+        return False, None
+    if str(evidence.get("status") or "") != EVIDENCE_STATUS_OK:
+        return False, None
+    if not str(evidence.get("worker") or "").strip():
+        return False, None
+    digests = evidence.get("output_digests")
+    digests = digests if isinstance(digests, dict) else {}
+    written = evidence.get("artifacts_written")
+    written = [str(a) for a in written] if isinstance(written, list) else []
+    covered = set(written) | {str(k) for k in digests.keys()}
+    if not set(artifacts) <= covered:
+        return False, None
+    for rel in artifacts:
+        if digests.get(rel) != disk_digests.get(rel):
+            return False, None
+    return True, evidence
+
+
 def write_evidence(self_dir: str, *, dispatch_id: str, batch_id: Any = None,
                    worker: str, provider: str = "", model: str = "",
                    started_at: Optional[str] = None, finished_at: Optional[str] = None,

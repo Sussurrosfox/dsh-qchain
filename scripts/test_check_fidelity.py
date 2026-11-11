@@ -453,7 +453,7 @@ class AssetConservationFixture(FidelityFixture):
         stats = res["checked"]["assets"]
         self.assertEqual(stats["source_kept"], {"figure": 2, "table": 1})
         self.assertEqual(stats["output"], {"figure": 2, "table": 1})
-        self.assertEqual(cf.TOOL_VERSION, "1.1")
+        self.assertEqual(cf.TOOL_VERSION, "1.2")
 
     # ---- T17: 源 1 个 tikzcd、产物无 → FAIL 且 code 正确 ----
     def test_t17_tikz_lost_fails(self):

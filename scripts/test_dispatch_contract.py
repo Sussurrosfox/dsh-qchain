@@ -161,7 +161,12 @@ class T04_WriteRequestFile(unittest.TestCase):
 
 
 class T05_RunDispatch(unittest.TestCase):
-    """T5: worker 替身改变产物 → ok；产物无变化 → no_change（沿用既有判定逻辑）。"""
+    """T5: worker 替身改变产物 → ok；产物无变化 → no_change（沿用既有判定逻辑）。
+
+    A16 起细分了两种「无变化」：worker 真的跑了并留下证据台账（replan 逐字
+    重写同一份文件）→ 按认证空转放行；worker 什么都没写 → 仍然是 no_change
+    失败（B2 口径：陈旧产物不得被静默接受）。
+    """
 
     def setUp(self):
         # worker_registry 是进程级单例：用后必须清除，避免污染其他用例
@@ -200,13 +205,24 @@ class T05_RunDispatch(unittest.TestCase):
             res["dispatch_results"][req["dispatch_id"]]["dispatched_via"],
             "worker")
 
-    def test_t05_no_change_fails(self):
-        req, res = self._dispatch({"sec1.tex": "% v1 初始内容\n"})
+    def test_t05_no_change_without_evidence_fails(self):
+        """worker 什么都没写（无证据台账）→ no_change → HALTED。"""
+        req, res = self._dispatch({})
         self.assertEqual(res["stage"], "HALTED")
         self.assertEqual(res["routing_action"], "HALT")
         self.assertEqual(
             res["dispatch_results"][req["dispatch_id"]]["status"], "no_change")
         self.assertIn("未发生变化", res["error_message"])
+
+    def test_t05_no_change_with_evidence_proceeds(self):
+        """A16：worker 逐字重写且留下证据 → 认证空转，放行不判死。"""
+        req, res = self._dispatch({"sec1.tex": "% v1 初始内容\n"})
+        self.assertEqual(res["stage"], "T2_SECTIONS_STAGED")
+        self.assertEqual(res["routing_action"], "PROCEED")
+        entry = res["dispatch_results"][req["dispatch_id"]]
+        self.assertEqual(entry["status"], "success")
+        self.assertTrue(entry["no_change"])
+        self.assertTrue(entry["no_change_attested_by"].startswith("llm-worker:"))
 
 
 class T06_StateFields(unittest.TestCase):

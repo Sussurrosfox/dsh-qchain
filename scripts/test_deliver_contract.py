@@ -138,9 +138,9 @@ class TDryRunValidatesHtml(unittest.TestCase):
                                       return_value="fixture"), \
                     mock.patch.object(deliver.evidence, "card_usages", return_value={}), \
                     mock.patch.object(deliver, "run_check", side_effect=fake_run), \
-                    mock.patch.object(deliver, "run_html_smoke_check",
+                    mock.patch.object(deliver, "run_html_smoke_check_ex",
                                       side_effect=lambda *a, **k: (smoke.append(1) or
-                                                                   (True, "OK"))), \
+                                                                   (True, "OK", False))), \
                     mock.patch.object(deliver, "atomic_release") as rel, \
                     contextlib.redirect_stdout(buf):
                 code = deliver.main()
@@ -179,7 +179,7 @@ class TDryRunValidatesHtml(unittest.TestCase):
                                               "tool_version": "t", "input_digest": "fixture",
                                               "status": "pass", "issues": []})),
                                           mock.Mock(returncode=0, stdout="", stderr=""))[1]), \
-                    mock.patch.object(deliver, "run_html_smoke_check",
+                    mock.patch.object(deliver, "run_html_smoke_check_ex",
                                       side_effect=deliver.HtmlSmokeError("BLOCKED_ENV")), \
                     mock.patch.object(deliver, "atomic_release") as rel, \
                     contextlib.redirect_stdout(buf):

@@ -278,16 +278,28 @@ def write_report(path, report):
 
 # ======================= HTML 可见文本与卡片解析 =======================
 class _VisibleTextParser(HTMLParser):
-    """可见文本抽取：完整标签栈判定隐藏容器（嵌套安全）。"""
+    """可见文本抽取：完整标签栈判定隐藏容器（嵌套安全）。
+
+    ``skip_classes``：A23 防泄露扫描用的「可见但设计上含答案」区域类名
+    （``qc-options`` 选择题选项组、``qc-reveal`` 延迟发放揭示区）。
+    这些区域对学生**本就可见**，把它们的文本算进"泄露"会把设计当成缺陷；
+    跳过它们不影响真泄露检测——答案若出现在题干正文里，仍然会被扫到。
+
+    ``include_hidden``：True 时不再跳过 ``hidden``/``display:none`` 容器
+    （A24 内容身份用，见 html_card_pages）。
+    """
 
     SKIP = {"script", "style", "template", "noscript"}
     VOID = {"br", "img", "hr", "input", "meta", "link", "area", "base",
             "col", "embed", "source", "track", "wbr"}
 
-    def __init__(self):
+    def __init__(self, skip_classes=(), include_hidden=False):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.skip_depth = 0
+        self.skip_classes = tuple(skip_classes or ())
+        self.region_depth = 0
+        self.include_hidden = bool(include_hidden)
         self.stack = []            # [[tag, hidden_flag], ...] 开标签栈
         self.cards = []            # [(card_id, text_parts)]
         self.cur_card = None
@@ -299,7 +311,13 @@ class _VisibleTextParser(HTMLParser):
         style = (d.get("style") or "").replace(" ", "").lower()
         return "display:none" in style
 
+    def _skipped_region(self, attrs):
+        cls = (dict(attrs).get("class") or "").split()
+        return any(c in self.skip_classes for c in cls)
+
     def _in_hidden(self):
+        if self.include_hidden:
+            return False
         return any(h for _t, h in self.stack)
 
     def handle_starttag(self, tag, attrs):
@@ -309,12 +327,14 @@ class _VisibleTextParser(HTMLParser):
         hidden = self._hidden(tag, attrs)
         if tag not in self.VOID:
             self.stack.append([tag, hidden])
+        if self._skipped_region(attrs):
+            self.region_depth += 1
         d = dict(attrs)
         if tag == "section" and "qc-card" in (d.get("class") or ""):
             self.cur_card = d.get("id") or ""
             self.cards.append((self.cur_card, []))
 
-    def handle_startendtag(self, tag, attrs):
+    def handle_startendtag(self, handle):
         pass  # 自闭合标签无文本、不入栈
 
     def handle_endtag(self, tag):
@@ -332,7 +352,7 @@ class _VisibleTextParser(HTMLParser):
             self.cur_card = None
 
     def handle_data(self, data):
-        if self.skip_depth or self._in_hidden():
+        if self.skip_depth or self.region_depth or self._in_hidden():
             return
         self.parts.append(data)
         if self.cur_card is not None:
@@ -352,18 +372,62 @@ def html_visible_text(path):
     return "\n".join("".join(p.parts).split())
 
 
-def html_card_pages(path):
-    """按卡片页返回 [(card_id, text), ...]（可见文本，隐藏揭示区除外）。"""
+def html_card_pages(path, skip_classes=(), include_hidden=False):
+    """按卡片页返回 [(card_id, text), ...]（可见文本，隐藏揭示区除外）。
+
+    ``skip_classes``：额外跳过的区域类名（见 _VisibleTextParser）。
+    ``include_hidden``：True 时把 ``hidden``/``display:none`` 容器内的文字
+    也收进结果（A24 的内容身份用——"延迟可见"仍是交付内容，不得因隐藏
+    而逃过验收绑定）；默认 False 保持"学生当下可见"语义。
+    """
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             html = f.read()
     except OSError:
         return None
-    p = _VisibleTextParser()
+    p = _VisibleTextParser(skip_classes=skip_classes,
+                           include_hidden=include_hidden)
     p.feed(html)
     p.close()
     return [(cid, "\n".join("".join(parts).split()))
             for cid, parts in p.cards]
+
+
+#: A23：防泄露扫描要跳过的「可见但设计上含答案」区域。
+#: qc-options = 选择题化填空的选项组（正确答案按 design 就是其中一个按钮）；
+#: qc-reveal  = 延迟发放的参考解答/教学要点揭示区（学生版带 hidden）。
+ANSWER_REGION_CLASSES = ("qc-options", "qc-reveal")
+
+
+#: A24：验收记录里「学生版 HTML 内容身份」的字段名。
+HTML_CONTENT_FIELD = "student_html_content_digest"
+
+
+def html_student_content_digest(path):
+    """学生版 HTML 的**内容**摘要：卡片 ID 序列 + 每张卡的可见文本（A24）。
+
+    A24：验收记录过去绑定 student.html 的原始字节 sha256，而
+    render_html.py:356 每次构建都会把 time.strftime 的 ``GENERATED_AT``
+    写进页面——于是字节哈希**每次重新构建都变**，内容一字未改时整份教学
+    验收也被判过期，逼操作者删 .pd/acceptance/* + claims + 回滚 checkpoint
+    重跑 T4。但教学验收审的是**内容**，不是渲染字节：构建时间戳、KaTeX
+    本地/CDN、CSS、资产路径都不改变学生看到什么。
+
+    这里给出一个对渲染层不敏感、对内容敏感的身份：卡片 ID 序列 + 每张
+    卡的**全部**文本（空白归一化，不跳过任何区域——选项、隐藏揭示区的
+    文字同样是学生可见内容的一部分；隐藏只是"延迟可见"，写进隐藏区的
+    答案若能被改动而验收不失效，就等于给后门留缝）。
+
+    返回 sha256 十六进制串；文件不存在或解析不出卡片页时返回 ``None``
+    （= "算不出内容身份"，调用方按 fail-close 处理，不得当作通过）。
+    """
+    pages = html_card_pages(path, include_hidden=True)
+    if not pages:
+        return None
+    blob = json.dumps(
+        [[cid, re.sub(r"\s+", "", text)] for cid, text in pages],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 
@@ -631,7 +695,8 @@ def _issue_lifecycle_problems(issues, scope, required=None):
 
 
 def _validate_acceptance_v2(rec, current_digest=None, student_pdf_sha=None,
-                            student_html_sha=None):
+                            student_html_sha=None,
+                            student_html_content_sha=None, warnings=None):
     """校验合并终审投影的验收证据（v2）。
 
     与 v1 的差别只有「证据从哪来」：v1 是审读员直接写的盲审记录，v2 是宿主从
@@ -643,7 +708,8 @@ def _validate_acceptance_v2(rec, current_digest=None, student_pdf_sha=None,
         （本轮磁盘实测指纹）**必须分离**：前者是历史，后者是本轮机械验收；
       - 两份引用都必须携带真实 64 位摘要（零 hash / 占位摘要按伪造证据失败）；
       - derived_from 必须能对回父主产物与派发身份；
-      - html-only 显式不含 PDF 证明：不得出现 student.pdf 指纹。
+      - html-only 显式不含 PDF 证明：不得出现 student.pdf 指纹。；
+       - ``student_html_content_sha``（A24）：同 v1 口径——字节哈希不一致时，以学生版 HTML 的**内容**身份（student_html_content_digest）判定验收是否仍然覆盖当剈产物；渲染层变动只记账，内容变动才失效。
     """
     problems = []
     scope = (rec or {}).get("scope", "?")
@@ -788,8 +854,27 @@ def _validate_acceptance_v2(rec, current_digest=None, student_pdf_sha=None,
             bound = (delivery_digests.get("student.html")
                      or rec.get("student_html_sha256"))
             if bound and bound != student_html_sha:
-                problems.append("验收记录 %s 绑定的 student.html 哈希与当前构建不一致"
-                                % scope)
+                # A24：同 v1 口径——字节不同不等于内容不同，渲染层变动
+                # （GENERATED_AT / KaTeX 本地或 CDN / CSS / 资产路径）不该让
+                # 整份教学验收过期；内容身份一致 → 记账放行，否则硬失败。
+                # 注意取**审读当时**的内容身份（content_review_refs），不能用
+                # delivery_check_ref——那是本轮磁盘实测，与当前值比恒等，
+                # 等于把这道校验关掉。
+                recorded = (content_digests.get(HTML_CONTENT_FIELD)
+                            or rec.get(HTML_CONTENT_FIELD))
+                if student_html_content_sha and recorded \
+                        and recorded == student_html_content_sha:
+                    if warnings is not None:
+                        warnings.append(
+                            "验收记录 %s 绑定的 student.html 字节哈希已变，但"
+                            "学生可见内容一致（渲染层变动），验收维持有效"
+                            % scope)
+                else:
+                    problems.append(
+                        "验收记录 %s 绑定的 student.html 哈希与当前构建不一致"
+                        "（内容身份 %s）"
+                        % (scope,
+                           "也未登记" if not recorded else "已改变"))
     return problems
 
 
@@ -806,20 +891,28 @@ def _is_reused_acceptance(rec):
     return isinstance(binding, dict) and binding.get("reused") is True
 
 
-def _delivery_digests(rec):
-    """从 acceptance 记录提取 delivery_check_ref.artifact_digests（若无则空）。
+def _delivery_digests(rec, review=False):
+    """从 acceptance 记录提取产物指纹字典（若无则空）。
 
+    ``review=False``（默认）：取 ``delivery_check_ref.artifact_digests``，
     复用重测指纹代表「本轮磁盘实测」，优先于停留在外部审读时刻的
     顶层 student_pdf_sha256/student_html_sha256（与 _validate_acceptance_v2
-    的回退口径一致）。值统一剥掉可选的 ``sha256:`` 前缀，与
-    sha256_file / 顶层字段的裸十六进制口径对齐。
+    的回退口径一致）。
+
+    ``review=True``（A24）：取 ``content_review_refs.artifact_digests``，即
+    **审读员当时**看到的产物指纹。判「字节是否变」用前者；取「审读当时的
+    内容身份」必须用后者——拿前者与当前值比恒等，等于把 A24 那道校验关掉。
+
+    值统一剥掉可选的 ``sha256:`` 前缀，与 sha256_file / 顶层字段的裸十六进制
+    口径对齐。
     """
     if not isinstance(rec, dict):
         return {}
-    dref = rec.get("delivery_check_ref")
-    if isinstance(dref, dict) and isinstance(dref.get("artifact_digests"), dict):
+    key = "content_review_refs" if review else "delivery_check_ref"
+    ref = rec.get(key)
+    if isinstance(ref, dict) and isinstance(ref.get("artifact_digests"), dict):
         out = {}
-        for rel, value in dref["artifact_digests"].items():
+        for rel, value in ref["artifact_digests"].items():
             if isinstance(value, str) and value.startswith("sha256:"):
                 out[rel] = value[len("sha256:"):]
             else:
@@ -828,7 +921,9 @@ def _delivery_digests(rec):
     return {}
 
 
-def validate_acceptance_json(rec, current_digest=None, student_pdf_sha=None, student_html_sha=None):
+def validate_acceptance_json(rec, current_digest=None, student_pdf_sha=None,
+                             student_html_sha=None,
+                             student_html_content_sha=None, warnings=None):
     """校验 .pd/acceptance/<scope>.json 的记录一致性（不代替实际审读）。
 
     返回问题列表（空 = 通过）。规则：
@@ -838,6 +933,13 @@ def validate_acceptance_json(rec, current_digest=None, student_pdf_sha=None, stu
       - status=fixed 的 issue 必须有改后位置（resolution）与复验摘要
         （verified_digest）；status=withdrawn 必须给出误报依据
         （resolution 非空且不得只填“综合考虑”）。
+    ``student_html_content_sha``（A24）：学生版 HTML 的**内容**摘要
+    （html_student_content_digest）。字节哈希不一致时，若记录带
+    ``student_html_content_digest`` 且与它相等，说明只是渲染层变动
+    （GENERATED_AT 时间戳 / KaTeX 本地或 CDN / CSS / 资产路径），学生可见
+    内容没变——教学验收维持有效，只往 ``warnings`` 记一条账，不再让整份
+    验收过期。内容身份不一致、或记录没带内容摘要（无法区分）时，仍然是
+    硬失败：旧 PASS 不得因字节改了名就冒充新内容的结果。
     """
     # 卡14：v2 = 合并终审确定性投影（判别式 review_kind，不看 schema_version：
     # 旧 v1 记录的 schema_version 本来就是 2，拿版本号判别会放松历史档校验）。
@@ -847,6 +949,8 @@ def validate_acceptance_json(rec, current_digest=None, student_pdf_sha=None, stu
             current_digest=current_digest,
             student_pdf_sha=student_pdf_sha,
             student_html_sha=student_html_sha,
+            student_html_content_sha=student_html_content_sha,
+            warnings=warnings,
         )
     problems = []
     scope = (rec or {}).get("scope", "?")
@@ -899,8 +1003,28 @@ def validate_acceptance_json(rec, current_digest=None, student_pdf_sha=None, stu
         if student_html_sha is not None:
             bound = delivery_digests.get("student.html") or rec.get("student_html_sha256")
             if bound and bound != student_html_sha:
-                problems.append("验收记录 %s 绑定的 student.html 哈希与当前构建"
-                                "不一致" % scope)
+                # A24：字节不同不等于内容不同。渲染层变动（GENERATED_AT
+                # 时间戳、KaTeX 本地/CDN、CSS、资产路径）不该让整份教学
+                # 验收过期——验收审的是学生可见内容。有内容身份且一致 → 记账
+                # 放行；否则保持硬失败。
+                # 取审读当时的内容身份（content_review_refs / 顶层字段），
+                # 不用 delivery_check_ref——那是本轮磁盘实测，恒等即失效。
+                review_digests = _delivery_digests(rec, review=True)
+                recorded = (review_digests.get(HTML_CONTENT_FIELD)
+                            or rec.get(HTML_CONTENT_FIELD))
+                if student_html_content_sha and recorded \
+                        and recorded == student_html_content_sha:
+                    if warnings is not None:
+                        warnings.append(
+                            "验收记录 %s 绑定的 student.html 字节哈希已变，但"
+                            "学生可见内容一致（渲染层变动），验收维持有效"
+                            % scope)
+                else:
+                    problems.append(
+                        "验收记录 %s 绑定的 student.html 哈希与当前构建不一致"
+                        "（内容身份 %s）"
+                        % (scope,
+                           "也未登记" if not recorded else "已改变"))
     return problems
 
 

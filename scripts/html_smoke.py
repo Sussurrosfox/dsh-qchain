@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -53,6 +54,24 @@ EXIT_FAIL = 1
 EXIT_BLOCKED_ENV = 3
 
 BROWSER_ENV = "QC_HTML_SMOKE_BROWSER"
+
+#: 浏览器启动探测的超时（秒）。Playwright 在受限沙箱里**不会报错，而是挂在
+#: 启动阶段**（named pipe 打开被拒 EPERM 时既无输出也不退出，实测挂死 >24 分钟、
+#: kill 前零输出），因此必须放在子进程里带硬超时跑——否则调用方（deliver.py /
+#: 流水线节点）会被一起拖死。可用 QC_HTML_SMOKE_PROBE_TIMEOUT 覆盖。
+PROBE_TIMEOUT_ENV = "QC_HTML_SMOKE_PROBE_TIMEOUT"
+DEFAULT_PROBE_TIMEOUT = 25
+
+#: 受限环境特征：命中这些字样时给出可操作的诊断，而不是一句"启动失败"。
+PIPE_HINTS = (
+    ("named pipe", "命名管道"),
+    ("epipe", "命名管道"),
+    ("eperm", "权限被拒"),
+    ("pipe is being closed", "命名管道已关闭"),
+    ("access is denied", "访问被拒"),
+    ("permissionerror", "权限被拒"),
+    ("拒绝访问", "访问被拒"),
+)
 
 # 本机可配置浏览器：先看显式路径/环境变量，再按平台常见安装位置探测，
 # 最后退回 Playwright 自带 channel（chrome/msedge/chromium）。
@@ -141,6 +160,74 @@ def browser_diagnostic(errors):
     """把探测失败清单拼成人类可读的依赖诊断。"""
     detail = "; ".join(errors) if errors else "未找到任何 Chrome/Chromium/Edge"
     return "无可用浏览器（HTML 离线包验收无法进行）：%s。%s" % (detail, INSTALL_HINT)
+
+
+def classify_launch_failure(text):
+    """把启动失败归类。返回 (kind, hint)。
+
+    kind ∈ {"pipe", "permission", "missing", "other"}——调用方据此决定是
+    「换环境」还是「装依赖」。受限沙箱（DSH/CI/无图形会话）里 Playwright 打开
+    命名管道会被拒，这一档必须被识别出来：它不是"没装浏览器"。
+    """
+    low = str(text or "").lower()
+    for needle, label in PIPE_HINTS:
+        if needle in low:
+            return "pipe", ("浏览器进程无法通过命名管道/IPC 与本工具通信（%s）。"
+                            "典型成因：运行在受限沙箱里（named pipe 被拒），"
+                            "或杀毒/策略拦截了 Chrome 启动。"
+                            "该环境**自动降级**：交付继续，但 manifest 如实记录"
+                            " html_smoke.status=blocked_env_degraded。" % label)
+    if "executable doesn't exist" in low or "不存在" in low or "no such file" in low:
+        return "missing", "浏览器可执行文件不存在"
+    return "other", ""
+
+
+def probe_browser(timeout_s=None, browser_path=None, candidates=None):
+    """在子进程里带硬超时探测浏览器是否真的能启动。返回 (ok, reason)。
+
+    为什么需要它：``find_browser`` 里的 ``pw.chromium.launch()`` 在受限沙箱下
+    不会抛异常，而是**永久挂起**（named pipe EPERM）。挂死的主进程拿不到任何
+    错误信息，调用方只能强杀。这里用 ``--selftest`` 起一个独立子进程跑同一个
+    launch，主进程只看它有没有在超时内给出结论：
+
+      * 超时无输出      → ("pipe", 挂起诊断)   ← E7 的核心场景
+      * 退出码非 0      → 按 classify_launch_failure 归类
+      * 退出码 0        → (True, 可用浏览器描述)
+
+    只做最小动作（launch + about:blank + close），不碰交付包，因此可以反复调用。
+    """
+    if timeout_s is None:
+        raw = os.environ.get(PROBE_TIMEOUT_ENV) or ""
+        try:
+            timeout_s = int(str(raw).strip()) if str(raw).strip() else DEFAULT_PROBE_TIMEOUT
+        except ValueError:
+            timeout_s = DEFAULT_PROBE_TIMEOUT
+    timeout_s = max(5, int(timeout_s))
+    cmd = [sys.executable, os.path.abspath(__file__), "--selftest"]
+    if browser_path:
+        cmd += ["--browser", browser_path]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, (
+            "浏览器启动探测超时（%ds 内无任何结论）：浏览器进程被卡在启动/握手"
+            "阶段。受限沙箱下 Playwright 打开命名管道会被拒（EPERM），此时既不会"
+            "报错也不会退出——旧实现因此挂死 >24 分钟且零输出。可用环境变量 "
+            "%s 调整超时。" % (timeout_s, PROBE_TIMEOUT_ENV))
+    except OSError as exc:
+        return False, "浏览器启动探测无法执行: %s" % exc
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode == 0:
+        line = [l for l in out.splitlines() if l.startswith("[html_smoke] 可用浏览器")]
+        return True, (line[0] if line else "[html_smoke] 可用浏览器")
+    kind, hint = classify_launch_failure(out)
+    if kind == "pipe":
+        return False, ("浏览器无法启动（受限环境：%s）%s"
+                       % (out.strip().splitlines()[-1][:160] if out.strip() else "",
+                          hint))
+    return False, out.strip()[:300] or "浏览器启动探测失败（退出码 %d）" % proc.returncode
 
 
 # --------------------------------------------------------------------------
@@ -679,6 +766,18 @@ def run_smoke(package_dir, report_path=None, versions=None, viewports=None,
         report["issues"] = issues
         return _finalize(report, report_path, EXIT_BLOCKED_ENV, "blocked_env")
 
+    # E7：先在子进程里带硬超时探一次浏览器。受限沙箱（named pipe EPERM）下
+    # launch 不报错只是挂死，若直接在这里 launch，调用方会被拖死且拿不到任何
+    # 诊断。探测失败 → 立即 blocked_env（附可操作诊断），探测本身不碰交付包。
+    probe_ok, probe_reason = probe_browser(browser_path=browser_path)
+    if not probe_ok:
+        report["evidence"]["dependency"] = {
+            "status": "blocked_env", "reason": probe_reason,
+            "stage": "browser_probe", "hints": [INSTALL_HINT]}
+        issues.append(_issue("BLOCKED_ENV: %s" % probe_reason))
+        report["issues"] = issues
+        return _finalize(report, report_path, EXIT_BLOCKED_ENV, "blocked_env")
+
     pw = sync_playwright().start()
     browser = None
     try:
@@ -746,7 +845,8 @@ def run_smoke(package_dir, report_path=None, versions=None, viewports=None,
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="HTML 离线交付包浏览器验收（发布切换前，file:// 断网）")
-    ap.add_argument("package", help="待验收的包目录（.release-staging 或 release/）")
+    ap.add_argument("package", nargs="?", default=None,
+                    help="待验收的包目录（.release-staging 或 release/）")
     ap.add_argument("--report", default=None,
                     help="证据报告路径（缺省 <package>/../%s）"
                     % DEFAULT_REPORT_REL.replace(os.sep, "/"))
@@ -759,7 +859,42 @@ def main(argv=None):
     ap.add_argument("--timeout-ms", type=int, default=15000)
     ap.add_argument("--list-browsers", action="store_true",
                     help="只打印浏览器探测结果，不验收")
+    ap.add_argument("--selftest", action="store_true",
+                    help="只启动浏览器并打开 about:blank，用于探活（供 "
+                         "probe_browser 在子进程里带超时调用）")
     args = ap.parse_args(argv)
+
+    if not args.package and not (args.selftest or args.list_browsers):
+        ap.error("缺少待验收的包目录（或使用 --selftest / --list-browsers 只做探测）")
+
+    if args.selftest:
+        try:
+            sync_playwright = import_playwright()
+        except SmokeUnavailable as exc:
+            print("[html_smoke] BLOCKED_ENV: %s" % exc.reason)
+            for h in exc.diagnostics:
+                print("  - " + h)
+            return EXIT_BLOCKED_ENV
+        pw = sync_playwright().start()
+        try:
+            browser, desc, diag = find_browser(pw, browser_path=args.browser)
+            if browser is None:
+                print("[html_smoke] BLOCKED_ENV: %s" % browser_diagnostic(diag))
+                return EXIT_BLOCKED_ENV
+            try:
+                page = browser.new_context().new_page()
+                page.goto("about:blank")
+            finally:
+                browser.close()
+            print("[html_smoke] 可用浏览器: %s" % desc)
+            for d in diag:
+                print("  (fallback) " + d)
+            return EXIT_PASS
+        finally:
+            try:
+                pw.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
     if args.list_browsers:
         try:

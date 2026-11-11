@@ -158,21 +158,25 @@ class T02Persistence(unittest.TestCase):
             project_root=self.root, source_files=["8.md"])
         self_dir, _ = _make_self(self.root, manifest)
         script = os.path.join(ENGINE_ROOT, "scripts", "source_inventory.py")
-        env = dict(os.environ, PYTHONPATH=ENGINE_ROOT)
+        # TEV_GateCli 同源坑：Windows 上 Python 子进程默认按 cp936 写 stdout，
+        # 父进程按 UTF-8 收就成乱码；反之亦然。双端正解是**把子进程钉成 UTF-8**
+        # （PYTHONUTF8=1，与 PYTHONIOENCODING 等价但优先级更高且不依赖 3.7+ 行为
+        # 差异），父进程显式按 UTF-8 解码。
+        env = dict(os.environ, PYTHONPATH=ENGINE_ROOT, PYTHONUTF8="1")
+        text_kw = dict(capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env)
         # 先缺失 → FAIL
         r = subprocess.run([sys.executable, script, "--self-dir", self_dir,
-                            "--check"], capture_output=True, text=True,
-                           env=env)
+                            "--check"], **text_kw)
         self.assertEqual(r.returncode, 1)
         # 生成
         r = subprocess.run([sys.executable, script, "--self-dir", self_dir],
-                           capture_output=True, text=True, env=env)
+                           **text_kw)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("8 单元", r.stdout)
         # 校验 → PASS
         r = subprocess.run([sys.executable, script, "--self-dir", self_dir,
-                            "--check"], capture_output=True, text=True,
-                           env=env)
+                            "--check"], **text_kw)
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(os.path.join(self_dir, ".pd", "source-inventory.json"),
                   "r", encoding="utf-8") as f:

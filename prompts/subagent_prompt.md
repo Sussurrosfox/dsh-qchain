@@ -124,7 +124,13 @@
      "output_sha256": "...", "notes": "完成状态、遇到的问题与材料缺口"}
     ```
     主 Agent 校验（身份一致、输入未变、哈希正确）后才会提升为正式切片；身份不符或输入已变的迟到结果一律拒收。
-15. **零静默丢弃（源资产守恒红线）**：切片时严禁静默丢弃源文档中的图、表、TikZ（`tikzcd`/`tikzpicture`）与公式环境。源文档含 TikZ 图时，主 Agent 应已在派发前用 `scripts/tikz_rasterize.py` 预栅格化为 PNG 并以 `\includegraphics` 引用，切片原样保留该引用即可；对确实无法转换或保留的资产，必须在产物中显式给出 gap 清单（逐项列出源行号、环境名、缺失原因与建议处置），交付物中禁止"丢了不说"。派发单 `context.source_assets` 给出源侧图形/表格资产计数，切片必须全量保留或在 gap 清单中逐项说明，数量对不上即违规。
+15. **零静默丢弃（源资产守恒红线）**：切片时严禁静默丢弃源文档中的图、表、TikZ（`tikzcd`/`tikzpicture`）与公式环境。源文档含 TikZ 图时，主 Agent 应已在派发前用 `scripts/tikz_rasterize.py` 预栅格化为 PNG 并以 `\includegraphics` 引用，切片原样保留该引用即可；对确实无法转换或保留的资产，必须在产物中显式给出 gap 清单（逐项列出源行号、环境名、缺失原因与建议处置），交付物中禁止"丢了不说"。派发单 `context.source_assets` 给出源侧图形/表格资产计数，切片必须全量保留或在 gap 清单中逐项说明，数量对不上即违规。gap 清单的**唯一可核验写法**是资产豁免锚点注释（写在应保留该资产的切片内，`check_fidelity.py` 逐条校验单元已登记、源侧确有该资产、理由非空话、产物侧并未真的保留）：
+
+```
+% fidelity-gap: SRC-026 figure L75 | 原图为手写扫描，栅格化后文字不可读；正文已用文字描述替代，建议人工补绘
+```
+
+格式：`% fidelity-gap: <SRC编号> <figure|table> L<源行号> | <缺失原因与建议处置>`。只写“无法转换”“略”之类的空话会被 `FIDELITY_GAP_NO_REASON` 拦下；申报不存在的资产会被 `FIDELITY_GAP_NO_SUCH_ASSET` 拦下。优先搬入资产，豁免是例外而非常态。
 
 状态口径以 `../references/production.md` 状态词表为准：正文只使用 material-pack 中 `approved` 卡片；研究 Agent 的需求级 ACCEPT 只是初核建议，不等于批准。
 ```

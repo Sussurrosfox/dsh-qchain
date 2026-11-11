@@ -85,6 +85,18 @@ agent_timeout_seconds: 900    # 单请求超时（秒）
 agent_max_retries: 2          # transient 故障重试次数（content/contract 类不重试）
 agent_allow_unattested: false # 扁平兜底逃生阀（等价 agent_dispatch.allow_unattested；映射块优先）
 
+# --- 内容返修预算（A5：正式运维通道）---
+# 每 scope（切片/文件）允许安排的内容返修轮数上限，以及全 run 全局累计上限。
+# 缺省按 execution_profile：legacy 每 scope 3 次、无全局上限；faithful_fast 每
+# scope 2 次、全 run 6 次。Phase 0 会把 repair_max_per_scope / repair_max_total
+# 冻结进执行契约（冻结值优先，改这里不覆盖已冻结的会话）。
+# 优先级：冻结 execution_config > state 显式覆盖 > 本配置 > profile 默认。
+# 放宽上限请改这两行，**不要**去二进制改 checkpoint 里的 repair_per_scope_limit
+# （msgpack 写 ASCII 会损坏状态、填字符串会崩 apply_writes）。
+# repair_per_scope_limit: 12
+# repair_total_limit: 40
+# 也可写在 agent_dispatch 子块里（agent_dispatch.repair_per_scope_limit），等价。
+
 # --- 课前预算与容量控制 ---
 # lesson_minutes: 课时总预算（仅 teaching/classroom 模式下生效，默认 90 分钟；self_study 模式不设时长上限）
 lesson_minutes: 90                     # 课时总预算（仅 teaching / classroom 模式校验）

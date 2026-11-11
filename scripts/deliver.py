@@ -112,11 +112,25 @@ HTML_SMOKE_SKIP_HINT = (
     "（file:// 断网、逐卡 desktop 与 390px、逐节点公式状态）。开发态确需跳过时"
     "设置 %s=1 并加 --skip-html-smoke；正式交付不得跳过。" % HTML_SMOKE_SKIP_ENV)
 
+#: HTML 侧验收的执行模式。strict=浏览器不可用即中止交付（默认，正式交付）；
+#: auto=浏览器不可用时自动降级继续（流水线/受限环境专用，manifest 如实记录）。
+HTML_SMOKE_MODES = ("strict", "auto")
+
 
 class HtmlSmokeError(Exception):
     """HTML 离线交付包浏览器验收未通过（含浏览器不可用的 BLOCKED_ENV）。
 
     发布必须中止：由 atomic_release 的 except 分支清 staging，旧 release 不动。
+    """
+
+
+class HtmlSmokeBlockedEnv(HtmlSmokeError):
+    """浏览器不可用（BLOCKED_ENV）——**环境问题，不是内容问题**。
+
+    E7：受限沙箱（DSH Windows named pipe EPERM、CI 无浏览器）里 html_smoke 的
+    探测只会给出"起不来"，与"HTML 有内容缺陷"是两件事。调用方在 auto 模式下
+    捕获本异常并把 manifest.html_smoke 置为 blocked_env_degraded 后继续，
+    而不是把整条发布链路拖死（旧实现靠人工放环境变量 + 落标记文件才能绕过）。
     """
 
 
@@ -315,7 +329,7 @@ def run_smoke_check(pdir, fmt):
                   % (proc.returncode, ",".join(pdfs)))
 
 
-def resolve_html_smoke_skip(skip_html_smoke, env=None):
+def resolve_html_smoke_skip(skip_html_smoke, env=None, mode="strict"):
     """解析 HTML 侧冒烟跳过策略。返回 (skip, reason)。
 
     skip is False → 正常执行；
@@ -324,9 +338,18 @@ def resolve_html_smoke_skip(skip_html_smoke, env=None):
 
     注意：``--skip-smoke`` 只豁免 PDF 侧（render_smoke.py），**不**自动豁免
     HTML 侧——两者是两件不同的事，HTML 包必须用真实浏览器验收。
+
+    ``mode`` 只影响"浏览器不可用"这一类失败的处置（见
+    HtmlSmokeBlockedEnv），不影响显式跳过语义。
     """
     env = os.environ if env is None else env
+    if mode not in HTML_SMOKE_MODES:
+        return None, ("拒绝执行：--html-smoke-mode 只接受 %s"
+                      % "/".join(HTML_SMOKE_MODES))
     if not skip_html_smoke:
+        if mode == "auto":
+            return False, ("HTML 侧验收默认执行（auto 模式：浏览器不可用时降级"
+                           "为 blocked_env_degraded 并继续，manifest 如实记录）")
         return False, ("HTML 侧验收默认执行：对 staging 实际包做 file:// 断网"
                        "浏览器验收（html/both 格式），--skip-smoke 不豁免此门禁")
     if env.get(HTML_SMOKE_SKIP_ENV) != "1":
@@ -342,17 +365,29 @@ def run_html_smoke_check(package_dir, report_path=None, runner=None):
 
     验收对象必须是 staging/release 里那份包（写完 manifest 之后），不是工作区
     原版 HTML；浏览器不可用时返回 ok=False（BLOCKED_ENV 绝不等于通过）。
+
+    需要区分"浏览器不可用"与"内容缺陷"时用 run_html_smoke_check_ex。
+    """
+    ok, reason, _blocked = run_html_smoke_check_ex(package_dir, report_path, runner)
+    return ok, reason
+
+
+def run_html_smoke_check_ex(package_dir, report_path=None, runner=None):
+    """run_html_smoke_check 的扩展版，返回 (ok, reason, blocked_env)。
+
+    blocked_env=True 表示失败原因是**环境**（无浏览器 / 启动被沙箱拒），
+    auto 模式下调用方可据此降级；False 表示内容/包本身有问题，任何模式都不放行。
     """
     if runner is None:
         try:
             import html_smoke
         except Exception as exc:  # noqa: BLE001
-            return False, "无法导入 scripts/html_smoke.py：%s" % exc
+            return False, "无法导入 scripts/html_smoke.py：%s" % exc, False
         runner = html_smoke.run_smoke
     try:
         report, code = runner(package_dir, report_path)
     except Exception as exc:  # noqa: BLE001
-        return False, "HTML 冒烟执行异常：%s" % exc
+        return False, "HTML 冒烟执行异常：%s" % exc, False
     report = report or {}
     status = report.get("status")
     evidence_blob = report.get("evidence") or {}
@@ -364,14 +399,14 @@ def run_html_smoke_check(package_dir, report_path=None, runner=None):
             % (os.path.basename(package_dir), counts.get("cards"),
                counts.get("math_nodes"), counts.get("math_ok"),
                counts.get("toc_clicked"), counts.get("option_groups_clicked"),
-               counts.get("images")))
+               counts.get("images"))), False
     if status == "blocked_env":
         dep = evidence_blob.get("dependency") or {}
         return False, ("HTML 离线包验收无法进行（BLOCKED_ENV）：%s"
-                       % (dep.get("reason") or "本机无可用浏览器"))
+                       % (dep.get("reason") or "本机无可用浏览器")), True
     problems = [i.get("message") for i in (report.get("issues") or [])]
     return False, ("HTML 离线包浏览器验收未通过（%d 项问题）：%s"
-                   % (len(problems), "; ".join(problems[:6])))
+                   % (len(problems), "; ".join(problems[:6]))), False
 
 
 def _agent_calls_digest(pdir):
@@ -438,7 +473,8 @@ def release_paths(pdir):
             os.path.join(pdir, ".release-prev"))
 
 
-def prepare_staging(pdir, manifest, fmt="both", html_smoke=None):
+def prepare_staging(pdir, manifest, fmt="both", html_smoke=None,
+                    html_smoke_mode="strict"):
     """按 fmt 把交付物装配进 .release-staging 并做全部离线验收。
 
     成功返回（已回填验收结果的）manifest，**staging 保留在盘上**——由调用方
@@ -454,6 +490,11 @@ def prepare_staging(pdir, manifest, fmt="both", html_smoke=None):
         None     用随包 scripts/html_smoke.py 做真实浏览器验收（发布路径默认）
         callable 自定义验收器 f(package_dir, report_path) -> (report, exit_code)
         False    显式跳过（仅限资源/回滚类测试与开发态，调用方自负）
+
+    html_smoke_mode:
+        "strict" 浏览器不可用（BLOCKED_ENV）→ 抛 HtmlSmokeError 中止发布
+        "auto"   浏览器不可用 → 抛 HtmlSmokeBlockedEnv，由调用方降级继续；
+                 HTML 内容缺陷仍照旧中止（环境问题不等于内容合格）
     """
     _rel, staging, _backup = release_paths(pdir)
     if os.path.exists(staging):
@@ -534,9 +575,13 @@ def prepare_staging(pdir, manifest, fmt="both", html_smoke=None):
             report_path = os.path.join(pdir, HTML_SMOKE_REPORT_REL)
             print("[deliver] 对 staging 实际包做 HTML 离线验收: %s"
                   % os.path.basename(staging))
-            ok, reason = run_html_smoke_check(staging, report_path,
-                                             runner=html_smoke or None)
+            ok, reason, blocked = run_html_smoke_check_ex(
+                staging, report_path, runner=html_smoke or None)
             print("[deliver]   %s" % reason)
+            if blocked and html_smoke_mode == "auto":
+                # E7：受限环境（无浏览器 / named pipe EPERM）自动降级。只降
+                # "没法验"这一种，内容缺陷照旧中止。
+                raise HtmlSmokeBlockedEnv(reason)
             if not ok:
                 raise HtmlSmokeError(reason)
             manifest["html_smoke"] = {
@@ -560,7 +605,39 @@ def prepare_staging(pdir, manifest, fmt="both", html_smoke=None):
     return manifest
 
 
-def atomic_release(pdir, manifest, fmt="both", html_smoke=None):
+def _degrade_after_blocked_env(pdir, manifest, fmt, exc):
+    """auto 模式降级：跳过浏览器验收重新装配 staging，并把降级写进 manifest。
+
+    前置条件：prepare_staging 刚抛过 HtmlSmokeBlockedEnv，staging 已被清空。
+    这里用 html_smoke=False 重装一次（同一套装配与其余门禁口径，只是不点浏览器），
+    再把 html_smoke 状态改成 blocked_env_degraded 后回写 manifest.json。
+
+    降级是**显式留痕**的：manifest.html_smoke.status 记 blocked_env_degraded、
+    reason 保留诊断原文，第三方拿到包立刻知道这一版没有浏览器验收证据。
+    """
+    print("[deliver] [警告] HTML 侧浏览器验收因环境不可用而降级：%s" % exc)
+    print("[deliver]        已按 --html-smoke-mode=auto 继续发布，"
+          "manifest.html_smoke.status=blocked_env_degraded")
+    manifest = prepare_staging(pdir, manifest, fmt=fmt, html_smoke=False)
+    report_path = os.path.join(pdir, HTML_SMOKE_REPORT_REL)
+    reason = str(exc)
+    note = {"status": "blocked_env_degraded", "note": reason}
+    if os.path.isfile(report_path):
+        note["report"] = HTML_SMOKE_REPORT_REL.replace(os.sep, "/")
+    manifest["html_smoke"] = note
+    ev = manifest.setdefault("evidence", {})
+    hashes = ev.setdefault("evidence_hashes", {})
+    reports = hashes.setdefault("reports", {})
+    if os.path.isfile(report_path):
+        reports["html_smoke.json"] = evidence.sha256_file(report_path)
+    staging = release_paths(pdir)[1]
+    with open(os.path.join(staging, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    return manifest
+
+
+def atomic_release(pdir, manifest, fmt="both", html_smoke=None,
+                   html_smoke_mode="strict"):
     """先写临时目录，全部成功后原子切换 release。
 
     发布顺序（契约 C8 固定）：构建 staging → 写 manifest.json → 对 staging 做
@@ -568,10 +645,18 @@ def atomic_release(pdir, manifest, fmt="both", html_smoke=None):
     改名 release → 清理 backup。验收失败保留原 release，不吞错。
 
     装配与验收全部委托 prepare_staging（干跑复用同一条链路，见其文档）。
+
+    html_smoke_mode 同 prepare_staging；auto 模式下浏览器不可用时改由调用方
+    捕获 HtmlSmokeBlockedEnv 降级（见 main 的 try/except）。
     """
     rel, staging, backup = release_paths(pdir)
-    manifest = prepare_staging(pdir, manifest, fmt=fmt, html_smoke=html_smoke)
-
+    try:
+        manifest = prepare_staging(pdir, manifest, fmt=fmt, html_smoke=html_smoke,
+                                  html_smoke_mode=html_smoke_mode)
+    except HtmlSmokeBlockedEnv as exc:
+        # auto 模式：浏览器不可用。重新装一次 staging，把降级记录写进 manifest
+        # 后照常发布——"没法验"如实记录，"验不过"仍然中止。
+        manifest = _degrade_after_blocked_env(pdir, manifest, fmt, exc)
     if os.path.isdir(rel):
         if os.path.exists(backup):
             shutil.rmtree(backup)
@@ -631,6 +716,11 @@ def main():
     ap.add_argument("--skip-html-smoke", action="store_true",
                     help="跳过 HTML 侧离线包浏览器验收（仅开发态；需同时设置 "
                          "环境变量 QCHAIN_ALLOW_SKIP_HTML_SMOKE=1）")
+    ap.add_argument("--html-smoke-mode", choices=list(HTML_SMOKE_MODES),
+                    default="strict",
+                    help="浏览器不可用时的处置：strict=中止交付（默认）；"
+                         "auto=降级为 manifest.html_smoke.status="
+                         "blocked_env_degraded 后继续（流水线/受限环境用）")
     args = ap.parse_args()
 
     pdir = os.path.abspath(args.project)
@@ -650,10 +740,14 @@ def main():
     # D2：HTML 侧浏览器验收默认执行；显式跳过需环境变量二次确认（--skip-smoke
     # 只豁免 PDF 侧，不自动豁免 HTML 侧——两者是两件不同的事）
     skip_html_smoke, html_smoke_note = resolve_html_smoke_skip(
-        args.skip_html_smoke)
+        args.skip_html_smoke, mode=args.html_smoke_mode)
     if skip_html_smoke is None:
         print("[deliver] %s" % html_smoke_note)
         return 2
+    if args.html_smoke_mode == "auto" and not skip_html_smoke:
+        print("[deliver] [记录] --html-smoke-mode=auto：浏览器不可用（"
+              "BLOCKED_ENV）时降级继续，manifest.html_smoke.status="
+              "blocked_env_degraded；HTML 内容缺陷仍照旧中止。")
 
     fmt = args.format or render_html.load_config_value(pdir, "output_format", "both")
     fmt = fmt.strip().lower()
@@ -752,6 +846,19 @@ def main():
     if fmt in ("html", "both"):
         html_sha = {n: evidence.sha256_file(os.path.join(pdir, n + ".html")) for n in ("student", "teacher")}
 
+    # A24：学生版 HTML 的**内容**身份（卡片 ID + 可见文本）。字节哈希每次
+    # 构建都因 render_html.py:356 的 GENERATED_AT 时间戳而变，验收若只认
+    # 字节就会每次重渲染都整体过期；这里给出渲染层无关的身份供验收判读。
+    html_content_sha = {}
+    if fmt in ("html", "both"):
+        html_content_sha = {
+            n: evidence.html_student_content_digest(
+                os.path.join(pdir, n + ".html"))
+            for n in ("student", "teacher")
+        }
+    # A24：渲染层变动的记账（不是 blocker；content 身份一致即放行）
+    a24_warnings = []
+
     # 验证各报告有效性（含前置 shuffle 报告）
     for entry in PRE_CHECKS + CHECKS:
         script, report_name = entry[0], entry[1]
@@ -815,7 +922,9 @@ def main():
                     for p in evidence.validate_acceptance_json(
                         rec, current_digest=digest,
                         student_pdf_sha=pdf_sha.get("student") if fmt in ("pdf", "both") else None,
-                        student_html_sha=html_sha.get("student") if fmt in ("html", "both") else None
+                        student_html_sha=html_sha.get("student") if fmt in ("html", "both") else None,
+                        student_html_content_sha=html_content_sha.get("student"),
+                        warnings=a24_warnings
                     ):
                         accept_blockers.append(p)
 
@@ -843,6 +952,10 @@ def main():
         for b in accept_blockers:
             print("  - " + b)
         return 1
+
+    # A24：渲染层变动记账（内容身份一致，验收维持有效——只是字节变了）
+    for w in a24_warnings:
+        print("[deliver] [记录] %s" % w)
 
     # 产物存在性核对（D1：格式缺失硬失败，严禁静默降级交付范围——
     # 旧实现 both 缺 PDF 时降级为 html-only 且照常放行）
@@ -942,8 +1055,7 @@ def main():
                         else "pending")),
             "report": HTML_SMOKE_REPORT_REL.replace(os.sep, "/"),
             "note": html_smoke_note,
-        },
-        "deliverables": deliverables,
+        },        "deliverables": deliverables,
         "status": "pass",
         "issues": [],
         "reports": {entry[1]: (reports.get(entry[1]) or {}).get("status")
@@ -966,7 +1078,18 @@ def main():
         if fmt in ("html", "both") and not skip_html_smoke:
             _rel, _staging, _backup = release_paths(pdir)
             try:
-                prepare_staging(pdir, manifest, fmt=fmt, html_smoke=None)
+                prepare_staging(pdir, manifest, fmt=fmt, html_smoke=None,
+                               html_smoke_mode=args.html_smoke_mode)
+            except HtmlSmokeBlockedEnv as e:
+                if args.html_smoke_mode != "auto":
+                    print("[deliver] 发布中止（HTML 离线包浏览器验收未通过）: %s" % e)
+                    print("  提示: %s" % HTML_SMOKE_SKIP_HINT)
+                    return 2
+                print("[deliver] [警告] 干跑：HTML 侧浏览器验收因环境不可用而降级"
+                      "（--html-smoke-mode=auto）：%s" % e)
+                print("[deliver]        干跑结论不含 HTML 包可用性，请在有浏览器"
+                      "的环境复跑。")
+                return 0
             except HtmlSmokeError as e:
                 print("[deliver] 发布中止（HTML 离线包浏览器验收未通过）: %s" % e)
                 print("  提示: %s" % HTML_SMOKE_SKIP_HINT)
@@ -986,7 +1109,8 @@ def main():
 
     try:
         rel = atomic_release(pdir, manifest, fmt=fmt,
-                             html_smoke=(False if skip_html_smoke else None))
+                             html_smoke=(False if skip_html_smoke else None),
+                             html_smoke_mode=args.html_smoke_mode)
     except HtmlSmokeError as e:
         print("[deliver] 发布中止（HTML 离线包浏览器验收未通过）: %s" % e)
         print("  提示: %s" % HTML_SMOKE_SKIP_HINT)

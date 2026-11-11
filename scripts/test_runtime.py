@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""test_runtime.py — F05–F08 运行时证据链回归测试（unittest + 临时目录）
 
@@ -195,7 +195,7 @@ def seed_reports(d, compare_status="pass"):
     tools = {"shuffle_options.json": ("shuffle_options.py", "1.0"),
              "check_numbering.json": ("check_numbering.py", "2.2"),
              "check_pedagogy.json": ("check_pedagogy.py", "1.1"),
-             "check_dialogue.json": ("check_dialogue.py", "1.2"),
+             "check_dialogue.json": ("check_dialogue.py", "1.3"),
               # F3 来源忠实性门禁：合成工程自带契约链（见 make_project），
               # 预置 PASS 报告使 --skip-checks 路径继续验证其余阻断逻辑。
               "check_fidelity.json": ("check_fidelity.py", "1.0"),

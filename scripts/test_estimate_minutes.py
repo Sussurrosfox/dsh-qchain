@@ -441,7 +441,9 @@ class TestEstimateMinutes(unittest.TestCase):
             "--json",
             output_json,
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        env = dict(os.environ, PYTHONUTF8="1")
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env=env)
         self.assertEqual(proc.returncode, 0, f"CLI error: {proc.stderr}")
         self.assertTrue(os.path.isfile(output_json))
 

@@ -49,9 +49,13 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
 
     # C3：先判无进展/额度，再安排返修。输入摘要 = 返修前该产物的 sha256。
     input_digest = snapshot(self_dir, [tex_filename]).get(tex_filename)
+    # A5：返修上限的运维覆盖走 config.yaml（扁平键或 agent_dispatch 子块），
+    # 不再需要拿 msgpack 二进制改 checkpoint 的 repair_per_scope_limit。
+    repair_cfg = repair_budget.load_repair_overrides(self_dir)
     plan = repair_budget.plan_repair(
         state, target_sec, reason, input_digest,
-        issues=state.get("repair_issues"), artifact=tex_filename)
+        issues=state.get("repair_issues"), artifact=tex_filename,
+        config=repair_cfg)
     if plan["action"] == "HALT":
         return _halt_repair(state, history, plan, reason)
 

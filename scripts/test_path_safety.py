@@ -30,7 +30,10 @@ def _make_junction(link_path, target_path):
     """优先 mklink /J（Windows 目录 junction，无需开发者模式），失败则退回 os.symlink。"""
     if os.name == "nt":
         proc = subprocess.run(["cmd", "/c", "mklink", "/J", link_path, target_path],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True,
+                              # mklink 的中文提示按 cp936 输出；显式声明后
+                              # 父进程不会因本地代码页差异崩在 reader 线程上
+                              encoding="utf-8", errors="replace")
         if proc.returncode == 0 and os.path.exists(link_path):
             return True
     try:

@@ -105,7 +105,15 @@ def current_digests(self_dir):
            for n in ("student", "teacher")}
     html = {n: evidence.sha256_file(os.path.join(self_dir, n + ".html"))
             for n in ("student", "teacher")}
-    return {"content_digest": digest, "pdf_sha256": pdf, "html_sha256": html}
+    # A24：HTML 内容身份（渲染层无关）。realign 时与字节哈希一起重盖章，
+    # 否则重签一次只会让下次重渲染再次触发字节不一致。
+    html_content = {
+        n: evidence.html_student_content_digest(
+            os.path.join(self_dir, n + ".html"))
+        for n in ("student", "teacher")
+    }
+    return {"content_digest": digest, "pdf_sha256": pdf, "html_sha256": html,
+            "html_content_sha256": html_content}
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +152,7 @@ def realign_review_notes(data, compare_sha, digest, pdf_sha, html_sha):
     return changes
 
 
-def realign_acceptance(rec, digest, pdf_sha, html_sha):
+def realign_acceptance(rec, digest, pdf_sha, html_sha, html_content_sha=None):
     """对齐 acceptance/<scope>.json 的产物绑定（校验点 B）。纯函数。"""
     changes = []
     if "content_digest" in rec:
@@ -153,6 +161,11 @@ def realign_acceptance(rec, digest, pdf_sha, html_sha):
         _set_field(rec, "student_pdf_sha256", pdf_sha["student"], changes)
     if "student_html_sha256" in rec and html_sha.get("student"):
         _set_field(rec, "student_html_sha256", html_sha["student"], changes)
+        # A24：字节哈希重盖章时一并重盖内容身份。缺失产物（html_sha 为 None）
+        # 不改写，交给门禁如实判失败——不用空串伪造一次对齐。
+        if html_content_sha and html_content_sha.get("student"):
+            _set_field(rec, evidence.HTML_CONTENT_FIELD,
+                       html_content_sha["student"], changes)
     return changes
 
 
@@ -210,7 +223,8 @@ def collect_plan(self_dir, digs, compare_sha):
                 rel = (ACCEPTANCE_DIR_REL + os.sep + fn).replace(os.sep, "/")
                 _add(rel, lambda d: realign_acceptance(
                     d, digs["content_digest"],
-                    digs["pdf_sha256"], digs["html_sha256"]))
+                    digs["pdf_sha256"], digs["html_sha256"],
+                    digs.get("html_content_sha256")))
     return entries, problems
 
 
@@ -294,6 +308,10 @@ def main(argv=None):
                     help="透传给 deliver.py：跳过 HTML 离线包浏览器验收"
                          "（仅开发态；仍需环境变量 "
                          "QCHAIN_ALLOW_SKIP_HTML_SMOKE=1 二次确认）")
+    ap.add_argument("--html-smoke-mode", choices=["strict", "auto"],
+                    default="strict",
+                    help="浏览器不可用时：strict=中止交付（默认）；auto=降级为 "
+                         "manifest.html_smoke.status=blocked_env_degraded 后继续")
     ap.add_argument("--dry-run", action="store_true",
                     help="只打印将执行的步骤与将更新的 digest 清单，不落盘")
     ap.add_argument("--json", metavar="PATH", default=None,
@@ -308,7 +326,11 @@ def main(argv=None):
     fmt_args = ["--format", args.format] if args.format else []
     # HTML 侧浏览器验收默认由 deliver.py 对 staging 实际包执行；本脚本不提供
     # 任何"绕过"捷径，只能显式透传跳过开关（deliver 侧仍需环境变量二次确认）。
-    html_smoke_args = ["--skip-html-smoke"] if args.skip_html_smoke else []
+    html_smoke_args = []
+    if args.skip_html_smoke:
+        html_smoke_args = ["--skip-html-smoke"]
+    elif getattr(args, "html_smoke_mode", "strict") == "auto":
+        html_smoke_args = ["--html-smoke-mode=auto"]
     steps = []
     if not args.skip_build:
         steps.append(("build.py", script_cmd(

@@ -325,7 +325,7 @@ class T09CliContract(unittest.TestCase):
             report = json.load(f)
         self.assertEqual(report["schema_version"], 2)
         self.assertEqual(report["tool"], "check_provenance.py")
-        self.assertEqual(report["tool_version"], "1.0")
+        self.assertEqual(report["tool_version"], "1.1")
         self.assertEqual(report["status"], "pass")
         self.assertTrue(report["input_digest"])
 

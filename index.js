@@ -138,6 +138,31 @@ function resolveCurrentProjectDir(ctx, hintPath) {
 
 // ---- 人工台账工具（qchain_approve / qchain_defer）共用 ---------------------
 
+/**
+ * A14：判断一个目录是否**真的**是 qchain self 工作区。
+ *
+ * 旧实现在 self_dir 探测里只做 `fs.existsSync(cwd + '/self')`：宿主进程的
+ * cwd 指向哪里完全不可控（实测误命中 D:\Scripts\self），于是 qchain_status /
+ * qchain_gate / qchain_dispatch 会在用户毫不知情的情况下对**另一个工作区**
+ * 报 PASS/FAIL、甚至往别人的 .pd 里写台账。同名目录不是工作区。
+ *
+ * 判定采用「有产物」口径：.pd/、config.yaml、coverage-map.md、
+ * overview-guide/、任一 sec*.tex 至少命中一项；纯空壳 self/ 不算。
+ */
+function looksLikeSelfWorkspace(dir) {
+  if (!dir) return false;
+  try {
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return false;
+    const markers = ['.pd', 'config.yaml', 'coverage-map.md', 'overview-guide.md', 'overview-guide'];
+    for (const m of markers) {
+      if (fs.existsSync(path.join(dir, m))) return true;
+    }
+    return fs.readdirSync(dir).some((f) => /^sec\d+\.tex$/i.test(f));
+  } catch (_) {
+    return false;
+  }
+}
+
 /** 定位 self 工作区（显式 → cwd/self → workspaceRegistry → 当前工程/self）。 */
 function resolveSelfWorkspaceDir(ctx, hintSelfDir) {
   const candidates = [];
@@ -156,9 +181,16 @@ function resolveSelfWorkspaceDir(ctx, hintSelfDir) {
     }
   } catch (_) {}
   candidates.push(path.join(resolveCurrentProjectDir(ctx), 'self'));
-  for (const c of candidates) {
+  // A14：隐式候选一律过工作区形态校验（cwd 下的同名 self 不算工作区）；
+  // 显式 hintSelfDir 由用户自己负责、且只要求它是目录，但它不是"隐式"候选，
+  // 绝不能靠"下标 > 0"这种巧合免检（下标会随显式参数是否传入而平移）。
+  const hasExplicit = !!hintSelfDir;
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
     try {
-      if (fs.existsSync(c) && fs.statSync(c).isDirectory()) return c;
+      if (!fs.existsSync(c) || !fs.statSync(c).isDirectory()) continue;
+      if (!(hasExplicit && i === 0) && !looksLikeSelfWorkspace(c)) continue;
+      return c;
     } catch (_) {}
   }
   return '';
@@ -777,7 +809,11 @@ export function apply(ctx, config = {}) {
             proj = path.dirname(targetInput);
           }
         } else {
-          proj = resolveEngineRoot(engineRoot);
+          // A14：无参 run/resume 时把 --project 指向**插件自身目录**会让
+          // runner 去 C:\...\dsh-qchain\self 里找流水线（那里只有脚本），
+          // resume 于是对一份空工作区从头跑。缺省改取当前工程目录
+          // （cwd → workspaceRegistry → cwd），至少落在用户真正的工作区上。
+          proj = resolveCurrentProjectDir(ctx);
         }
       }
 
@@ -946,15 +982,13 @@ export function apply(ctx, config = {}) {
         ? (path.isAbsolute(args.target_dir) ? args.target_dir : path.resolve(baseDir, args.target_dir))
         : '';
       if (!rawTarget) {
-        if (fs.existsSync(path.join(baseDir, 'self'))) {
-          rawTarget = path.join(baseDir, 'self');
-        } else if (fs.existsSync(path.join(process.cwd(), 'self'))) {
-          rawTarget = path.join(process.cwd(), 'self');
-        } else if (fs.existsSync(path.join(proj, 'self'))) {
-          rawTarget = path.join(proj, 'self');
-        } else {
-          rawTarget = path.join(baseDir, 'self');
-        }
+        // A14：隐式回退按「工作区形态」挑选，而不是 cwd 下碰巧有个 self 就用。
+        const implicit = [
+          path.join(baseDir, 'self'),
+          path.join(process.cwd(), 'self'),
+          path.join(proj, 'self'),
+        ].filter((c) => looksLikeSelfWorkspace(c));
+        rawTarget = implicit[0] || path.join(baseDir, 'self');
       } else {
         if (fs.existsSync(rawTarget) && !fs.statSync(rawTarget).isDirectory()) {
           rawTarget = path.join(path.dirname(rawTarget), 'self');
@@ -1176,9 +1210,14 @@ export function apply(ctx, config = {}) {
       } catch (_) {}
       candidates.push(path.join(baseDir, 'self'));
       let selfDir = '';
-      for (const c of candidates) {
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
         try {
-          if (fs.existsSync(c) && fs.statSync(c).isDirectory()) { selfDir = c; break; }
+          if (!fs.existsSync(c) || !fs.statSync(c).isDirectory()) continue;
+          // A14：隐式候选必须真的是 qchain 工作区（cwd 下同名目录不算）
+          if (i > 0 && !looksLikeSelfWorkspace(c)) continue;
+          selfDir = c;
+          break;
         } catch (_) {}
       }
       if (!selfDir) {
@@ -1429,9 +1468,16 @@ export function apply(ctx, config = {}) {
           }
         } catch (_) {}
         candidates.push(path.join(baseDir, 'self'));
-        for (const c of candidates) {
+        // A14：隐式候选必须是真工作区（cwd 下同名 self 不算）。注意不能写成
+        // "i > 0"——显式 self_dir 不存在时 cwd/self 就是下标 0，那种写法会
+        // 把它当成显式输入免检，A14 直接失效。
+        const hasExplicit = !!args.self_dir;
+        for (let i = 0; i < candidates.length; i++) {
+          const c = candidates[i];
           try {
-            if (fs.existsSync(c) && fs.statSync(c).isDirectory()) return c;
+            if (!fs.existsSync(c) || !fs.statSync(c).isDirectory()) continue;
+            if (!(hasExplicit && i === 0) && !looksLikeSelfWorkspace(c)) continue;
+            return c;
           } catch (_) {}
         }
         return '';

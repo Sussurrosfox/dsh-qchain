@@ -15,6 +15,12 @@ writer attempt / checker result」，且旧结果不得因文件存在而被复�
   PROV_PATH_OUTSIDE_ALLOWLIST  证据台账写入了写域白名单之外的路径
   PROV_QID_UNPLANNED           正文 qid 未登记于 coverage-map.md
 
+  A21 手工编辑通道（替代"为过血缘硬造一次派发"的规避）：
+  PROV_MANUAL_EDIT_UNKNOWN_SECTION / _BAD_DIGEST / _NO_REASON /
+  _DUPLICATE / _STALE     .pd/manual-edits.json 登记项本身的问题
+  一次登记 = 声明"这一节由人手工改过，当前字节级内容即此"，门禁据此
+  为 writer 链放行；checker 链（语义审读）仍按 digest 绑定，不受豁免。
+
 写域白名单（audit §5.2）：子 Agent 只能写自己的 secN.tex 候选与 .pd/ 下
 的派发/证据/报告文件；main.tex / student.tex / teacher.tex / 其他 section /
 release/ 一律拒绝。
@@ -30,9 +36,13 @@ attempt 与写域核对记 WARNING 跳过——该交付路径未经多 Agent �
 - .pd/agent-calls/*.json       子 Agent 证据台账（output_digests）
 - .pd/semantic/<sec>.json      语义审读结果（checker 链）
 - .pd/shuffle-map.json         打乱血缘台账（摘要迁移豁免）
+- .pd/manual-edits.json        手工编辑登记（A21：writer 链豁免）
 - coverage-map.md              规划登记（qid 覆盖核对）
 
 用法: python check_provenance.py [工作目录] [--json PATH] [--mode full|writer-only]
+      python check_provenance.py <工作目录> --register-manual-edit sec1 \
+          --reason "修正 sec1 题干笔误" [--attested-by 姓名]
+      python check_provenance.py <工作目录> --list-manual-edits
       （writer-only 供 faithful_fast 图的「构建前」使用：跳过 checker 链；
         交付前的正式报告一律 full，且仍是 deliver 的 MUST_PASS 项。）
 退出码: 0 = 通过, 1 = 存在阻断性问题。
@@ -63,7 +73,7 @@ import request_scopes  # noqa: E402  C5：多 scope 授权唯一口径
 import section_scan  # noqa: E402
 
 TOOL_NAME = "check_provenance.py"
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 
 #: 卡15（C6）门禁分层：full=终审/交付；writer-only=构建前（审读证据尚未产生）
 MODE_FULL = "full"
@@ -74,6 +84,12 @@ REQUESTS_DIR_REL = os.path.join(".pd", "agent-requests")
 CALLS_DIR_REL = os.path.join(".pd", "agent-calls")
 SEMANTIC_DIR_REL = os.path.join(".pd", "semantic")
 COVERAGE_MAP_REL = "coverage-map.md"
+MANUAL_EDITS_REL = os.path.join(".pd", "manual-edits.json")
+
+#: A21 手工编辑登记：一次登记 = 为 writer 链放行一节；登记必须绑定当前 digest。
+MANUAL_EDITS_SCHEMA_VERSION = 1
+MANUAL_REASON_MIN_CHARS = 4
+RE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 RE_MAIN_INPUT = section_scan.RE_MAIN_INPUT
 RE_QID_LINE = re.compile(r"^\s*%\s*qid:\s*([^\s%|]+)", re.MULTILINE)
@@ -148,7 +164,116 @@ def _shuffle_bound(record_digest, current_digest, edges):
         return False
 
 
-def _writer_certifies(self_dir, sec, requests, current_digest, edges):
+def load_manual_edits(self_dir):
+    """读取 .pd/manual-edits.json，返回 {section: {"digest","reason","edited_by"}}。
+
+    A21：手工编辑（含 repurpose 派发单改写了别节的副作用）过去只能靠"硬造
+    一次派发"来恢复血缘，一次手工改动 = 一整轮返修。本通道把这件事变成
+    显式登记：登记哪一节、为什么改、改后字节级摘要是什么。
+
+    读取失败/结构不对一律视为"无登记"（安全方向：没登记就没有豁免），
+    条目本身的问题由 validate_manual_edits 报错，不在这里静默吞掉。
+    """
+    path = os.path.join(self_dir, MANUAL_EDITS_REL)
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    raw = data.get("edits")
+    if not isinstance(raw, list):
+        return {}
+    out = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        sec = entry.get("section")
+        if isinstance(sec, str) and sec:
+            out[sec] = {
+                "digest": str(entry.get("digest") or ""),
+                "reason": str(entry.get("reason") or ""),
+                "edited_by": str(entry.get("edited_by") or ""),
+            }
+    return out
+
+
+def validate_manual_edits(self_dir, sections, edits):
+    """校验登记项本身；返回 (errors, warnings)。
+
+    防伪三条：登记的节必须真实存在；摘要必须是 64 位十六进制；必须给理由。
+    重复登记同一节只保留最后一条（写入口保证），这里只报 warning 提醒。
+    """
+    errors, warnings = [], []
+    known = set(sections)
+    seen = set()
+    for sec in sorted(edits):
+        entry = edits[sec]
+        if sec in seen:
+            warnings.append({
+                "code": "PROV_MANUAL_EDIT_DUPLICATE",
+                "detail": "手工编辑登记中 %s 出现多次，仅最后一条生效" % sec})
+        seen.add(sec)
+        if sec not in known:
+            errors.append({
+                "code": "PROV_MANUAL_EDIT_UNKNOWN_SECTION",
+                "detail": "手工编辑登记了不存在的切片 %r（main.tex 未引用），"
+                          "登记无法核对" % sec})
+            continue
+        if not RE_SHA256.match(entry.get("digest") or ""):
+            errors.append({
+                "code": "PROV_MANUAL_EDIT_BAD_DIGEST",
+                "detail": "%s 的手工编辑登记缺合法 sha256 摘要（digest=%r），"
+                          "血缘无从核对" % (sec, entry.get("digest"))})
+            continue
+        if len((entry.get("reason") or "").strip()) < MANUAL_REASON_MIN_CHARS:
+            errors.append({
+                "code": "PROV_MANUAL_EDIT_NO_REASON",
+                "detail": "%s 的手工编辑登记缺少理由（至少 %d 字符）："
+                          "手工改动必须有可追溯的说明"
+                          % (sec, MANUAL_REASON_MIN_CHARS)})
+    return errors, warnings
+
+
+def register_manual_edit(self_dir, sec, reason, attested_by=""):
+    """把 sec 的当前内容登记为手工编辑；返回 (ok, message)。
+
+    登记摘要取**磁盘当前字节**，所以登记必须紧跟在手工改动之后做；
+    之后再改文件而不重新登记，登记即过期（PROV_MANUAL_EDIT_STALE），
+    不会变成永久的免检金牌。
+    """
+    sec_path = os.path.join(self_dir, sec + ".tex")
+    digest = _sha256_file(sec_path)
+    if not digest:
+        return False, "%s.tex 不存在或不可读，无法登记" % sec
+    if len((reason or "").strip()) < MANUAL_REASON_MIN_CHARS:
+        return False, "理由至少 %d 字符（说明改了什么、为什么）" \
+            % MANUAL_REASON_MIN_CHARS
+    path = os.path.join(self_dir, MANUAL_EDITS_REL)
+    data = {"schema_version": MANUAL_EDITS_SCHEMA_VERSION, "edits": []}
+    if os.path.isfile(path):
+        old = _load_json(path)
+        if isinstance(old, dict) and isinstance(old.get("edits"), list):
+            data["edits"] = [e for e in old["edits"] if isinstance(e, dict)]
+    data["edits"] = [e for e in data["edits"] if e.get("section") != sec]
+    entry = {"section": sec, "digest": digest, "reason": reason.strip()}
+    if attested_by:
+        entry["edited_by"] = attested_by
+    data["edits"].append(entry)
+    data["edits"].sort(key=lambda e: str(e.get("section") or ""))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    return True, "已登记 %s 的手工编辑（digest=%s…）→ %s" \
+        % (sec, digest[:12], os.path.relpath(path, self_dir))
+
+
+def _writer_certifies(self_dir, sec, requests, current_digest, edges,
+                      manual=None):
     """是否存在一条证据台账认证「当前切片内容」的写作 attempt。
 
     返回 (ok, detail)：detail 描述最佳候选失败原因（留痕用）。
@@ -156,7 +281,21 @@ def _writer_certifies(self_dir, sec, requests, current_digest, edges):
     卡13（C5）：一个作者可以一次写 1–2 个相邻节，因此「这个派发单是否被授权写
     sec」必须读正规化 scopes（``request_scopes``），不能再拿 ``scope`` 字段做
     独占判定——否则 sec1+sec2 的合批单永远无法为 sec2 认证，来源链必然断裂。
+
+    A21：``manual`` 为手工编辑登记（{section: {digest, reason}}）。登记项
+    摘要与当前字节一致时，视为已声明的人工改动，writer 链放行——这替代了
+    "为了过血缘硬造一次派发"的规避；摘要不一致（登记后又改过）不放行，
+    并在 detail 里指出，避免登记沦为永久免检。
     """
+    if manual:
+        entry = manual.get(sec)
+        if entry:
+            recorded = entry.get("digest") or ""
+            if recorded == current_digest:
+                return True, "manual-edit: %s" % (entry.get("reason") or "")
+            best = ("已有手工编辑登记，但其摘要与当前 %s.tex 不符"
+                    "（登记后又改动过？请重新 --register-manual-edit）" % sec)
+            return False, best
     best = None
     for req in requests:
         artifacts = [a for a in (req.get("artifacts") or [])
@@ -269,7 +408,14 @@ def check_provenance_project(workdir, mode=MODE_FULL):
 
     checked = {"sections": sections, "requests": len(requests),
                "certified": [], "checker": {}, "has_pipeline": has_pipeline,
-               "mode": mode}
+               "manual": [], "mode": mode}
+
+    # A21：手工编辑登记先校验本身，再作为 writer 链的豁免依据
+    manual_edits = load_manual_edits(self_dir)
+    man_errors, man_warnings = validate_manual_edits(
+        self_dir, sections, manual_edits)
+    errors.extend(man_errors)
+    warnings.extend(man_warnings)
 
     for sec in sections:
         sec_path = os.path.join(self_dir, sec + ".tex")
@@ -282,7 +428,7 @@ def check_provenance_project(workdir, mode=MODE_FULL):
         # ---- 1. writer attempt 链 ----
         if has_pipeline:
             ok, detail = _writer_certifies(
-                self_dir, sec, requests, current, edges)
+                self_dir, sec, requests, current, edges, manual_edits)
             if not ok:
                 errors.append({
                     "code": "PROV_WRITER_DIGEST_MISSING",
@@ -290,6 +436,8 @@ def check_provenance_project(workdir, mode=MODE_FULL):
                               "（%s）——旧结果不得因文件存在而复用" % (sec, detail)})
             else:
                 checked["certified"].append(sec)
+                if detail.startswith("manual-edit:"):
+                    checked["manual"].append(sec)
 
             # ---- 2. 写域白名单（只看认证当前内容的证据台账）----
             # 卡13（C5）：授权同样按 scopes 判定——合批单写 sec2 的证据台账也要
@@ -365,7 +513,46 @@ def main(argv=None):
     ap.add_argument("--mode", choices=MODES, default=MODE_FULL,
                     help="full=含 checker 链（终审/交付）；"
                          "writer-only=只查 writer 认证/写域/qid（构建前）")
+    ap.add_argument("--register-manual-edit", metavar="SECTION",
+                    help="A21：登记该切片为手工编辑（摘要取磁盘当前内容），"
+                         "writer 链据此放行；必须同时给 --reason")
+    ap.add_argument("--reason", metavar="TEXT",
+                    help="手工编辑理由（与 --register-manual-edit 连用，"
+                         "至少 %d 字符）" % MANUAL_REASON_MIN_CHARS)
+    ap.add_argument("--attested-by", metavar="NAME", default="",
+                    help="登记人署名（留痕用，可空）")
+    ap.add_argument("--list-manual-edits", action="store_true",
+                    help="列出手工编辑登记后退出")
     args = ap.parse_args(argv)
+
+    workdir = os.path.abspath(args.workdir)
+
+    if args.list_manual_edits:
+        edits = load_manual_edits(workdir)
+        if not edits:
+            print("[check_provenance] 无手工编辑登记（%s）"
+                  % MANUAL_EDITS_REL)
+            return 0
+        sections = expected_sections(workdir)
+        for sec in sorted(edits):
+            entry = edits[sec]
+            digest = entry.get("digest") or ""
+            now = _sha256_file(os.path.join(workdir, sec + ".tex"))
+            state = "有效" if digest == now else "已过期（需重新登记）"
+            print("[check_provenance] %s.tex %s digest=%s… 理由=%s"
+                  % (sec, state, digest[:12], entry.get("reason") or ""))
+            if sec not in sections:
+                print("    （警告：%s 不在 main.tex 的切片清单内）" % sec)
+        return 0
+
+    if args.register_manual_edit:
+        if not args.reason:
+            ap.error("--register-manual-edit 必须同时提供 --reason")
+        ok, msg = register_manual_edit(
+            workdir, args.register_manual_edit, args.reason,
+            attested_by=args.attested_by)
+        print("[check_provenance] %s" % msg)
+        return 0 if ok else 1
 
     res = check_provenance_project(args.workdir, mode=args.mode)
     errors, warnings = res["errors"], res["warnings"]
@@ -406,9 +593,11 @@ def main(argv=None):
 
     checked = res["checked"]
     print("[check_provenance] 通过（模式 %s）：血缘链完整（%d 节 / %d 张派发单，"
-          "认证 %d 节，checker %s）。"
+          "认证 %d 节%s，checker %s）。"
           % (res["mode"], len(checked["sections"]), checked["requests"],
              len(checked["certified"]),
+             ("，其中手工编辑登记 %d 节" % len(checked.get("manual") or []))
+             if checked.get("manual") else "",
              ",".join("%s:%s" % kv for kv in sorted(checked["checker"].items()))
              or ("跳过（writer-only）" if res["mode"] == MODE_WRITER_ONLY else "无")))
     return 0

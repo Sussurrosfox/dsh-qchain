@@ -104,10 +104,16 @@ def seed_evidence(d, req, digests=None, worker="subagent:test-agent",
 def run_gate(d, extra_args=()):
     """跑 check_agent_audit.py，返回 (returncode, report_dict)。"""
     report_path = os.path.join(d, ".pd", "reports", "check_agent_audit.json")
+    env = dict(os.environ, PYTHONUTF8="1")
     proc = subprocess.run(
         [sys.executable, os.path.join(HERE, "check_agent_audit.py"), d,
          "--json", report_path] + list(extra_args),
-        capture_output=True, text=True)
+        capture_output=True, text=True,
+        # TEV_GateCli：Windows 上 text=True 默认按本地代码页（cp936）解子进程
+        # stdout。子进程是 Python、按 UTF-8 输出中文，于是父进程拿 GBK 解 UTF-8，
+        # reader 线程抛 UnicodeDecodeError —— 表现为「偶发失败」。
+        # 双端修正：子进程钉 PYTHONUTF8=1，父进程显式按 UTF-8 收。
+        encoding="utf-8", errors="replace", env=env)
     with open(report_path, "r", encoding="utf-8") as f:
         report = json.load(f)
     return proc.returncode, report

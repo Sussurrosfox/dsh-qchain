@@ -63,6 +63,13 @@ RE_TEACHER_BLOCK = re.compile(
 RE_ANNOUNCE_SOLVED = re.compile(
     r"(求得|解得|算得|化简得|化简为|展开得|代入得|即为|可得|整理得出)"
     r"[^。；\n]{0,30}=")
+# A19：学生作答空白宏的完整集合。\ansspace（双 s）是 header.tex 的定义，
+# \ansace（单 s）是它的 \providecommand 别名（见 tex2cards.py:565-568）；
+# 全仓其余门禁（check_dialogue.py:83、check_numbering.py:404）早已把它们
+# 与 \fillin 同等视为"答案区"。此前的"零填空"判定只认 \fillin，于是
+# "……给出任意两列相等时 $\delta(A)=0$。\ansace{1.0cm}" 这类已经把结论
+# 留给学生落笔的小问，仍被判"未设置任何填空"而连续返修。
+RE_STUDENT_BLANK = re.compile(r"\\(?:fillin|ansspace|ansace)\b")
 
 
 def norm_text(s):
@@ -386,7 +393,7 @@ def check_pedagogy_slice(name, text, problems, warnings, policy=None):
             ep = sub_positions[idx + 1] if idx + 1 < len(sub_positions) else limit
             ep = min(ep, limit)
             sub_text = student_part[sp:ep]
-            if "\\fillin" in sub_text:
+            if RE_STUDENT_BLANK.search(sub_text):
                 continue  # 有学生动作的小问不算旁观
             m_ann = RE_ANNOUNCE_SOLVED.search(sub_text)
             if m_ann:

@@ -213,10 +213,20 @@ def _evidence_baseline(
         evidence.sha256_file(os.path.join(self_dir, "student.html"))
         if fmt in ("html", "both") else None
     )
+    # A24：学生版 HTML 的**内容**身份（卡片 ID + 可见文本）。字节哈希每次
+    # 构建都因 render_html.py:356 的 GENERATED_AT 时间戳而变，验收若只认
+    # 字节就会每次重渲染都整体过期；随 context 下发给验收专员登记，fan-in
+    # 时用它判读「字节变了但内容没变」。
+    student_html_content_sha = (
+        evidence.html_student_content_digest(
+            os.path.join(self_dir, "student.html"))
+        if fmt in ("html", "both") else None
+    )
     return {
         "content_digest": current_digest,
         "student_pdf_sha": student_pdf_sha,
         "student_html_sha": student_html_sha,
+        "student_html_content_sha": student_html_content_sha,
         "output_format": fmt,
     }
 
@@ -740,12 +750,18 @@ def _evaluate_scope(
 
     conclusion = str(rec.get("conclusion") or "").strip().upper()
     entry["conclusion"] = conclusion
+    # A24：字节变但内容身份一致 → 记账（warnings），不判 schema_error
+    a24_warnings: List[str] = []
     problems = evidence.validate_acceptance_json(
         rec,
         current_digest=baseline.get("content_digest"),
         student_pdf_sha=baseline.get("student_pdf_sha"),
         student_html_sha=baseline.get("student_html_sha"),
+        student_html_content_sha=baseline.get("student_html_content_sha"),
+        warnings=a24_warnings,
     )
+    for w in a24_warnings:
+        entry.setdefault("warnings", []).append(str(w))
     if problems:
         entry["error"] = "schema_error: " + "; ".join(str(p) for p in problems)
         return entry, rec
@@ -994,6 +1010,9 @@ def node_t4_plan_review(state: ShrinkCoursewareState) -> Dict[str, Any]:
                 "content_digest": baseline["content_digest"],
                 "student_pdf_sha256": baseline["student_pdf_sha"],
                 "student_html_sha256": baseline["student_html_sha"],
+                # A24：HTML 内容身份（渲染层无关），供验收记录登记
+                "student_html_content_digest": baseline.get(
+                    "student_html_content_sha"),
                 "output_format": baseline["output_format"],
             },
             scope=sec,

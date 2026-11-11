@@ -75,8 +75,29 @@ class FixtureMixin(unittest.TestCase):
 
     STUDENT_PDF = b"%PDF-1.4 fake student artifact\n"
     TEACHER_PDF = b"%PDF-1.4 fake teacher artifact\n"
-    STUDENT_HTML = b"<html>student</html>\n"
-    TEACHER_HTML = b"<html>teacher</html>\n"
+    # A24：内容身份要能从 student.html 里解析出卡片页，故夹具须带真实
+    # qc-card 结构（render_html.render_card 同构）。纯 "<html>student</html>"
+    # 解析不出卡片 → html_student_content_digest 返回 None → realign 按
+    # fail-close 不盖章，测试反而学不到"内容身份一起重盖"这一行为。
+    STUDENT_HTML = (
+        '<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
+        "<title>t</title></head>\n<body>\n"
+        '<section class="qc-card" id="qc-card-CARD-01">\n'
+        '  <div class="qc-card-head"><span class="qc-kind">QA</span>'
+        '<span class="qc-qid">sec1-q1</span></div>\n'
+        '  <div class="qc-card-body"><div class="qc-stem">sec1 stem text'
+        "</div></div>\n"
+        '  <div class="qc-card-foot">page 1 / 1</div>\n'
+        "</section>\n</body></html>\n"
+    ).encode("utf-8")
+    TEACHER_HTML = (
+        '<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
+        "<title>t</title></head>\n<body>\n"
+        '<section class="qc-card" id="qc-card-CARD-01">\n'
+        '  <div class="qc-card-body"><div class="qc-stem">sec1 stem text'
+        "</div></div>\n"
+        "</section>\n</body></html>\n"
+    ).encode("utf-8")
 
     def setUp(self):
         self.d = tempfile.mkdtemp(prefix="redeliver-test-")
@@ -207,14 +228,20 @@ class TestRealign(FixtureMixin):
         original = copy.deepcopy(rec)
         digs = self._digs()
         changes = redeliver.realign_acceptance(
-            rec, digs["content_digest"], digs["pdf_sha256"], digs["html_sha256"])
+            rec, digs["content_digest"], digs["pdf_sha256"], digs["html_sha256"],
+            digs.get("html_content_sha256"))
 
         self.assertEqual(rec["content_digest"], digs["content_digest"])
         self.assertEqual(rec["student_pdf_sha256"],
                          sha256_bytes(self.STUDENT_PDF))
         self.assertEqual(rec["student_html_sha256"],
                          sha256_bytes(self.STUDENT_HTML))
-        self.assertEqual(len(changes), 3)
+        # A24：内容身份与字节哈希一起重盖章（4 项 = content_digest + pdf +
+        # html 字节 + html 内容身份）；审读记录原文仍不动
+        self.assertEqual(rec[evidence.HTML_CONTENT_FIELD],
+                         evidence.html_student_content_digest(
+                             os.path.join(self.self_dir, "student.html")))
+        self.assertEqual(len(changes), 4)
         # 审读记录原文与其他字段不动
         for k in ("scope", "reviewed_qids", "conclusion", "reviewer_role",
                   "stage1_record", "stage2_record", "issues", "schema_version"):

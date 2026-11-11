@@ -28,7 +28,8 @@ r"""check_fidelity.py — 来源忠实性确定性门禁（audit §18.6）。
 - source-map.md              F2 映射契约：source_id -> scope ->
                              action -> status -> reason
 - coverage-map.md            F2 覆盖契约（source_ids/action/new_objects）
-- sec*.tex                   正文切片（% source: / % bridge: 锚点）
+- sec*.tex                   正文切片（% source: / % bridge: 锚点；
+                             % fidelity-gap: 资产豁免申报，A20）
 
 用法: python check_fidelity.py [工作目录] [--json PATH]
 退出码: 0 = 通过, 1 = 存在阻断性问题。
@@ -52,7 +53,7 @@ if HERE not in sys.path:
 import evidence  # noqa: E402（scripts/ 已在 sys.path）
 
 TOOL_NAME = "check_fidelity.py"
-TOOL_VERSION = "1.1"
+TOOL_VERSION = "1.2"
 
 MANIFEST_REL = os.path.join(".pd", "source-manifest.json")
 CONTRACT_REL = os.path.join(".pd", "intent-contract.json")
@@ -79,6 +80,19 @@ RE_ASSET_FIGURE = re.compile(
     r"\\includegraphics(?=[\[{])|\\begin\{(?:tikzcd|tikzpicture)\}")
 #: 表格类资产：\begin{tabular} / \begin{tabular*}（不含 array/tabularx）。
 RE_ASSET_TABLE = re.compile(r"\\begin\{tabular\*?\}")
+#: A20：显式资产豁免锚点。 prompts/subagent_prompt.md:127 与
+#: prompts/acceptance_prompt.md:73 承诺"对确实无法转换或保留的资产，必须
+#: 在产物中显式给出 gap 清单（逐项列出源行号、环境名、缺失原因与建议处置）"，
+#: 但门禁此前只做计数、没有任何 gap 清单的解析通路——按契约写 gap 注释的
+#: 作者照样被判 FIDELITY_ASSET_LOST（生产实证：sec2 第 75/101 行的 gap
+#: 占位注释触发 dsp-repair-sec2-2d5b028478 返修）。本锚点把契约里的
+#: "gap 清单"落成可核验格式：
+#:   % fidelity-gap: SRC-026 figure L75 | 原图为手写扫描，栅格化后不可读
+RE_ASSET_GAP = re.compile(
+    r"^\s*%\s*fidelity-gap:\s*(SRC-\d+)\s+(figure|table)\s+L?(\d+)\s*"
+    r"(?:\||\s)\s*(.+?)\s*$", re.IGNORECASE)
+#: gap 理由的最短长度（剥掉标点后的实义字符数），防止 "无"/"-" 之类空话。
+GAP_REASON_MIN_CHARS = 4
 #: 单元 locator 的行号区间（如 "§ 2.4.1 定义 L12-80"）。
 RE_LOCATOR_LINES = re.compile(r"L(\d+)-(\d+)\s*$")
 #: novelty 归一时要剥掉的括号补充说明（捕获括号内文字，供"是否只是空话"判定）。
@@ -357,7 +371,34 @@ def _scan_asset_lines(text):
     return found
 
 
-def check_asset_conservation(workdir, manifest, units, rows=None):
+def parse_asset_gaps(self_dir):
+    """扫描 sec*.tex 中的 ``% fidelity-gap:`` 锚点（A20）。
+
+    返回 [(source_id, kind, source_lineno, reason, sec_name, line_idx)]。
+    锚点是 TeX 注释，必须读原始行（不剥注释）。
+    """
+    found = []
+    if not os.path.isdir(self_dir):
+        return found
+    for name in sorted(os.listdir(self_dir)):
+        if not RE_SEC_TEX.match(name) or name == "sec_template.tex":
+            continue
+        path = os.path.join(self_dir, name)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for idx, line in enumerate(lines):
+            m = RE_ASSET_GAP.match(line)
+            if m:
+                found.append((m.group(1).upper(), m.group(2).lower(),
+                              int(m.group(3)), m.group(4).strip(),
+                              name, idx))
+    return found
+
+
+def check_asset_conservation(workdir, manifest, units, rows=None, gaps=None):
     """第 8 项：源文档视觉/结构资产守恒对账。
 
     源侧：按 manifest 读取各 include 源文件原文，统计两类资产行号；用
@@ -367,6 +408,12 @@ def check_asset_conservation(workdir, manifest, units, rows=None):
     产物侧：连接 self/sec*.tex 同口径统计。守恒判定：产物侧各类总数
     >= 源侧应保留总数，否则 FIDELITY_ASSET_LOST。
 
+    A20：gaps 为 parse_asset_gaps 的结果——作者按 prompts 契约显式申报的
+    资产豁免。申报即从"应保留"集合中扣除，但每条申报都要过四项校验
+    （单元已登记 / 源侧确有该资产 / 理由非空话 / 产物侧并未真的保留），
+    所以门禁的牙齿不减：只是把"必须原样搬进来"从唯一通路变成"搬进来
+    或给出可核验理由"两条通路。
+
     rows 为 source-map.md 解析行（source_id -> scope），用于在缺失报文里
     指明每个资产“应迁入哪个切片”：scope 命中现有切片用该切片，doc-infra /
     未登记等非切片范围并入末尾切片（学案无独立基础设施切片，致谢/页脚类
@@ -374,7 +421,7 @@ def check_asset_conservation(workdir, manifest, units, rows=None):
     REPAIR_SECTION 而不是无目标地 REPLAN 回 T1。
 
     返回 (problems, warnings, stats)；stats = {"source_kept": {...},
-    "output": {...}}（各类计数），供报告 checked 区入账。
+    "output": {...}, "declared_gaps": N}（各类计数），供报告 checked 区入账。
     """
     problems, warnings = [], []
     project_root = manifest.get("project_root") or os.path.dirname(workdir)
@@ -464,9 +511,67 @@ def check_asset_conservation(workdir, manifest, units, rows=None):
             for kind in ("figure", "table"):
                 prod[kind].extend((name, ln) for ln in found[kind])
 
+    # ---- A20：显式资产豁免申报的校验与扣除 ----
+    unit_ids = {u.get("source_id") for u in units if u.get("source_id")}
+    excluded_ids = {u.get("source_id") for u in units
+                    if u.get("disposition") == "excluded"}
+    # locator 无法解析的单元：其资产按"应保留"兜底计入，申报也无从核对
+    locator_unknown = {u.get("source_id") for u in units
+                       if not RE_LOCATOR_LINES.search(
+                           str(u.get("locator") or ""))}
+    # (sid, source_lineno) -> 源侧真实资产行号集合（按 kind）
+    real_assets = {}
+    for sf, entries in ranges.items():
+        for lo, hi, sid, _disp in entries:
+            for ln in range(lo, hi + 1):
+                real_assets.setdefault((sid, ln), set()).add(sf)
+    declared = set()          # (sid, kind, source_lineno) 已核验通过的豁免
+    for sid, kind, ln, reason, sec_name, line_idx in (gaps or []):
+        if sid not in unit_ids:
+            problems.append({
+                "code": "FIDELITY_GAP_UNKNOWN_SOURCE",
+                "detail": "%s 第 %d 行的 fidelity-gap 申报引用了未登记的单元 %s"
+                          % (sec_name, line_idx + 1, sid)})
+            continue
+        if sid in excluded_ids:
+            warnings.append({
+                "code": "FIDELITY_GAP_REDUNDANT",
+                "detail": "%s 第 %d 行申报豁免 %s，但该单元已被用户排除，无需重复申报"
+                          % (sec_name, line_idx + 1, sid)})
+            continue
+        if len(reason.strip(_NOVELTY_PUNCT)) < GAP_REASON_MIN_CHARS:
+            problems.append({
+                "code": "FIDELITY_GAP_NO_REASON",
+                "detail": "%s 第 %d 行的 fidelity-gap 缺少可核验理由（需 ≥%d 个实义字符，"
+                          "写明源行号、缺失原因与建议处置），当前理由：%r"
+                          % (sec_name, line_idx + 1, GAP_REASON_MIN_CHARS, reason)})
+            continue
+        if sid in locator_unknown:
+            warnings.append({
+                "code": "FIDELITY_GAP_LOCATOR_UNKNOWN",
+                "detail": "%s 第 %d 行申报豁免 %s L%d，但该单元 locator 行号无法解析，"
+                          "仅登记不扣除" % (sec_name, line_idx + 1, sid, ln)})
+            continue
+        if (sid, ln) not in real_assets:
+            problems.append({
+                "code": "FIDELITY_GAP_NO_SUCH_ASSET",
+                "detail": "%s 第 %d 行申报豁免 %s %s 类 L%d，但源侧该位置没有对应资产"
+                          "（防止伪造豁免）" % (sec_name, line_idx + 1, sid, kind, ln)})
+            continue
+        if any(s == sec_name for s, _l in prod[kind]):
+            warnings.append({
+                "code": "FIDELITY_GAP_STALE",
+                "detail": "%s 第 %d 行申报豁免 %s L%d，但该切片仍保留 %s 类资产，申报可能过期"
+                          % (sec_name, line_idx + 1, sid, ln, kind)})
+            continue
+        declared.add((sid, kind, ln))
+
     # ---- 守恒判定 ----
     for kind in ("figure", "table"):
-        need, got = len(kept[kind]), len(prod[kind])
+        need_all, got = len(kept[kind]), len(prod[kind])
+        kept[kind] = [e for e in kept[kind]
+                      if (e[2], kind, e[1]) not in declared]
+        need = len(kept[kind])
         if got < need:
             # 按目标切片归因“仍未配齐”的资产：产物侧现有资产先抵扣各目标
             # 切片的应保留数，清单只列抵扣后仍有缺口的切片内资产（源序取
@@ -504,16 +609,20 @@ def check_asset_conservation(workdir, manifest, units, rows=None):
                              for t in dict.fromkeys(targets))
             problems.append({
                 "code": "FIDELITY_ASSET_LOST",
-                "detail": "%s类资产不守恒：源侧应保留 %d 个，产物 sec*.tex "
-                          "仅 %d 个，缺失 %d 个。仍未配齐的资产清单（按目标"
-                          "切片归因，请人工核对 tikz 栅格化等合法置换）: %s%s。"
-                          "按 source-map 输出范围仍未配齐: %s"
-                          % (ASSET_KIND_LABEL[kind], need, got, need - got,
-                             listing, more, tsum or "无法定位")})
+                "detail": "%s类资产不守恒：源侧应保留 %d 个（已核验豁免 %d 个），"
+                          "产物 sec*.tex 仅 %d 个，缺失 %d 个。仍未配齐的资产清单"
+                          "（按目标切片归因，请人工核对 tikz 栅格化等合法置换）: "
+                          "%s%s。按 source-map 输出范围仍未配齐: %s。确实无法转换或"
+                          "保留的资产，请在目标切片内写 "
+                          "%% fidelity-gap: <SRC编号> <figure|table> L<源行号> | <原因与建议处置> "
+                          "申报豁免（理由须可核验）"
+                          % (ASSET_KIND_LABEL[kind], need, len(declared), got,
+                             need - got, listing, more, tsum or "无法定位")})
 
     stats = {
         "source_kept": {k: len(kept[k]) for k in kept},
         "output": {k: len(prod[k]) for k in prod},
+        "declared_gaps": len(declared),
     }
     return problems, warnings, stats
 
@@ -767,7 +876,7 @@ def check_fidelity_project(workdir):
 
     # ---- 8. 资产守恒对账（源文档视觉/结构资产 vs 产物 sec*.tex）----
     asset_problems, asset_warnings, asset_stats = check_asset_conservation(
-        workdir, manifest, units, rows)
+        workdir, manifest, units, rows, parse_asset_gaps(workdir))
     errors.extend(asset_problems)
     warnings.extend(asset_warnings)
 

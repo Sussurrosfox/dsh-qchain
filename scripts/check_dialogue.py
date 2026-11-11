@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-TOOL_VERSION = "1.2"
+TOOL_VERSION = "1.3"
 r"""
 check_dialogue.py — 对话层（sectiondialogue / exampledialogue）结构与泄露检查
 
@@ -49,6 +49,14 @@ check_dialogue.py — 对话层（sectiondialogue / exampledialogue）结构与�
      指示词；末句含断言标志词则判失败；
  14. check_conflict_density：对话块中必须至少含 2 处认知冲突触发词。
 
+  A18 修复（v1.3）：
+ 15. `% dialogue: qid=<入口题qid>` 绑定注释允许写在 \begin{exampledialogue}
+     之前（紧邻的注释/空行区间内），不强制移进块内；
+ 16. 泄露判定三条假阳性豁免：\begin{sectiondialogue}[标题] 的方括号标题
+     参数不算台词；以 ？/? 结尾的设问句不参与判定；sectiondialogue 只对
+     含数学记号的答案做判定（纯文字答案是学科固有词汇）。完整悬置词表见
+     _SUSPENSION_WORDS（14 个，运行时/文档/错误文案同源生成）。
+
   未使用对话层的旧工程（无任何对话块）一律通过，行为完全不变。
 
 退出码: 0=通过, 1=发现问题, 2=缺少依赖或输入。
@@ -65,7 +73,7 @@ for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from check_numbering import strip_comment, sec_inputs, _scan_bracket, _scan_brace  # noqa: E402
+from check_numbering import strip_comment, sec_inputs, scan_bracket, _scan_brace  # noqa: E402
 from gen_config import load_config  # noqa: E402
 import evidence  # noqa: E402
 
@@ -158,6 +166,11 @@ def scan_file(workdir, name):
       items         probchain 一级题目 [{line,qid,mode}]（按出现顺序）
       offs          {off-section/off-example: (行号, 理由)}
       qids          本文件全部题目 qid -> 题目起始行号
+    A18-1：绑定注释 `% dialogue: qid=<入口题qid>` 允许写在
+    `\begin{exampledialogue}` 之前——只要它落在紧邻该 begin 的注释/空行
+    区间内即视为有效（作者习惯把注释写在环境标签上方）。写在块内仍兼容。
+    A18-2a：`\begin{sectiondialogue}[标题]` 的方括号参数是环境标签而非
+    台词，start_col 跳过它，否则标题里的术语会被当成"说出的答案"。
     """
     path = os.path.join(workdir, name)
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -172,6 +185,7 @@ def scan_file(workdir, name):
     stack = []          # [env, start_line]
     cur_dlg = None
     pending_qid = None
+    pre_dlg_qid = None   # A18-1：写在 \begin{...} 之前的绑定注释
     cur_item = None
 
     def close_dialogue(end_line):
@@ -192,13 +206,18 @@ def scan_file(workdir, name):
         if mq:
             pending_qid = mq.group(1)
         md = DLG_QID.match(raw)
-        if md and cur_dlg is not None:
-            cur_dlg["qid"] = md.group(1)
+        if md:
+            if cur_dlg is not None:
+                cur_dlg["qid"] = md.group(1)
+            else:
+                # A18-1：注释写在 \begin 之前（紧邻的注释/空行区间内）同样有效
+                pre_dlg_qid = md.group(1)
         mo = DLG_OFF.match(raw)
         if mo:
             offs[mo.group(1)] = (lineno, mo.group(2).strip())
 
         line = strip_comment(raw)
+        dlg_began = False
         for m in TOKEN.finditer(line):
             tok = m.group(0)
             if tok.startswith("\\item"):
@@ -230,9 +249,24 @@ def scan_file(workdir, name):
                 if env in DIALOGUE_ENVS:
                     close_dialogue(lineno)  # 防御：上一块未闭合先结算
                     # 记录精确范围（begin token 之后起算），内容计数延后统一处理
+                    start_col = m.end()
+                    # A18-2a：跳过 \begin{sectiondialogue}[标题] 的方括号参数。
+                    # 该参数是环境标签（作者的引导语），不是任何角色说出的台词；
+                    # 不跳过就会把标题里的术语当成答案泄露——sec3
+                    # `\begin{sectiondialogue}[交换两列，值变不变]` 即此坑。
+                    k = m.end()
+                    while k < len(line) and line[k] in " \t":
+                        k += 1
+                    if k < len(line) and line[k] == "[":
+                        k2, _title, _ok = scan_bracket(line, k)
+                        if _ok:
+                            start_col = k2
                     cur_dlg = {"env": env, "start": lineno, "end": None,
-                               "start_col": m.end(), "end_col": None,
-                               "speakers": 0, "qid": None, "forbidden": []}
+                               "start_col": start_col, "end_col": None,
+                               "speakers": 0,
+                               "qid": pre_dlg_qid, "forbidden": []}
+                    pre_dlg_qid = None
+                    dlg_began = True
                 stack.append([env, lineno])
             else:  # end
                 if stack and stack[-1][0] == env:
@@ -246,6 +280,10 @@ def scan_file(workdir, name):
                 if env in DIALOGUE_ENVS and cur_dlg is not None:
                     cur_dlg["end_col"] = m.start()  # end token 之前为止
                     close_dialogue(lineno)
+        # A18-1：实质性内容出现即让"块前绑定注释"失效，防止把远处某个注释
+        # 误绑到后面的对话块（注释行与空行 strip 后为空，不会打断）。
+        if line.strip() and not dlg_began:
+            pre_dlg_qid = None
     finish_item()
     if cur_dlg is not None:
         cur_dlg["end"] = len(lines)
@@ -427,7 +465,7 @@ def _scan_fillin_answers_block(text):
         while k < len(text) and text[k] in " \t\n":
             k += 1
         if k < len(text) and text[k] == "[":
-            k, ans, closed = _scan_bracket(text, k)
+            k, ans, closed = scan_bracket(text, k)
             if closed and ans.strip():
                 answers.append(ans.strip())
             pos = k
@@ -442,6 +480,16 @@ def check_fillin_leak(name, s, scanned_lines, problems):
     C3 修复：① 支持跨行 fillin 答案；② sectiondialogue 同样受检
     （其位置在全部题目之前，任何答案都构成剧透，与全部题目答案比对）；
     ③ 判定使用 _is_leak（含子串包含）。
+
+    A18 修复（三条假阳性豁免，均只放宽判定、不删规则）：
+    A18-2b 设问句豁免：台词行以 ？/? 结尾时该行不参与判定。设问是在
+      "提出"术语（"这形状为何偏偏成立？"），不是在"给出"答案；真泄露是
+      断言句（"所以答案是 D_1/D"）。sec1「分子」、sec4「$D_1/D$」即此坑。
+    A18-2c sectiondialogue 纯文字答案豁免：sectiondialogue 位于全部题目
+      之前、承担话题热身职能，只对含数学记号的答案（$D_1/D$、公式、数值）
+      做判定；纯中文/英文词答案（分子/不变/变号/转置定理）是学科固有
+      词汇，对话里出现不等于剧透——sec8 两个答案即此坑。exampledialogue
+      绑定到具体题目、紧跟题干，仍做全量检查。
     """
     blocks = s["blocks"]
     qids = s["qids"]
@@ -456,7 +504,9 @@ def check_fillin_leak(name, s, scanned_lines, problems):
             continue
 
         if b["env"] == "sectiondialogue":
-            fillin_answers = all_answers
+            # A18-2c：只保留含数学记号的答案（见函数 docstring）
+            fillin_answers = [a for a in all_answers
+                              if not _is_textual_answer(a)]
         else:
             if b["qid"] is None:
                 continue
@@ -483,18 +533,8 @@ def check_fillin_leak(name, s, scanned_lines, problems):
             continue
 
         # 提取对话块台词文本（非 \dlgteacher 部分）
-        dlg_text_lines = []
-        for ln in range(b["start"], b["end"] + 1):
-            raw_line = lines[ln - 1]
-            # 跳过 \dlgteacher 行（教师专属）
-            if r"\dlgteacher" in raw_line:
-                continue
-            text = strip_comment(raw_line)
-            if ln == b["start"]:
-                text = text[b["start_col"]:]
-            if ln == b["end"] and b["end_col"] is not None:
-                text = text[:b["end_col"]]
-            dlg_text_lines.append((ln, text))
+        # A18-2b：按 \\speaker 拆出台词，在台词上判定，不在原始行上判定。
+        dlg_text_lines = _iter_speaker_speeches(b, lines)
 
         # 对每个 fillin answer token 扫描台词
         for ans in fillin_answers:
@@ -502,6 +542,10 @@ def check_fillin_leak(name, s, scanned_lines, problems):
             for ln, text in dlg_text_lines:
                 if found_leak:
                     break
+                # A18-2b：设问句豁免。以 ？/? 结尾的台词是在"提出"术语，
+                # 不是在"给出"答案；真泄露形态是断言句。
+                if text.rstrip().endswith(("？", "?")):
+                    continue
                 # C3：片段提取覆盖 CJK 连续片段（纯中文答案此前永不参与比对）
                 math_frags = re.findall(
                     r"\$[^$]+\$|[A-Za-z\\][^\s,;！？!?。，]{2,}"
@@ -518,10 +562,56 @@ def check_fillin_leak(name, s, scanned_lines, problems):
 
 
 # 规则 B：末句悬置检测
-_SUSPENSION_INDICATORS = re.compile(
-    r"验算|计算|证明|检验|究竟|能否|谁对|动笔|算一算|写出|代入|核验|检查|验证")
+# A18-3：词表以元组为唯一真源，regex、模块 docstring、错误文案全部由它生成，
+# 杜绝"运行时词表比文档长"的漂移（作者看不到完整要求就必然多轮返修）。
+_SUSPENSION_WORDS = (
+    "验算", "计算", "证明", "检验", "究竟", "能否", "谁对",
+    "动笔", "算一算", "写出", "代入", "核验", "检查", "验证",
+)
+_SUSPENSION_INDICATORS = re.compile("|".join(_SUSPENSION_WORDS))
+_SUSPENSION_HINT = "/".join(_SUSPENSION_WORDS)
 _PREMATURE_RESOLUTION = re.compile(
     r"由此可见|必然成立|所以答案是|显然等于|因此等于|可以得到|由上可知|结论是")
+
+
+def _iter_speaker_speeches(b, lines):
+    """产出块内每个 \\speaker{角色}{台词} 的 (行号, 台词)（A18-2b）。
+
+    必须在台词上做"设问句豁免"：原始行是 `\\speaker{B}{...？}`，行尾是
+    `}` 而不是问号，直接 endswith("？") 永假（A18 首版即此坑）。
+    """
+    seg = []
+    for ln in range(b["start"], b["end"] + 1):
+        raw = lines[ln - 1]
+        if r"\dlgteacher" in raw:
+            continue
+        text = strip_comment(raw)
+        if ln == b["start"]:
+            text = text[b["start_col"]:]
+        if ln == b["end"] and b["end_col"] is not None:
+            text = text[:b["end_col"]]
+        seg.append((ln, text))
+    out = []
+    for ln, text in seg:
+        pos = 0
+        while True:
+            idx = text.find("\\speaker{", pos)
+            if idx < 0:
+                break
+            k = idx + len("\\speaker")
+            k, _role, ok1 = _scan_brace(text, k)
+            if not ok1:
+                break
+            while k < len(text) and text[k] in " \t":
+                k += 1
+            if k >= len(text) or text[k] != "{":
+                break
+            k, speech, ok2 = _scan_brace(text, k)
+            if not ok2:
+                break
+            out.append((ln, speech))
+            pos = k
+    return out
 
 
 def _extract_last_speaker_text(b, lines):
@@ -568,7 +658,7 @@ def check_suspension_ending(name, b, lines, problems):
 
     检测逻辑：
     1. 末句必须以 ？/?/！/! 结尾；
-    2. 末句必须含悬置指示词（验算/计算/证明/检验/究竟/能否/谁对）之一；
+    2. 末句必须含悬置指示词之一（词表见 _SUSPENSION_WORDS）；
     3. 末句若含断言标志词（由此可见/必然成立/所以答案是/显然等于），判定失败。
     """
     last_text, last_ln = _extract_last_speaker_text(b, lines)
@@ -588,9 +678,9 @@ def check_suspension_ending(name, b, lines, problems):
     elif not ends_with_question or not has_suspension:
         problems.append(
             "%s:%d: [ERROR] dialogue-suspension-missing: 对话末句不符合悬置原则——"
-            "须以 ？/！/？/! 结尾且含【验算/计算/证明/检验/究竟/能否/谁对】等悬置指示词"
+            "须以 ？/！/？/! 结尾且含悬置指示词【%s】"
             "（当前末句：%s）"
-            % (name, last_ln, last_text[:80]))
+            % (name, last_ln, _SUSPENSION_HINT, last_text[:80]))
 
 
 # 规则 C：认知冲突密度检测

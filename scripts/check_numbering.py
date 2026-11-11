@@ -138,12 +138,24 @@ def sec_key(name):
     return (int(m.group(1)) if m else 0, name)
 
 
-def _scan_bracket(text, k):
-    """从 text[k]=='[' 起扫描配对 ]（\\ 转义与 {} 分组感知）；
-    返回 (新位置, 内容, 是否闭合)。"""
+def scan_bracket(text, k):
+    r"""从 text[k]=='[' 起扫描配对 ]（\ 转义、{} 分组与 [] 嵌套感知）；
+    返回 (新位置, 内容, 是否闭合)。
+
+    A17：方括号必须按深度配对，不能"遇第一个 ] 即闭合"。\fillin 的答案/选项
+    参数里写列向量、区间、矩阵记号时（如 \fillin[\det([\bm a_2,\bm a_1])]{2cm}
+    [\det([\bm a_2,\bm a_1])/\cdots/\cdots]），旧实现会把参数截断成
+    \det([\bm a_2,\bm a_1，其后紧跟的字符不再是 {宽度}，整个 \fillin 被静默
+    跳过——选择题化填空门禁对它失效、shuffle 失去重排依据。同口径的正确实现
+    早已存在于 compare_versions.py:70-97 extract_fillin_answers（只做 [] 深度，
+    不做 {} 分组）；此处取两者并集：[] 与 {} 都按深度配对。
+
+    \ 转义保证 \[ ... \] 显示数学定界符不会被当成参数边界（\[ 与 \] 作为
+    转义对整体吃掉）。
+    """
     n = len(text)
     k += 1
-    buf, brace, closed = [], 0, False
+    buf, brace, sq, closed = [], 0, 1, False
     while k < n:
         c = text[k]
         if c == "\\" and k + 1 < n:
@@ -155,13 +167,22 @@ def _scan_bracket(text, k):
             brace += 1
         elif c == "}" and brace > 0:
             brace -= 1
-        elif c == "]" and brace == 0:
-            closed = True
-            k += 1
-            break
+        elif c == "[":
+            sq += 1
+        elif c == "]":
+            if sq > 1:
+                sq -= 1
+            elif brace == 0:
+                closed = True
+                k += 1
+                break
         buf.append(c)
         k += 1
     return k, "".join(buf), closed
+
+
+# 历史私有名保留：模块内旧调用点与外部脚本都在用
+_scan_bracket = scan_bracket
 
 
 def _scan_brace(text, k):
@@ -199,7 +220,7 @@ def scan_fillins(text):
             k += 1
         answer = None
         if k < n and text[k] == "[":
-            k, answer, ok = _scan_bracket(text, k)
+            k, answer, ok = scan_bracket(text, k)
             if not ok:
                 i = k
                 continue
@@ -216,7 +237,7 @@ def scan_fillins(text):
             k += 1
         options = None
         if k < n and text[k] == "[":
-            k, options, ok = _scan_bracket(text, k)
+            k, options, ok = scan_bracket(text, k)
             if not ok:
                 i = k
                 continue
@@ -226,18 +247,24 @@ def scan_fillins(text):
 
 
 def split_options(text, sep="/"):
-    r"""切分选项，支持 {} 嵌套保护与 \/ 转义。
+    r"""切分选项，支持 {} 与 [] 嵌套保护、\/ 转义。
 
     规则：
     1. 在花括号 {} 内的 sep（如 {\mathbf{Z}/p\mathbf{Z}}）不作为分隔符；
-    2. 紧跟反斜杠的 \sep (如 \/) 为转义字符，不作为分隔符；
-    3. 顶层未转义的 sep 作为选项分隔符。
+    2. 在方括号 [] 内的 sep 同样不作为分隔符——区间/列向量选项
+       （如 [0,\pi/2]/[0,\pi]/[0,1]）里的 / 属于数学记号，不是选项分隔符；
+    3. 紧跟反斜杠的 \sep (如 \/) 为转义字符，不作为分隔符；
+    4. 顶层未转义的 sep 作为选项分隔符。
+
+    A17：第 2 条是补上的。原来只保护 {}，导致 [0,\pi/2] 被切成
+    "[0,\pi" 与 "2]" 两段，参考答案比对必然失败（误报「不在选项中」）。
     """
     if text is None:
         return []
     items = []
     buf = []
     brace_depth = 0
+    bracket_depth = 0
     i = 0
     n = len(text)
     while i < n:
@@ -259,7 +286,14 @@ def split_options(text, sep="/"):
             if brace_depth > 0:
                 brace_depth -= 1
             buf.append(c)
-        elif c == sep and brace_depth == 0:
+        elif c == "[":
+            bracket_depth += 1
+            buf.append(c)
+        elif c == "]":
+            if bracket_depth > 0:
+                bracket_depth -= 1
+            buf.append(c)
+        elif c == sep and brace_depth == 0 and bracket_depth == 0:
             items.append("".join(buf))
             buf = []
         else:

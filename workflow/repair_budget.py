@@ -28,6 +28,7 @@
 
 import hashlib
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -107,25 +108,45 @@ def issue_fingerprint(scope: str, issues: Optional[List[Dict[str, Any]]] = None,
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def resolve_limits(state: Dict[str, Any]) -> Tuple[int, Optional[int], str]:
+def resolve_limits(state: Dict[str, Any],
+                   config: Optional[Dict[str, Any]] = None
+                   ) -> Tuple[int, Optional[int], str]:
     """(per_scope_limit, total_limit|None, profile)。
 
     F4（冻结优先）：Phase 0 把 ``repair_max_per_scope`` / ``repair_max_total``
     冻结进 ``state["execution_config"]``，但旧实现只读 profile 默认值与顶层
     ``repair_per_scope_limit``/``repair_total_limit``——冻结的 1/1 被读成 2/6，
-    预算上限形同虚设。现在的优先级：
-      冻结 execution_config > 显式 state 覆盖 > profile 默认。
+    预算上限形同虚设。优先级：
+      冻结 execution_config > 显式 state 覆盖 > config.yaml > profile 默认。
+
+    A5：新增 ``config`` 一层。此前想放宽上限只有一条路——拿 msgpack 二进制改
+    checkpoint 里的 ``repair_per_scope_limit``（写 ASCII 会损坏状态、填 str 会崩
+    ``apply_writes``），等于把运维动作降级成逆向工程。现在 ``self/config.yaml``
+    的扁平键 ``repair_per_scope_limit`` / ``repair_total_limit`` 就是正式通道，
+    返修节点每轮现读现用（运行中改一行 YAML 下一轮即生效，不必动 checkpoint）。
     """
     profile = "fast" if state.get("execution_profile") == FAST_PROFILE else "legacy"
     per_scope = FAST_PER_SCOPE_LIMIT if profile == "fast" else LEGACY_PER_SCOPE_LIMIT
     total: Optional[int] = FAST_TOTAL_LIMIT if profile == "fast" else LEGACY_TOTAL_LIMIT
     frozen = state.get("execution_config")
     frozen = frozen if isinstance(frozen, dict) else {}
+    cfg = config if isinstance(config, dict) else {}
 
     def _limit(key: str) -> Optional[int]:
         value = frozen.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
+        return None
+
+    def _as_int(value: Any) -> Optional[int]:
+        """config.yaml 的取值可能是 int 或字符串；非法/负数一律视为未设置。"""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            n = int(value.strip())
+            return n if n >= 0 else None
         return None
 
     frozen_scope = _limit("repair_max_per_scope")
@@ -143,11 +164,19 @@ def resolve_limits(state: Dict[str, Any]) -> Tuple[int, Optional[int], str]:
     if frozen_total is None and isinstance(ov_total, int) \
             and not isinstance(ov_total, bool) and ov_total >= 0:
         total = ov_total
+    # A5：config.yaml 通道（弱于 state 显式覆盖、强于 profile 默认）
+    cfg_scope = _as_int(cfg.get("repair_per_scope_limit"))
+    if frozen_scope is None and not isinstance(ov_scope, int) and cfg_scope is not None:
+        per_scope = cfg_scope
+    cfg_total = _as_int(cfg.get("repair_total_limit"))
+    if frozen_total is None and not isinstance(ov_total, int) and cfg_total is not None:
+        total = cfg_total
     return per_scope, total, profile
 
 
-def limits_source(state: Dict[str, Any]) -> str:
-    """返修上限的生效来源：frozen / state / profile（排障用，进 HALT 证据）。"""
+def limits_source(state: Dict[str, Any],
+                  config: Optional[Dict[str, Any]] = None) -> str:
+    """返修上限的生效来源：frozen / state / config / profile（排障用，进 HALT 证据）。"""
     frozen = state.get("execution_config")
     frozen = frozen if isinstance(frozen, dict) else {}
     for key in ("repair_max_per_scope", "repair_max_total"):
@@ -158,12 +187,76 @@ def limits_source(state: Dict[str, Any]) -> str:
         value = state.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return "state"
+    cfg = config if isinstance(config, dict) else {}
+    for key in ("repair_per_scope_limit", "repair_total_limit"):
+        value = cfg.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value >= 0:
+            return "config"
+        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            return "config"
     return "profile"
+
+
+def load_repair_overrides(self_dir: Optional[str]) -> Dict[str, Any]:
+    """A5：从 ``self/config.yaml`` 读返修上限的运维覆盖（正式通道）。
+
+    认两种写法（扁平优先，其次 ``agent_dispatch`` 子块）::
+
+        repair_per_scope_limit: 12
+        repair_total_limit: 40
+        # 或
+        agent_dispatch:
+          repair_per_scope_limit: 12
+
+    读不到 / 文件不存在 / YAML 损坏一律返回 ``{}``（按 profile 默认），绝不抛错
+    ——返修回路不能因为一行配置写错就整体崩掉。非法取值（负数/非数字）同样视为
+    未设置，由 ``resolve_limits`` 统一解释。
+    """
+    out: Dict[str, Any] = {}
+    if not self_dir:
+        return out
+    cfg_path = os.path.join(self_dir, "config.yaml")
+    if not os.path.isfile(cfg_path):
+        return out
+    try:
+        with open(cfg_path, encoding="utf-8-sig") as f:
+            text = f.read()
+    except OSError:
+        return out
+    data: Any = None
+    try:
+        import yaml  # type: ignore
+
+        data = yaml.safe_load(text)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        # 无 PyYAML 或 YAML 损坏：退回扁平 `key: value` 行解析
+        data = {}
+        for line in text.splitlines():
+            if line[:1] in (" ", "\t", "#"):
+                continue
+            if ":" not in line:
+                continue
+            key, _, value = line.partition(":")
+            data[key.strip()] = value.strip()
+    for key in ("repair_per_scope_limit", "repair_total_limit"):
+        raw = data.get(key)
+        if raw is None:
+            nested = data.get("agent_dispatch")
+            if isinstance(nested, dict):
+                raw = nested.get(key)
+        if raw is not None:
+            out[key] = raw
+    return out
 
 
 def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Optional[str],
                 *, issues: Optional[List[Dict[str, Any]]] = None,
-                artifact: Optional[str] = None) -> Dict[str, Any]:
+                artifact: Optional[str] = None,
+                config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """决定“安排下一次内容返修”还是 HALT；纯函数，不读写磁盘。
 
     返回::
@@ -175,7 +268,7 @@ def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Op
     ``patch`` 是须随派发单同一次 checkpoint 写入的全部持久字段（完整新 dict，
     不依赖 reducer）。HALT 不增加任何计数。
     """
-    per_scope, total_limit, profile = resolve_limits(state)
+    per_scope, total_limit, profile = resolve_limits(state, config)
     by_scope = dict(state.get("repair_attempts_by_scope") or {})
     total = int(state.get("repair_attempts_total") or 0)
     last_fp = dict(state.get("repair_last_fingerprint_by_scope") or {})
@@ -187,7 +280,7 @@ def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Op
     halt_ctx = {
         "scope": scope,
         "profile": profile,
-        "limits_source": limits_source(state),
+        "limits_source": limits_source(state, config),
         "scope_attempts": scope_attempts,
         "total_attempts": total,
         "per_scope_limit": per_scope,

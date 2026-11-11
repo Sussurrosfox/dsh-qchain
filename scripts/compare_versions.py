@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-TOOL_VERSION = "3.0"
+TOOL_VERSION = "3.1"
 r"""
 compare_versions.py — 学生版/教师版一致性与防泄露对比检查 (PDF / HTML 双引擎支持)
 
@@ -11,6 +11,17 @@ compare_versions.py — 学生版/教师版一致性与防泄露对比检查 (PD
      - PDF 模式：源文件 solution/teacherNote 数量与 student.log/teacher.log 的 SUMMARY 计数交叉核对。
      - HTML 模式：两版卡片页集合一致，教师版可见解答数 == 源计数，学生版可见解答数 == 0。
   4. 文本量与页数统计（诊断信息）。
+
+A23 修正（v3.1）：HTML 侧泄露扫描过去把三类"设计上就该含答案"的落点当成疑似泄露，
+24 条 review 全部为假阳性，`status=review` 又会让 build 节点 HALT 等人工复核：
+  ① 选择题化填空的选项按钮 `<button class="qc-option" data-correct="true">`
+     —— 正确答案按 design 就是其中一个可见选项；
+  ② hidden 的 `qc-reveal qc-solution` 延迟发放揭示区；
+  ③ 题干/知识卡正文里的固有短语（同一措辞在双版都出现，不是跨版本泄露）。
+现在 ①② 由 evidence.ANSWER_REGION_CLASSES 在取可见文本时整体跳过，
+③ 由 prose_index（源文本剔除 \fillin 答案位后的题面索引）降级为 info，
+`--strict-answers` 仍可把 ③ 升级回 review。题干正文里出现不在选项中的答案
+仍然照旧报 review——防泄露能力没有放松。
 
 用法: python compare_versions.py [工作目录] [--format {both,pdf,html}] [选项]
 退出码: 0=通过（含结构通过但有疑似答案项待复核）, 1=发现硬失败, 2=缺少依赖或输入。
@@ -205,23 +216,94 @@ def extract_fillin_entries(raw_text):
 
 
 def option_sequences(raw_text):
+    """选项区域在成品文本里的字面形态（用于比对前先抹除选项区）。
+
+    A23：PDF 侧 \fillin[答案]{宽度}[选项] 渲染成 `（甲／乙／丙）`（全角括号 +
+    全角斜杠，见 render_smoke.py 的填空选项页判定），旧实现只吐半角
+    `甲/乙/丙`，于是选项区从来没被抹掉过——正确答案按钮的文本原样留在
+    学生版里，必然被泄露扫描命中。这里把常见字面形态全部列出。
+
+    C2 红线保留：只抹"整个选项区"与单个**干扰项**，绝不单独抹本空正确
+    选项文本——否则与正确选项同形的题干泄露会被一并抹掉（防泄露盲区）。
+    """
     entries = extract_fillin_entries(raw_text)
     seqs = []
     for ans_raw, _w, opts_raw in entries:
-        if opts_raw:
-            items = [re.sub(r"\s+", "", normalize_answer(x))
-                     for x in check_numbering.split_options(opts_raw, "/") if x.strip()]
-            if items:
-                seq = "/".join(items)
-                if len(seq) >= 2:
-                    seqs.append(seq)
-            # C2：单个选项只剥离"干扰项"，绝不剥离本空正确答案——
-            # 否则与正确选项同形的泄露文本会被一并从页面抹除（防泄露盲区）。
-            ans_norm = re.sub(r"\s+", "", normalize_answer(ans_raw or ""))
-            for item in items:
-                if len(item) >= 2 and item != ans_norm:
-                    seqs.append(item)
+        if not opts_raw:
+            continue
+        items = [re.sub(r"\s+", "", normalize_answer(x))
+                 for x in check_numbering.split_options(opts_raw, "/") if x.strip()]
+        if not items:
+            continue
+        for sep in ("/", "／"):
+            joined = sep.join(items)
+            if len(joined) >= 2:
+                seqs.append(joined)
+            for lp, rp in (("(", ")"), ("（", "）")):
+                wrapped = lp + joined + rp
+                if len(wrapped) >= 2:
+                    seqs.append(wrapped)
+        ans_norm = re.sub(r"\s+", "", normalize_answer(ans_raw or ""))
+        for item in items:
+            if len(item) >= 2 and item != ans_norm:
+                seqs.append(item)
     return seqs
+
+
+def prose_index(raw_text):
+    """A23：题面自身文本的归一化索引（剔除 \\fillin 的答案位与选项位之后）。
+
+    答案串若仍能在题面里找到，说明它是题目/知识卡的固有措辞（双版都有），
+    不是"学生版泄露了教师版内容"——这一类应降级为 info，而不是每轮都
+    触发 review → HALT → 人工复核。剔除答案位是必需的：否则每个答案
+    都因为自己的 \\fillin[...] 参数而"出现在题面里"，索引失去判别力。
+    """
+    masked = mask_comments(raw_text)
+    out, i, n = [], 0, len(masked)
+    while i < n:
+        idx = masked.find(r"\fillin", i)
+        if idx < 0:
+            out.append(masked[i:])
+            break
+        out.append(masked[i:idx])
+        j = idx + len(r"\fillin")
+        while j < n and masked[j].isspace():
+            j += 1
+        if j < n and masked[j] == "[":
+            depth, k = 1, j + 1
+            while k < n and depth > 0:
+                if masked[k] == "\\":
+                    k += 2
+                    continue
+                if masked[k] == "[":
+                    depth += 1
+                elif masked[k] == "]":
+                    depth -= 1
+                k += 1
+            if depth == 0:
+                j = k
+        # 跳过可选的 {宽度} 与 [选项] 参数，只保留题面正文
+        while j < n and masked[j] in " \t":
+            j += 1
+        if j < n and masked[j] == "{":
+            depth, k = 1, j + 1
+            while k < n and depth > 0:
+                if masked[k] == "\\":
+                    k += 2
+                    continue
+                if masked[k] == "{":
+                    depth += 1
+                elif masked[k] == "}":
+                    depth -= 1
+                k += 1
+            if depth == 0:
+                j = k
+        while j < n and masked[j].isspace():
+            j += 1
+        if j < n and masked[j] == "[":
+            _opts, j = extract_bracket_arg(masked, j)
+        i = j
+    return normalize_answer("".join(out))
 
 
 def sec_sources(workdir):
@@ -321,6 +403,7 @@ def compare_pdf_version(workdir, args, report, src_texts, raw_texts, forbid):
         # --strict-answers 下升级为 review 待复核，绝不不留痕迹。
         seen_short, short_answers = set(), []
         opt_seqs = set()
+        prose = {}
         for fname in src_texts:
             for raw, qid in locate_fillin_answers(raw_texts[fname]):
                 norm = normalize_answer(raw)
@@ -333,6 +416,7 @@ def compare_pdf_version(workdir, args, report, src_texts, raw_texts, forbid):
                     seen.add(norm)
                     answers.append((raw.strip(), norm, qid, fname))
             opt_seqs.update(option_sequences(raw_texts[fname]))
+            prose[fname] = prose_index(raw_texts[fname])
 
         pages = [re.sub(r"\s+", "", p) for p in stu_pages]
         for seq in sorted(opt_seqs, key=len, reverse=True):
@@ -353,12 +437,25 @@ def compare_pdf_version(workdir, args, report, src_texts, raw_texts, forbid):
         for raw, norm, qid, fname in answers:
             hits = find_hits(pages, norm)
             for pno, ctx in hits:
-                msg = ("学生版 PDF 第 %d 页疑似泄露 \\fillin 答案 “%s” (需人工复核): …%s…"
-                       % (pno, raw[:30], ctx[:40]))
+                # A23：答案串在本节题面自身文本里（剔除答案位之后）→ 题干固有
+                # 措辞，双版都有，不算跨版本泄露；--strict-answers 仍升级。
+                inherent = norm in (prose.get(fname) or "")
+                if inherent:
+                    severity = "review" if args.strict_answers else "info"
+                    kind = "pdf-fillin-inherent"
+                    msg = ("答案 “%s” 出现在学生版 PDF 第 %d 页，"
+                           "但该串同时存在于本题题面/知识卡自身文本"
+                           "（双版一致，属题目固有措辞，非跨版本泄露）: …%s…"
+                           % (raw[:30], pno, ctx[:40]))
+                else:
+                    severity = "review"
+                    kind = "pdf-fillin-leak"
+                    msg = ("学生版 PDF 第 %d 页疑似泄露 \\fillin 答案 “%s” (需人工复核): …%s…"
+                           % (pno, raw[:30], ctx[:40]))
                 report["issues"].append({
-                    "severity": "review",
-                    "issue_id": suspect_issue_id(qid or fname, norm, "pdf-fillin-leak"),
-                    "kind": "pdf-fillin-leak",
+                    "severity": severity,
+                    "issue_id": suspect_issue_id(qid or fname, norm, kind),
+                    "kind": kind,
                     "qid": qid,
                     "location": {"page": pno, "context": re.sub(r"\s+", " ", ctx)[:80]},
                     "message": msg
@@ -429,6 +526,13 @@ def compare_html_version(workdir, args, report, src_texts, raw_texts, forbid):
     stu_pages = [t for _cid, t in stu_pages_tuples]
     tea_pages = [t for _cid, t in tea_pages_tuples]
 
+    # A23：泄露扫描专用视图——跳过"可见但设计上含答案"的区域
+    # （选择题选项组 / 延迟发放揭示区）。卡片一致性等其他检查仍用全量可见文本。
+    stu_scan_tuples = evidence.html_card_pages(
+        stu_html, skip_classes=evidence.ANSWER_REGION_CLASSES)
+    scan_pages = ([t for _cid, t in stu_scan_tuples]
+                  if stu_scan_tuples is not None else list(stu_pages))
+
     problems = []
 
     # 1. 禁用词检查
@@ -448,6 +552,7 @@ def compare_html_version(workdir, args, report, src_texts, raw_texts, forbid):
         # --strict-answers 下升级为 review 待复核，绝不不留痕迹。
         seen_short, short_answers = set(), []
         opt_seqs = set()
+        prose = {}
         for fname in src_texts:
             for raw, qid in locate_fillin_answers(raw_texts[fname]):
                 norm = normalize_answer(raw)
@@ -460,8 +565,9 @@ def compare_html_version(workdir, args, report, src_texts, raw_texts, forbid):
                     seen.add(norm)
                     answers.append((raw.strip(), norm, qid, fname))
             opt_seqs.update(option_sequences(raw_texts[fname]))
+            prose[fname] = prose_index(raw_texts[fname])
 
-        pages = [re.sub(r"\s+", "", p) for p in stu_pages]
+        pages = [re.sub(r"\s+", "", p) for p in scan_pages]
         for seq in sorted(opt_seqs, key=len, reverse=True):
             pages = [p.replace(seq, "") for p in pages]
 
@@ -480,12 +586,25 @@ def compare_html_version(workdir, args, report, src_texts, raw_texts, forbid):
         for raw, norm, qid, fname in answers:
             hits = find_hits(pages, norm)
             for pno, ctx in hits:
-                msg = ("学生版 HTML 第 %d 个卡片页疑似泄露 \\fillin 答案 “%s” (需人工复核): …%s…"
-                       % (pno, raw[:30], ctx[:40]))
+                # A23：答案串在本节题面自身文本里（剔除答案位之后）→ 题干固有
+                # 措辞，双版都有，不算跨版本泄露；--strict-answers 仍升级。
+                inherent = norm in (prose.get(fname) or "")
+                if inherent:
+                    severity = "review" if args.strict_answers else "info"
+                    kind = "html-fillin-inherent"
+                    msg = ("答案 “%s” 出现在学生版 HTML 第 %d 个卡片页，"
+                           "但该串同时存在于本题题面/知识卡自身文本"
+                           "（双版一致，属题目固有措辞，非跨版本泄露）: …%s…"
+                           % (raw[:30], pno, ctx[:40]))
+                else:
+                    severity = "review"
+                    kind = "html-fillin-leak"
+                    msg = ("学生版 HTML 第 %d 个卡片页疑似泄露 \\fillin 答案 “%s” (需人工复核): …%s…"
+                           % (pno, raw[:30], ctx[:40]))
                 report["issues"].append({
-                    "severity": "review",
-                    "issue_id": suspect_issue_id(qid or fname, norm, "html-fillin-leak"),
-                    "kind": "html-fillin-leak",
+                    "severity": severity,
+                    "issue_id": suspect_issue_id(qid or fname, norm, kind),
+                    "kind": kind,
                     "qid": qid,
                     "location": {"page": pno, "context": re.sub(r"\s+", " ", ctx)[:80]},
                     "message": msg

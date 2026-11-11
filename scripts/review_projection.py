@@ -47,9 +47,10 @@ if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
 import ledger  # noqa: E402  （N2：advisory 延期台账，投影时读生效条目）
+import evidence  # noqa: E402  （A24：HTML 内容身份，供验收记录判读）
 
 TOOL_NAME = "review_projection.py"
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 
 # ---------------------------------------------------------------------------
 # 版本与常量
@@ -666,6 +667,15 @@ def project_acceptance(record: Dict[str, Any], review_rel: str, review_sha: str,
                  if isinstance(k, str)}
     wanted = FORMAT_ARTIFACTS.get(fmt, ())
     delivery = {rel: (disk_digests or {}).get(rel) for rel in wanted}
+    # A24：学生版 HTML 的**内容**身份（渲染层无关）。只在「审读员看到的就是
+    # 本轮产物」时登记——否则说明审读与交付已错轮，内容身份无从谈起，留空
+    # 让后续校验按 fail-close 判字节不一致。
+    html_content = ""
+    if fmt in ("html", "both") and self_dir:
+        seen = artifacts.get("student.html")
+        if _is_digest(seen) and seen == delivery.get("student.html"):
+            html_content = str(evidence.html_student_content_digest(
+                os.path.join(self_dir, "student.html")) or "")
     # C7：内容审读指纹（审读员当时看到的产物）与本轮交付实测指纹必须分离，
     # 且绝不修改前者去假装它见过新产物。
     reused = any(_is_digest(artifacts.get(rel)) and _is_digest(delivery.get(rel))
@@ -684,6 +694,10 @@ def project_acceptance(record: Dict[str, Any], review_rel: str, review_sha: str,
         if fmt in ("pdf", "both") else None,
         "student_html_sha256": artifacts.get("student.html")
         if fmt in ("html", "both") else None,
+        # A24：HTML 内容身份（卡片 ID + 可见文本，渲染层无关）。字节哈希每次
+        # 构建都因 render_html.py:356 的 GENERATED_AT 而变；判读「字节变了但
+        # 学生可见内容没变」时靠它，不让整份教学验收过期。
+        evidence.HTML_CONTENT_FIELD: html_content or None,
         "conclusion": str(section.get("acceptance_conclusion") or ""),
         "reviewer_role": str(record.get("reviewer_role") or ""),
         "issues": issues,

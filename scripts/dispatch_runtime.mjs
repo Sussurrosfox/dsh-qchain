@@ -510,6 +510,10 @@ export function buildDispatchPrompt(request, envIn) {
     content_digest: ctxObj.content_digest || '',
     student_pdf_sha256: ctxObj.student_pdf_sha256 || '',
     student_html_sha256: ctxObj.student_html_sha256 || '',
+    // A24：HTML 内容身份（卡片 ID + 可见文本，渲染层无关）。字节哈希每次
+    // 构建都因 render_html.py:356 的 GENERATED_AT 而变，验收记录须同时登记
+    // 它，否则每次重渲染都被判整体过期。
+    student_html_content_digest: ctxObj.student_html_content_digest || '',
   }, null, 2);
   assign('EVIDENCE', baseline);
   assign('VERSION_HASHES', baseline);

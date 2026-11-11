@@ -420,7 +420,9 @@ class T19_CrossLanguage(unittest.TestCase):
             self.skipTest("node 不在 PATH，跳过跨语言比对")
         proc = subprocess.run(
             [node, JS_TEST_PATH, "--dump"],
-            cwd=PLUGIN_ROOT, capture_output=True, text=True, timeout=180)
+            cwd=PLUGIN_ROOT, capture_output=True, text=True, timeout=180,
+            # node 的 stdout 是 UTF-8；Windows 上不声明就会按 cp936 解
+            encoding="utf-8", errors="replace")
         self.assertEqual(0, proc.returncode,
                          "JS fixtures 求值失败: %s" % (proc.stderr or ""))
         js = json.loads(proc.stdout)

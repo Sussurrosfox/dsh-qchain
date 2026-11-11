@@ -23,7 +23,9 @@ qchain-html（题链 HTML）流水线的“填写规范”机器侧：把 sec*.t
   deck, issues = parse_project("self")
 
 命令行自检:
-  python tex2cards.py <project> [--json cards.json] [--pretty]
+  python tex2cards.py <project> [--json cards.json] [--pretty] [--no-persist]
+  不带 --json 时刷新 <project>/cards.json 并同时打印到 stdout（A13：裸跑不再
+  留下陈旧 cards.json 让 check_render H7 对账假阳性）；--no-persist 完全只读。
 退出码: 0=解析完成（issues 可能含提示）, 1=解析失败（输入缺失/结构错误）。
 """
 import argparse
@@ -128,29 +130,11 @@ def scan_brace(text, k):
     return i, "".join(buf), closed
 
 
-def scan_bracket(text, k):
-    r"""从 text[k]=='[' 起扫描配对 ]（\\ 转义与 {} 分组感知）；
-    返回 (新位置, 内容, 是否闭合)。"""
-    i, buf, brace, closed = k + 1, [], 0, False
-    n = len(text)
-    while i < n:
-        c = text[i]
-        if c == "\\" and i + 1 < n:
-            buf.append(c)
-            buf.append(text[i + 1])
-            i += 2
-            continue
-        if c == "{":
-            brace += 1
-        elif c == "}" and brace > 0:
-            brace -= 1
-        elif c == "]" and brace == 0:
-            closed = True
-            i += 1
-            break
-        buf.append(c)
-        i += 1
-    return i, "".join(buf), closed
+# A17：方括号扫描与 check_numbering.py 同源（一份实现，两个消费者）。
+# 本模块原先自带一份只做 {} 分组、不做 [] 嵌套的 scan_bracket，导致
+# \fillin[\det([\bm a_2,\bm a_1])]{2cm}[...] 这类答案在 tex2cards 侧被截断、
+# 在 compare_versions 侧却被正确提取——三处口径不一致。改为直接复用。
+scan_bracket = check_numbering.scan_bracket
 
 
 def norm_opt(s):
@@ -1195,6 +1179,26 @@ class SecParser:
                         for s in ctx.slots:
                             card.setdefault("slots", []).append(s)
                 elif meta.get("probchain"):
+                    # A8：probchain 帧自身的裸缓冲 fr[2] 必须被消费。
+                    # 进入这里的场景：probchain 内**第二个**顶层 enumerate
+                    # （此时 q["parts_opened"] 已 True → :1104 落 meta["list"]）
+                    # 关闭时经 _flush_list 把已渲染 HTML 回灌到父帧，而父帧是
+                    # probchain、其 cur_part/cur_item 均为 None，于是落到
+                    # fr[2]（_flush_list :1360）。旧实现只处理 _stem /
+                    # between_buf / pending_lead，从不读 fr[2] → 整段题干
+                    # （含 \fillin 与选项组）静默消失，而 \item 侧漏已经把槽位
+                    # 注册进 q["slots"]：卡片留下**孤儿槽位**，check_html 的
+                    # 「选项组 N 个与牌组槽位 M 个不一致」即由此而来。
+                    # 处置与 route_append 的 probchain 直属文本口径一致：
+                    # 题干开放期归当前题 _stem，否则归题间引导。
+                    leftover = content.strip()
+                    if leftover:
+                        if self.stem_open and self.cur_question is not None:
+                            self.cur_question.setdefault("_stem", []).append(leftover)
+                        elif self.cur_question is not None:
+                            self.between_buf.append(leftover)
+                        else:
+                            self.pending_lead.append(leftover)
                     self.finalize_question(fr[1])
                     self.in_probchain = False
                     self.stem_open = False
@@ -1525,6 +1529,8 @@ def main(argv=None):
     ap.add_argument("project", nargs="?", default=".")
     ap.add_argument("--json", metavar="PATH", help="把牌组写入 PATH")
     ap.add_argument("--pretty", action="store_true", help="缩进输出 JSON")
+    ap.add_argument("--no-persist", action="store_true",
+                    help="不写任何 cards.json（只打印到 stdout，供只读查看）")
     args = ap.parse_args(argv)
     if not os.path.isdir(args.project):
         print("[tex2cards] 项目目录不存在: %s" % args.project)
@@ -1533,11 +1539,23 @@ def main(argv=None):
     problems = validate_deck(deck)
     text = json.dumps(deck, ensure_ascii=False,
                       indent=2 if args.pretty else None)
-    if args.json:
-        with open(args.json, "w", encoding="utf-8") as f:
+    # A13：裸跑（不带 --json）只把牌组打印到 stdout，磁盘上的 cards.json 于是
+    # 停留在上一次渲染的旧版本 → check_render H7 对账报 220≠223 / 660≠669，
+    # 而排查时看 stdout 全是新数字，极易误判成门禁假阳性。现在裸跑一律顺手
+    # 刷新 <project>/cards.json 这个规范产物位置，stdout 行为不变；
+    # --json PATH 仍只写 PATH（显式优先），--no-persist 完全只读。
+    target = args.json
+    if not target and not args.no_persist:
+        target = os.path.join(args.project, "cards.json")
+    if target:
+        parent = os.path.dirname(os.path.abspath(target))
+        if parent and not os.path.isdir(parent):
+            print("[tex2cards] 输出目录不存在: %s" % parent)
+            return 1
+        with open(target, "w", encoding="utf-8") as f:
             f.write(text)
         print("[tex2cards] 牌组已写入 %s（%d 张卡片）"
-              % (args.json, len(deck["cards"])))
+              % (target, len(deck["cards"])))
     else:
         print(text)
     for msg in issues:
