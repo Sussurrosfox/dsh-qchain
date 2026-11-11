@@ -136,8 +136,12 @@ def shuffle_bound(record_digest, current_digest, edges, limit=32):
     return False
 
 
-def check_scope(workdir, sec):
-    """单 scope 审读记录校验 → issues 列表（空 = 通过）。"""
+def check_scope(workdir, sec, warnings=None):
+    """单 scope 审读记录校验 → issues 列表（空 = 通过）。
+
+    ``warnings``（可选）用于收集"不阻断但有话要说"的结论：N2 的人工延期
+    （.pd/deferrals.json）会把一条本会阻断的 REVISE 降级为提示。
+    """
     issues = []
     tex_path = os.path.join(workdir, "%s.tex" % sec)
     if not os.path.isfile(tex_path):
@@ -202,13 +206,28 @@ def check_scope(workdir, sec):
         i for i in (raw_issues or [])
         if isinstance(i, dict) and str(i.get("severity") or "") == "blocking"
     ]
+    deferred = [i for i in (raw_issues or [])
+                if isinstance(i, dict) and i.get("deferred")]
     if conclusion == "REVISE" or blocking:
         codes = sorted({str(i.get("code") or "?") for i in blocking}) or ["REVISE"]
-        issues.append({
-            "code": "SEMANTIC_REVISE",
-            "detail": "小节 %s 语义审读未通过（%s）: %s"
-                      % (sec, conclusion, ", ".join(codes)),
-            "issue_codes": codes})
+        if not blocking and deferred and warnings is not None:
+            # 全部 open issue 都命中人工延期 → 提示而不阻断。理由与批准人
+            # 一并输出，谁签的字在报告里可追。
+            reasons = "; ".join(
+                "%s(%s)" % (str(i.get("code") or "?"),
+                            str((i.get("deferral") or {}).get("reason") or "无理由"))
+                for i in deferred)
+            warnings.append({
+                "code": "SEMANTIC_REVISE_DEFERRED",
+                "detail": "小节 %s 判定 REVISE，但 open issue 均已由人工登记延期"
+                          "（%s），本轮不阻断；延期到期或撤销后会重新阻断"
+                          % (sec, reasons)})
+        else:
+            issues.append({
+                "code": "SEMANTIC_REVISE",
+                "detail": "小节 %s 语义审读未通过（%s）: %s"
+                          % (sec, conclusion, ", ".join(codes)),
+                "issue_codes": codes})
     elif conclusion == "NEEDS_EVIDENCE":
         issues.append({
             "code": "SEMANTIC_NEEDS_EVIDENCE",
@@ -236,7 +255,7 @@ def check_semantic_project(workdir, scope=""):
                 "detail": section_scan.no_slice_detail(workdir)})
     passed = 0
     for sec in sections:
-        issues = check_scope(workdir, sec)
+        issues = check_scope(workdir, sec, warnings=warnings)
         if issues:
             errors.extend(issues)
         else:

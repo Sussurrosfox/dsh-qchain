@@ -610,13 +610,16 @@ export function buildDispatchPrompt(request, envIn) {
         try {
           const obj = JSON.parse(fs.readFileSync(path.join(semDir, f), 'utf8'));
           if (!obj || (!obj.conclusion && !Array.isArray(obj.issues))) continue;
-          issueList.push(`[semantic/${f} conclusion=${obj.conclusion || 'n/a'}]（下列 blocking 与 advisory 问题必须一次性全部修复，未修的 advisory 在下一轮审读会被升级为 blocking）`);
+          // N2：advisory 不再"一律下一轮升级成 blocking"。人工登记延期的
+          // 条目本轮不必修（延期是人的决定，见 .pd/deferrals.json）。
+          issueList.push(`[semantic/${f} conclusion=${obj.conclusion || 'n/a'}]（下列 blocking 必须本轮全部修复；advisory 视情况修复；标注 [deferred] 的已由人工批准延期，本轮不要动它，也不要改写成别的问题）`);
           for (const iss of (obj.issues || [])) {
             const sev = iss.severity || '?';
             const code = iss.code || '?';
             const ln = iss.line ? ` L${iss.line}` : '';
             const ev = String(iss.evidence || iss.message || '').trim();
-            issueList.push(`[semantic/${f} ${sev} ${code}${ln}] ${ev}`);
+            const df = iss.deferred ? ` [deferred${(iss.deferral && iss.deferral.reason) ? `: ${iss.deferral.reason}` : ''}]` : '';
+            issueList.push(`[semantic/${f} ${sev} ${code}${ln}]${df} ${ev}`);
           }
         } catch (_) { /* 损坏的审读 JSON 不阻断 */ }
       }

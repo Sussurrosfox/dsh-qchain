@@ -125,6 +125,18 @@ def _load_json(path):
         return None, "JSON 解析失败: %s" % e
 
 
+def active_approval_entries(approvals):
+    """台账里**生效中**的批准条目（缺 status 视为 active，撤销的剔除）。
+
+    撤销（``ledger.py revoke`` / ``qchain_approve action=revoke``）只改 status，
+    不改历史记录——所以这里必须过滤，否则"撤销"在门禁侧等于没发生。
+    """
+    entries = (approvals or {}).get("approvals") if isinstance(approvals, dict) else None
+    return [a for a in (entries or [])
+            if isinstance(a, dict)
+            and str(a.get("status") or "active").lower() == "active"]
+
+
 def _input_digest(workdir):
     """受审输入摘要（与 deliver.py 的 input_digest 绑定口径一致）。
 
@@ -544,8 +556,11 @@ def check_fidelity_project(workdir):
     unit_by_id = {u.get("source_id"): u for u in units}
 
     # ---- 批准台账 ----
+    # N1：台账现在有写入通路（scripts/ledger.py，工具 qchain_approve）；
+    # 这里只认**生效中**的条目——撤销过的批准不得继续放行（原先按全表匹配，
+    # revoke 之后 BRIDGE 仍然通过）。
     approvals, _ = _load_json(os.path.join(workdir, APPROVALS_REL))
-    approval_entries = (approvals or {}).get("approvals") or []
+    approval_entries = active_approval_entries(approvals)
     approval_ids = {str(a.get("id", "")).upper() for a in approval_entries}
     approval_scopes = {(str(a.get("kind", "")).lower(),
                         str(a.get("scope", ""))) for a in approval_entries}
@@ -700,7 +715,8 @@ def check_fidelity_project(workdir):
                     "code": "FIDELITY_BRIDGE_UNAPPROVED",
                     "detail": "source-map.md:%d %s 的 BRIDGE(scope=%s) 缺少"
                               " .pd/approvals.json 批准记录（需 kind=bridge "
-                              "且带 reason）" % (r["line"], r["source_id"],
+                              "且带 reason；由真人用 qchain_approve / "
+                              "scripts/ledger.py approve 登记）" % (r["line"], r["source_id"],
                                                 scope)})
     # 正文 bridge 锚点必须有批准 id
     for sec, info in anchors_by_sec.items():
@@ -709,7 +725,8 @@ def check_fidelity_project(workdir):
                 errors.append({
                     "code": "FIDELITY_BRIDGE_UNAPPROVED",
                     "detail": "%s 第 %d 行 %% bridge: %s 未在 "
-                              ".pd/approvals.json 批准" % (sec, ln + 1, bid)})
+                              ".pd/approvals.json 批准（可由真人用 "
+                              "qchain_approve 以该 id 登记）" % (sec, ln + 1, bid)})
 
     # ---- 7. exclusion 对账（contract vs manifest）----
     manifest_excluded = {os.path.basename(s.get("path", ""))

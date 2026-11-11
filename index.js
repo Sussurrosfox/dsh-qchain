@@ -136,6 +136,57 @@ function resolveCurrentProjectDir(ctx, hintPath) {
   return cwd;
 }
 
+// ---- 人工台账工具（qchain_approve / qchain_defer）共用 ---------------------
+
+/** 定位 self 工作区（显式 → cwd/self → workspaceRegistry → 当前工程/self）。 */
+function resolveSelfWorkspaceDir(ctx, hintSelfDir) {
+  const candidates = [];
+  if (hintSelfDir) {
+    candidates.push(path.isAbsolute(hintSelfDir)
+      ? path.resolve(hintSelfDir)
+      : path.resolve(process.cwd(), hintSelfDir));
+  }
+  candidates.push(path.join(process.cwd(), 'self'));
+  try {
+    const registry = ctx?.get?.('workspaceRegistry') || ctx?.workspaceRegistry;
+    if (registry && typeof registry.list === 'function') {
+      for (const entry of (registry.list() || [])) {
+        if (entry && entry.path) candidates.push(path.join(entry.path, 'self'));
+      }
+    }
+  } catch (_) {}
+  candidates.push(path.join(resolveCurrentProjectDir(ctx), 'self'));
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c) && fs.statSync(c).isDirectory()) return c;
+    } catch (_) {}
+  }
+  return '';
+}
+
+/** 跑 scripts/ledger.py（人工批准 / advisory 延期的唯一写入通路）。 */
+async function runLedger(ctx, selfDir, argv) {
+  if (!selfDir) {
+    return { success: false, output: '❌ 未找到 self 工作区目录（请指定 self_dir）', payload: null };
+  }
+  const res = await runPython(
+    [path.join(engineRoot, 'scripts', 'ledger.py'), ...argv, '--self', selfDir, '--json'],
+    selfDir, 60000, pythonBin);
+  const raw = [res.stdout, res.stderr].filter(Boolean).join('\n').trim();
+  let payload = null;
+  try {
+    payload = JSON.parse(res.stdout);
+  } catch (_) { /* 非 JSON 输出（例如 argparse 报错）原样回传 */ }
+  const detail = payload && payload.success === false
+    ? String(payload.error || '')
+    : '';
+  return {
+    success: res.success && (!payload || payload.success !== false),
+    output: (detail ? `❌ ${detail}\n` : '') + raw,
+    payload,
+  };
+}
+
 // ---- qchain_dispatch 辅助（q_audit.md 多 Agent 证据链） --------------------
 
 function qdReadJson(absPath) {
@@ -1156,6 +1207,158 @@ export function apply(ctx, config = {}) {
         report: out || (res.success ? '进度查询完成' : '进度查询失败'),
         snapshot,
       };
+    },
+  });
+
+  // 2.4 注册 Tool: qchain_approve / qchain_defer（N1/N2 人工台账写入通路）
+  //   背景：.pd/approvals.json 原先只有 check_fidelity 在读、**没有任何写入者**，
+  //   faithful 模式下 BRIDGE/EXTENSION 永远拿不到批准 → 返修子 Agent 每轮新写
+  //   的桥接都被判 FIDELITY_BRIDGE_UNAPPROVED，形成"修复-复发"死循环。
+  //   延期台账同理：advisory 会被逐轮升级成 blocking，而"源材料没给这个口径"
+  //   一类问题无解，只能由人拍板延期。
+  ctx.tools.register({
+    name: 'qchain_approve',
+    description: '登记人工批准（.pd/approvals.json）：faithful 模式下 BRIDGE / EXTENSION 必须由真人批准才能留在正文，'
+      + '否则 check_fidelity 每轮都判 FIDELITY_BRIDGE_UNAPPROVED / FIDELITY_EXTEND_UNAPPROVED。'
+      + '★ approved_by 必须是真人的姓名或称呼：严禁填 Agent 名（会被 ledger.py 拒绝）。'
+      + '先向用户说明要批准什么、为什么（reason 必填，会写进台账），拿到明确同意与署名后再调用本工具。'
+      + 'action=list 可查看现有批准与延期；action=revoke 撤销（撤销后该批准立即失效）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['approve', 'revoke', 'list'],
+          description: 'approve(登记批准，默认) | revoke(撤销一条) | list(查看台账)',
+        },
+        self_dir: {
+          type: 'string',
+          description: 'self 工作区目录（缺省探测：cwd/self → workspaceRegistry[0]/self）',
+        },
+        kind: {
+          type: 'string',
+          enum: ['bridge', 'extension'],
+          description: 'approve 必填：bridge(补充桥接说明) | extension(在原文之外扩展内容)',
+        },
+        scope: {
+          type: 'string',
+          description: 'approve 必填：批准针对的小节 scope（如 sec1；source-map 的 BRIDGE 行按 scope 匹配）',
+        },
+        approval_id: {
+          type: 'string',
+          description: 'approve 可选：批准 id（正文 % bridge: <id> 锚点要用同一个 id；缺省自动生成 BR-<scope>-NN / EXT-<scope>-NN）',
+        },
+        qid: { type: 'string', description: 'approve 可选：关联题号' },
+        reason: {
+          type: 'string',
+          description: 'approve 必填：批准理由（写给未来的自己看：为什么这不违背忠实性）',
+        },
+        approved_by: {
+          type: 'string',
+          description: 'approve 必填：真人批准人姓名/称呼（由 ask_user_question 取得；Agent 标识会被拒）',
+        },
+        target_id: {
+          type: 'string',
+          description: 'revoke 必填：要撤销的台账条目 id（BR-… / EXT-… / DF-…）',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          success: { type: 'boolean' },
+          self_dir: { type: 'string' },
+          output: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.output }],
+    },
+    async execute(args) {
+      const selfDir = resolveSelfWorkspaceDir(ctx, args.self_dir);
+      const action = String(args.action || 'approve');
+      let argv;
+      if (action === 'revoke') {
+        if (!args.target_id) {
+          return { success: false, self_dir: selfDir, output: '❌ revoke 需要 target_id' };
+        }
+        argv = ['revoke', '--id', String(args.target_id), '--by', String(args.approved_by || '')];
+      } else if (action === 'list') {
+        argv = ['list'];
+      } else {
+        argv = ['approve',
+          '--kind', String(args.kind || ''),
+          '--scope', String(args.scope || ''),
+          '--reason', String(args.reason || ''),
+          '--approved-by', String(args.approved_by || '')];
+        if (args.approval_id) argv.push('--id', String(args.approval_id));
+        if (args.qid) argv.push('--qid', String(args.qid));
+      }
+      const res = await runLedger(ctx, selfDir, argv);
+      return { success: res.success, self_dir: selfDir, output: res.output };
+    },
+  });
+
+  ctx.tools.register({
+    name: 'qchain_defer',
+    description: '登记/撤销 advisory 延期（.pd/deferrals.json）：把"无解但有理由"的审读 advisory 保持为 advisory，'
+      + '不再下一轮机械升级成 blocking。命中延期的 issue 在投影里带 deferred 标记，返修提示词会写明"本轮不要动它"。'
+      + '★ deferred_by 必须是真人（Agent 标识会被拒）；reason 必填，且必须指定 code 或 qid（否则会误伤整节 advisory）。'
+      + '只在用户明确同意"这条先不修"时调用；延期是人的决定，不是 Agent 的自我豁免。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['defer', 'revoke', 'list'],
+          description: 'defer(登记延期，默认) | revoke(撤销) | list(查看台账)',
+        },
+        self_dir: {
+          type: 'string',
+          description: 'self 工作区目录（缺省探测：cwd/self → workspaceRegistry[0]/self）',
+        },
+        scope: { type: 'string', description: 'defer：作用范围（小节 scope；留空 = 全项目级）' },
+        code: { type: 'string', description: 'defer：issue code（与 qid 至少给一个）' },
+        qid: { type: 'string', description: 'defer：题号（与 code 至少给一个）' },
+        reason: { type: 'string', description: 'defer 必填：为什么这条现在不修' },
+        deferred_by: { type: 'string', description: 'defer 必填：真人姓名/称呼' },
+        expires_at: { type: 'string', description: 'defer 可选：YYYY-MM-DD，到期自动重新阻断' },
+        target_id: { type: 'string', description: 'revoke 必填：延期条目 id（DF-…）' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          success: { type: 'boolean' },
+          self_dir: { type: 'string' },
+          output: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.output }],
+    },
+    async execute(args) {
+      const selfDir = resolveSelfWorkspaceDir(ctx, args.self_dir);
+      const action = String(args.action || 'defer');
+      let argv;
+      if (action === 'revoke') {
+        if (!args.target_id) {
+          return { success: false, self_dir: selfDir, output: '❌ revoke 需要 target_id' };
+        }
+        argv = ['revoke', '--id', String(args.target_id), '--by', String(args.deferred_by || '')];
+      } else if (action === 'list') {
+        argv = ['list'];
+      } else {
+        argv = ['defer',
+          '--reason', String(args.reason || ''),
+          '--deferred-by', String(args.deferred_by || '')];
+        if (args.scope) argv.push('--scope', String(args.scope));
+        if (args.code) argv.push('--code', String(args.code));
+        if (args.qid) argv.push('--qid', String(args.qid));
+        if (args.expires_at) argv.push('--expires-at', String(args.expires_at));
+      }
+      const res = await runLedger(ctx, selfDir, argv);
+      return { success: res.success, self_dir: selfDir, output: res.output };
     },
   });
 

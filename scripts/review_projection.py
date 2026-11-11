@@ -46,6 +46,8 @@ _PLUGIN_ROOT = os.path.dirname(_HERE)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
+import ledger  # noqa: E402  （N2：advisory 延期台账，投影时读生效条目）
+
 TOOL_NAME = "review_projection.py"
 TOOL_VERSION = "1.0"
 
@@ -573,12 +575,19 @@ def _derived_from(record: Dict[str, Any], review_rel: str, review_sha: str,
     }
 
 
-def _project_issue(item: Any, index: int) -> Dict[str, Any]:
-    """审读 issue → 投影 issue（保留追溯字段 + 语义/验收两侧读取口径）。"""
+def _project_issue(item: Any, index: int,
+                   deferral: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """审读 issue → 投影 issue（保留追溯字段 + 语义/验收两侧读取口径）。
+
+    N2：登记了人工延期的 advisory 不再按 status=open 升级为 blocking——否则
+    "无解但有理由"的问题会逐轮重提，把返修预算耗空。延期是人的决定，必须带
+    reason，并作为独立字段留痕（deferred / deferral 块），不覆写原 status。
+    """
     data = item if isinstance(item, dict) else {}
     status = str(data.get("status") or "open")
     detail = str(data.get("detail") or data.get("claim") or "")
-    return {
+    deferred = bool(deferral) and status == "open"
+    projected = {
         # 追溯字段（验收证据硬要求，缺一即失败）
         "id": str(data.get("id") or "issue-%d" % (index + 1)),
         "qid": str(data.get("qid") or ""),
@@ -591,16 +600,47 @@ def _project_issue(item: Any, index: int) -> Dict[str, Any]:
         # 语义审读 v1 基础字段（evaluate_checker_result 读 severity/claim）
         "claim": str(data.get("claim") or detail),
         "line": data.get("line") if isinstance(data.get("line"), int) else 0,
-        "severity": "blocking" if status == "open" else "advisory",
+        "severity": "blocking" if (status == "open" and not deferred) else "advisory",
     }
+    if deferred:
+        # 只有真的命中延期才多出这两个键：没有延期时投影与旧版逐字节一致，
+        # 存量证据仍可复算认证（verify_projection 是逐字节比对的）。
+        projected["deferred"] = True
+        projected["deferral"] = {
+            "id": str(deferral.get("id") or ""),
+            "reason": str(deferral.get("reason") or ""),
+            "deferred_by": str(deferral.get("deferred_by") or ""),
+            "expires_at": str(deferral.get("expires_at") or ""),
+        }
+    return projected
+
+
+def _deferral_for(self_dir: Optional[str], scope: str,
+                   item: Any) -> Optional[Dict[str, Any]]:
+    """查该 issue 是否命中生效中的延期（self_dir 缺失 → 不延期）。"""
+    if not self_dir:
+        return None
+    data = item if isinstance(item, dict) else {}
+    try:
+        return ledger.find_deferral(
+            self_dir, scope=scope, code=data.get("code"),
+            qid=data.get("qid"))
+    except Exception:  # 台账损坏不该让投影失败（门禁另有阻断）
+        return None
+
+
+def _project_issues(items: Any, scope: str,
+                    self_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    return [_project_issue(item, idx, _deferral_for(self_dir, scope, item))
+            for idx, item in enumerate(items or [])]
 
 
 def project_semantic(record: Dict[str, Any], review_rel: str, review_sha: str,
-                     section: Dict[str, Any]) -> Dict[str, Any]:
+                     section: Dict[str, Any],
+                     self_dir: Optional[str] = None) -> Dict[str, Any]:
     """生成单节语义证据：v1 基础字段（可被旧闸门直接读）+ derived_from。"""
     scope = str(section.get("scope") or "")
-    issues = [_project_issue(item, idx)
-              for idx, item in enumerate(section.get("issues") or [])]
+    issues = _project_issues(section.get("issues"), scope, self_dir)
     return {
         "schema_version": 1,
         "scope": scope,
@@ -617,6 +657,7 @@ def project_semantic(record: Dict[str, Any], review_rel: str, review_sha: str,
 def project_acceptance(record: Dict[str, Any], review_rel: str, review_sha: str,
                        section: Dict[str, Any],
                        disk_digests: Optional[Dict[str, Optional[str]]] = None,
+                       self_dir: Optional[str] = None,
                        ) -> Dict[str, Any]:
     """生成单节验收证据：v2 分支（review_kind + 双证据引用 + derived_from）。"""
     scope = str(section.get("scope") or "")
@@ -629,8 +670,7 @@ def project_acceptance(record: Dict[str, Any], review_rel: str, review_sha: str,
     # 且绝不修改前者去假装它见过新产物。
     reused = any(_is_digest(artifacts.get(rel)) and _is_digest(delivery.get(rel))
                  and artifacts.get(rel) != delivery.get(rel) for rel in wanted)
-    issues = [_project_issue(item, idx)
-              for idx, item in enumerate(section.get("issues") or [])]
+    issues = _project_issues(section.get("issues"), scope, self_dir)
     return {
         "schema_version": 2,
         "review_kind": REVIEW_KIND,
@@ -708,9 +748,11 @@ def build_projections(self_dir: str, record: Dict[str, Any], review_rel: str,
         scope = str(section.get("scope") or "")
         if not scope:
             continue
-        semantic[scope] = project_semantic(record, review_rel, sha, section)
+        semantic[scope] = project_semantic(record, review_rel, sha, section,
+                                           self_dir=self_dir)
         acceptance[scope] = project_acceptance(record, review_rel, sha, section,
-                                               disk_digests=disk_digests)
+                                               disk_digests=disk_digests,
+                                               self_dir=self_dir)
     return {"semantic": semantic, "acceptance": acceptance}, []
 
 
