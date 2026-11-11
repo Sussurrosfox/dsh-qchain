@@ -22,10 +22,12 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from unittest import mock
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
@@ -538,6 +540,34 @@ class TestDeliverSmokeGate(unittest.TestCase):
             json.dump(data, f, ensure_ascii=False)
         return path
 
+    def _write_png(self, rel, inked=True, side=300):
+        """写一张真实 PNG（N8 起门槛要解析像素，夹具不能再是占位字符串）。
+
+        inked=True 时画一条黑带（墨迹占比约 25%），False 时整张纯白。
+        """
+        path = os.path.join(self.d, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rows = []
+        for y in range(side):
+            row = bytearray([0])  # filter type 0
+            for x in range(side):
+                dark = inked and (side // 4 <= y < side // 2)
+                val = 0 if dark else 255
+                row.extend([val, val, val])
+            rows.append(bytes(row))
+        raw = b"".join(rows)
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF))
+
+        ihdr = struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)
+        data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+                + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
     def _report(self, status="pass", png_count=2):
         return {"schema_version": 2, "tool": "render_smoke.py",
                 "tool_version": "1.1", "status": status,
@@ -548,10 +578,16 @@ class TestDeliverSmokeGate(unittest.TestCase):
                              "manifest": ".pd/review/smoke/smoke-manifest.json",
                              "items": [{"png": "x"}] * png_count}}
 
-    def _smoke_manifest(self, png_count=2):
+    def _smoke_manifest(self, png_count=2, inked=True):
+        """生成清单，并按条目数量真实写出 PNG（N8 起逐张核验）。"""
+        items = []
+        for i in range(png_count):
+            rel = ".pd/review/smoke/student-p%s.png" % (i + 1)
+            self._write_png(rel, inked=inked)
+            items.append({"png": rel, "pdf": "student.pdf", "page": i + 1})
         return {"schema_version": 2, "tool": "render_smoke.py",
                 "tool_version": "1.1", "png_count": png_count,
-                "items": [{"png": "x"}] * png_count, "advisory": True}
+                "items": items, "advisory": True}
 
     def test_missing_report_fails(self):
         ok, reason = deliver.smoke_gate_status(self.d, "both")

@@ -73,6 +73,10 @@ agent_dispatch:
     # T1: { provider: <provider>, model: <model> }    # 映射表阶段
     # T2: { provider: <provider>, model: <model> }    # 切片写作阶段
     # T4: { provider: <provider>, model: <model> }    # 验收阶段：应显式配置与 T2 不同的路由（创审分离 INV-2）
+    # 注意（N4）：不配 model_map 时子 Agent **继承父会话当前模型**，于是 T2 与
+    # T4 默认跑在同一个模型上——worker 不同、模型相同。check_agent_audit 会比对
+    # 台账里的生效路由（effective_provider/effective_model）：两侧撞车即
+    # REVIEWER_ROUTE_NOT_SEPARATED 阻断交付；旧台账没记生效路由时只 WARN。
 #   ② 标量档位（旧写法，等价于映射块仅设 profile）：
 # agent_dispatch: safe
 agent_max_concurrency: 0      # 扁平兜底键（v2：嵌套为正时以嵌套为准；legacy：扁平优先）

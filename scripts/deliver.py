@@ -41,6 +41,7 @@ sys.path.insert(0, SCRIPTS)
 import asset_bundle  # noqa: E402
 import evidence  # noqa: E402
 import gen_config  # noqa: E402
+import png_probe  # noqa: E402
 import render_html  # noqa: E402
 
 EXPECTED_SCHEMA = 2
@@ -196,8 +197,14 @@ def smoke_gate_status(self_dir, fmt, skip=False):
       - 报告 status != "pass"  → (False, …)
       - smoke-manifest 缺失    → (False, …)
       - png_count < 1          → (False, …)
+      - 清单里的 PNG 缺失/不是 PNG/几乎全白 → (False, …)   ← 修复 N8
       - 其余                   → (True,  通过…PNG N 张）
     只读盘面文件，不跑子进程，便于单测。
+
+    修复 N8：旧判定只要 `png_count >= 1` 就算过——而「一张全白的渲染页」
+    恰恰是选项丢失/字体未嵌/页边距错位最常见的外形；而主 Agent 侧多个模型
+    没有图像输入能力，所谓「真人过目」实际不会发生。这里补上机械可判据：
+    每张 PNG 必须存在、可解析、非几乎全白（墨迹占比 > BLANK_INK_RATIO）。
     """
     if skip:
         return True, ("已跳过渲染冒烟硬门槛（--skip-smoke）：须在交付说明中"
@@ -232,9 +239,53 @@ def smoke_gate_status(self_dir, fmt, skip=False):
         return False, ("冒烟截图清单 %s 的 png_count=%d（未产出任何 PNG）："
                        "请检查 PDF 是否为空或损坏"
                        % (SMOKE_MANIFEST_REL.replace(os.sep, "/"), png_count))
-    return True, ("渲染冒烟硬门槛通过（%s，PNG %d 张）；真人须过目 "
-                  ".pd/review/smoke/ 截图后方可交付"
-                  % (SMOKE_REPORT_REL.replace(os.sep, "/"), png_count))
+    # 修复 N8：逐张核验截图（存在→可解析→非几乎全白）
+    ok_png, png_reason, ink_summary = inspect_smoke_pngs(self_dir, man)
+    if not ok_png:
+        return False, png_reason
+    return True, ("渲染冒烟硬门槛通过（%s，PNG %d 张%s）；截图由机械判据"
+                  "核验过分辨率与墨迹占比，真人仍建议抽查 .pd/review/smoke/"
+                  % (SMOKE_REPORT_REL.replace(os.sep, "/"), png_count, ink_summary))
+
+
+def inspect_smoke_pngs(self_dir, man):
+    """逐张核验冒烟截图。返回 (ok, reason, ink_summary)。
+
+    清单项可以是 {"png": "相对 self 的路径"}；缺 png 字段视为清单损坏。
+    没有 png_probe 模块（或清单条目全为空）时降级为「只查存在性」，
+    绝不因为工具缺失就静默放行空白页——此时按失败处理并说明原因。
+    """
+    items = man.get("items") or []
+    paths = []
+    for it in items:
+        rel = it.get("png") if isinstance(it, dict) else None
+        if not rel:
+            return False, ("冒烟截图清单条目缺少 png 字段：%r（清单损坏，"
+                           "请重跑 render_smoke.py）" % (it,)), ""
+        paths.append(str(rel).replace("\\", "/"))
+    if not paths:
+        return False, "冒烟截图清单 items 为空（无法核验空白页）", ""
+    problems = []
+    inks = []
+    for rel in paths:
+        abs_path = os.path.join(self_dir, *rel.split("/"))
+        if not os.path.isfile(abs_path):
+            problems.append("%s 不存在" % rel)
+            continue
+        probe = png_probe.probe_or_error(abs_path)
+        if probe.get("bad"):
+            problems.append("%s: %s" % (rel, probe.get("reason")))
+        elif probe.get("ink_ratio") is not None:
+            inks.append(float(probe["ink_ratio"]))
+    if problems:
+        return False, ("冒烟截图核验未通过（%d/%d 张有问题）：%s；"
+                       "空白页通常意味着选项/字体/图片丢失，请修好排版后重跑 "
+                       "render_smoke.py" % (len(problems), len(paths),
+                                            "; ".join(problems[:5]))), ""
+    if inks:
+        return True, "", "，墨迹占比 %.3f%%–%.3f%%" % (min(inks) * 100.0,
+                                                     max(inks) * 100.0)
+    return True, "", ""
 
 
 def run_smoke_check(pdir, fmt):

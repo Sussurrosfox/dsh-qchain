@@ -1600,6 +1600,29 @@ export function apply(ctx, config = {}) {
           request.agentOptions.provider = subArgs.provider;
           request.agentOptions.model = subArgs.model;
         }
+        // 修复 N3：记「生效路由」。宿主在 startActivation 内部用
+        // resolveChildAgentOptions 决定子 Agent 的路由：请求里没给 provider/model
+        // 时**继承父会话当前路由**，而父会话的模型可以在会话中途被切换。因此
+        // 「请求了什么」与「实际用了什么」是两回事——旧台账只记请求值，漂移到
+        // 一个慢模型（首 token 890s、连续三次 900s 超时零输出）时无法归因。
+        // 这里在结果落地后、dispose 之前读子 Agent 会话的 requestHeader().config，
+        // 作为生效路由记进台账（读不到就记 null，绝不猜）。
+        const captureEffectiveRoute = (activation) => {
+          try {
+            const agent = activation && activation.handle && activation.handle.agent;
+            if (!agent || !agent.session || typeof agent.session.requestHeader !== 'function') return null;
+            const header = agent.session.requestHeader();
+            const cfg = header && header.config;
+            if (!cfg || (!cfg.provider && !cfg.model)) return null;
+            return {
+              provider: cfg.provider ? String(cfg.provider) : null,
+              model: cfg.model ? String(cfg.model) : null,
+              reasoning_effort: cfg.reasoningEffort ? String(cfg.reasoningEffort) : null,
+            };
+          } catch (_) {
+            return null;
+          }
+        };
         let lastErr = null;
         for (const providerName of ['spawn', 'fork']) {
           try {
@@ -1614,8 +1637,10 @@ export function apply(ctx, config = {}) {
               delivery: 'caller',
             });
             let result;
+            let effective = null;
             try {
               result = await activation.result;
+              effective = captureEffectiveRoute(activation);
             } finally {
               try {
                 if (typeof activation.dispose === 'function') await activation.dispose();
@@ -1625,6 +1650,8 @@ export function apply(ctx, config = {}) {
               subagentId: String(activation.childId || ''),
               output: (result && Array.isArray(result.output)) ? result.output : [],
               stopReason: (result && result.stopReason) ? String(result.stopReason) : '',
+              activation_provider: providerName,
+              effective_route: effective,
             };
           } catch (err) {
             lastErr = err;
@@ -1633,14 +1660,37 @@ export function apply(ctx, config = {}) {
         if (lastErr) throw lastErr;
         return null;
       };
+      // 修复 N6：宿主 subagent 工具是异步激活语义——`execute` 立即返回
+      // `started subagent <id>`（或 {kind:'activation'}），正文只会经 settlement
+      // 回流。派发链路必须同步拿到正文，因此桥接不可用时**不能**静默回落到它：
+      // 旧实现这样做，结果被判成「未按 FILE 协议返回产物」（content_error，
+      // 不可重试），真正的环境问题被归咎到子 Agent 头上，而且后台子 Agent 无人
+      // await、仍在烧 token。这里改为识别激活形状并显式归因为环境错误。
+      const isActivationResult = (value) => {
+        if (!value) return false;
+        if (typeof value === 'string') return /^\s*started subagent\b/i.test(value);
+        if (typeof value === 'object') {
+          if (value.kind === 'activation') return true;
+          if (value.subagentId && value.output === undefined
+            && value.content === undefined && value.text === undefined) return true;
+        }
+        return false;
+      };
       const callSubagent = async (subArgs, attemptExec) => {
         // 优先：同步桥接（拿到子 Agent 最终 output 块）
         const bridged = await startActivationBridge(subArgs, attemptExec);
-        if (bridged) return bridged;
-        if (subagentDef) return subagentDef.execute(subArgs, attemptExec);
+        if (bridged) {
+          if (attemptExec) attemptExec.hostMode = 'bridge';
+          return bridged;
+        }
+        if (subagentDef) {
+          if (attemptExec) attemptExec.hostMode = 'async-fallback';
+          return subagentDef.execute(subArgs, attemptExec);
+        }
         try {
           const tools = ctx?.tools || ctx?.get?.('tools');
           if (tools && typeof tools.execute === 'function') {
+            if (attemptExec) attemptExec.hostMode = 'async-fallback';
             return tools.execute({
               name: 'subagent',
               arguments: subArgs,
@@ -1652,6 +1702,7 @@ export function apply(ctx, config = {}) {
         } catch (_) {}
         const subagents = ctx?.get?.('subagents') || ctx?.subagents;
         if (subagents && typeof subagents.start === 'function') {
+          if (attemptExec) attemptExec.hostMode = 'subagents-service';
           const run = await subagents.start('spawn', {
             label: subArgs.description || 'qchain subagent',
             prompt: [{ type: 'text', text: subArgs.prompt }],
@@ -1727,6 +1778,9 @@ export function apply(ctx, config = {}) {
         let narrowMissing = [];
         const allWritten = [];
         const allDigests = {};
+        // 修复 N3：生效路由（每个 attempt 独立记；读不到就是 null）
+        let effectiveRoute = null;
+        let activationProvider = '';
         // 槽位是否仍被占用（取消未获宿主确认）：跨 attempt 保留，供返回值与协调者判定
         let hostSlotHeld = false;
         for (let attempt = 1; attempt <= policy.attempts_allowed; attempt += 1) {
@@ -1824,8 +1878,38 @@ export function apply(ctx, config = {}) {
                 error_class: errorClass, retryable: cls.retryable, source: cls.source || '',
                 error: outcome.error && outcome.error.message ? outcome.error.message : String(outcome.error),
               });
+            } else if (isActivationResult(outcome.value)) {
+              // N6：宿主只回了「activation 已启动」，正文不在返回值里。
+              // 这不是子 Agent 的协议错误，是执行环境问题（同步桥接不可用）。
+              // 必须显式归因，且不可重试（重试只会再起一个后台子 Agent）。
+              hostOutcomeUsable = false;
+              status = 'bridge_unavailable';
+              errorClass = 'config';
+              error = '子 Agent 同步桥接不可用：宿主 subagent 工具只返回了异步激活'
+                + '（started subagent …），正文经 settlement 回流而本链路必须同步取回。'
+                + '已放弃该 attempt；请检查 ctx.get("subagents").startActivation 是否可用'
+                + '（该环境可能缺少 spawn/fork 提供者），而不是重试派发。';
+              feedback = '';
+              appendDebugRecord(selfDir, {
+                event: 'bridge_unavailable', dispatch_id: dispatchId, attempt, attempt_id: attemptId,
+                host_mode: (attemptExec && attemptExec.hostMode) || 'unknown',
+                hint: '宿主 subagent 执行器为异步激活语义，无法在本调用内取回产物',
+              });
             } else {
               hostOutcomeUsable = true;
+              // 修复 N3：宿主返回的生效路由（桥接路径才有；回落到异步 subagent
+              // 工具时宿主不回报，保持 null——绝不把「请求的」当成「生效的」）。
+              effectiveRoute = (outcome.value && outcome.value.effective_route) || null;
+              activationProvider = (outcome.value && outcome.value.activation_provider) || '';
+              if (effectiveRoute && (route.provider || route.model)
+                && (effectiveRoute.provider !== (route.provider || null)
+                  || effectiveRoute.model !== (route.model || null))) {
+                appendDebugRecord(selfDir, {
+                  event: 'route_drift', dispatch_id: dispatchId, attempt, attempt_id: attemptId,
+                  requested_provider: route.provider || null, requested_model: route.model || null,
+                  effective_provider: effectiveRoute.provider, effective_model: effectiveRoute.model,
+                });
+              }
               parsed = parseSubagentFiles(outcome.value, request.artifacts);
               parsed.stopReason = (outcome.value && outcome.value.stopReason)
                 ? String(outcome.value.stopReason) : '';
@@ -2054,6 +2138,16 @@ export function apply(ctx, config = {}) {
                 provider: route.provider || null,
                 model: route.model || null,
                 route_key: route.matched_key || null,
+                // N3：请求路由 vs 生效路由分开记。生效值来自子 Agent 会话的
+                // requestHeader().config；桥接不可用时无从得知，一律 null。
+                requested_provider: route.provider || null,
+                requested_model: route.model || null,
+                effective_provider: effectiveRoute ? effectiveRoute.provider : null,
+                effective_model: effectiveRoute ? effectiveRoute.model : null,
+                effective_reasoning_effort: effectiveRoute ? effectiveRoute.reasoning_effort : null,
+                route_source: effectiveRoute ? 'host-session'
+                  : ((route.provider && route.model) ? 'requested-only' : 'inherited-unknown'),
+                activation_provider: activationProvider || null,
                 // C12.4：started_at/finished_at 是「宿主调用窗口」的两个端点，
                 // 不是供应商开始推理的时间；推理时间只有真实值时才填，否则 null。
                 started_at: hostWindowStart.toISOString(),
@@ -2122,6 +2216,16 @@ export function apply(ctx, config = {}) {
               worker,
               provider: route.provider || null,
               model: route.model || null,
+              // N3：请求值与生效值分列；`provider/model` 保持历史语义（请求值），
+              // 这样既有审计脚本不必改，新增字段供归因与 INV-2 路由分离核对。
+              requested_provider: route.provider || null,
+              requested_model: route.model || null,
+              effective_provider: effectiveRoute ? effectiveRoute.provider : null,
+              effective_model: effectiveRoute ? effectiveRoute.model : null,
+              effective_reasoning_effort: effectiveRoute ? effectiveRoute.reasoning_effort : null,
+              route_source: effectiveRoute ? 'host-session'
+                : ((route.provider && route.model) ? 'requested-only' : 'inherited-unknown'),
+              activation_provider: activationProvider || null,
               started_at: startedAt.toISOString(),
               finished_at: finishedAt.toISOString(),
               host_call_started_at: hostWindowStart.toISOString(),

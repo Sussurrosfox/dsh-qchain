@@ -14,6 +14,10 @@ r"""check_agent_audit.py — 多 Agent 证据链门禁审计（q_audit.md 根因
   EVIDENCE_STALE               证据与盘面产物摘要不符（证据落盘后产物被改写）
   REVIEWER_IDENTITY_VIOLATION  T4 验收 worker 与写作阶段 worker 同体（违反
                                INV-2 创审分离：验收必须由未参与写作的子 Agent 完成）
+  REVIEWER_ROUTE_NOT_SEPARATED 验收与写作的**生效模型路由**完全相同（worker 不同、
+                               模型相同）——host 默认让子 Agent 继承父会话路由，
+                               未配 model_map 时这是默认形态，独立审读在模型层不存在
+  REVIEWER_ROUTE_UNRECORDED    （WARN）验收证据没记录生效路由，无法核对模型层分离
 
 superseded 规则：旧派发单的产物若已由另一条证据台账（不同 dispatch_id、
 status ok、摘要与盘面一致）重新认证（典型场景：返修环重派），则该旧派发单
@@ -83,6 +87,24 @@ def _is_reviewer_evidence(self_dir, ev):
         batch = str((ev or {}).get("batch_id") or "")
         return batch.startswith(T4_BATCH_PREFIX) or batch.startswith(
             T4_COMBINED_BATCH_PREFIX)
+
+
+def _evidence_route(ev):
+    """证据台账里的模型路由 (provider, model)；未知返回 None。
+
+    N3 起台账分列 requested_*（请求的）与 effective_*（子 Agent 会话实际用的）。
+    判定创审是否真的换了模型必须用生效值；旧台账没有该字段时退回
+    provider/model（那时它就是请求值，且多半为 null → 视为未知）。
+    """
+    if not isinstance(ev, dict):
+        return None
+    for key in (("effective_provider", "effective_model"),
+                ("provider", "model")):
+        provider = ev.get(key[0])
+        model = ev.get(key[1])
+        if provider and model:
+            return (str(provider), str(model))
+    return None
 
 
 def _load_json(path):
@@ -460,6 +482,47 @@ def audit_agent_evidence(workdir, allow_unattested=None):
             _record("REVIEWER_IDENTITY_VIOLATION",
                     f"验收证据 {dispatch_id} 的 worker={worker} 与写作阶段"
                     f"（T1/T2）证据同体，违反 INV-2 创审分离", dispatch_id)
+
+    # ---- INV-2 路由层：审读与写作不得用同一模型路由（N4）-----------------
+    # worker id 不同只证明「会话是另起的」。宿主默认让子 Agent 继承父会话
+    # 当前的 provider/model（dsh-subagent resolveChildAgentOptions），config.yaml
+    # 的 model_map 又默认整块注释掉——于是「不同 worker、同一个模型」成为默认
+    # 形态：审读方与写作方共享同样的偏差，独立审读在模型层根本不存在。
+    # 这里读台账里的生效路由（effective_*，N3 起记录；旧台账回落到 provider/model）：
+    #   - 两侧都已知且完全相同 → REVIEWER_ROUTE_NOT_SEPARATED（FAIL）
+    #   - 存在未知（null）    → REVIEWER_ROUTE_UNRECORDED（WARN，提示补 model_map）
+    writer_routes = {}
+    for ev in evidence_files:
+        if not str(ev.get("worker") or "").strip():
+            continue
+        if _is_reviewer_evidence(self_dir, ev):
+            continue
+        route = _evidence_route(ev)
+        if route is not None:
+            writer_routes.setdefault(route, str(ev.get("dispatch_id") or ""))
+    unrecorded = 0
+    for ev in evidence_files:
+        if not str(ev.get("worker") or "").strip():
+            continue
+        if not _is_reviewer_evidence(self_dir, ev):
+            continue
+        dispatch_id = str(ev.get("dispatch_id") or "")
+        route = _evidence_route(ev)
+        if route is None:
+            unrecorded += 1
+            continue
+        if route in writer_routes:
+            _record("REVIEWER_ROUTE_NOT_SEPARATED",
+                    f"验收证据 {dispatch_id} 与写作证据 {writer_routes[route]}"
+                    f" 使用同一模型路由 {route[0]}/{route[1]}：worker 不同但模型相同，"
+                    f"独立审读在模型层不存在（请在 config.yaml 的 "
+                    f"agent_dispatch.model_map 为 T4 配置与 T2 不同的路由）",
+                    dispatch_id)
+    if unrecorded:
+        _record("REVIEWER_ROUTE_UNRECORDED",
+                f"{unrecorded} 条验收证据未记录生效路由（provider/model 均为空）："
+                f"无法核对创审在模型层是否分离；升级后新派发会记录 effective_*",
+                "", "warning")
 
     # ---- 缓存复用台账对账（任务16/C7）-----------------------------------
     # 缓存命中的 scope 没有本轮派发单，因此**不会**进入上面的遍历；这既避免
