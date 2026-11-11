@@ -39,6 +39,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import evidence  # noqa: E402（scripts/ 已在 sys.path）
+import section_scan  # noqa: E402
 
 TOOL_NAME = "check_semantic.py"
 TOOL_VERSION = "1.0"
@@ -47,7 +48,8 @@ SEMANTIC_DIR_REL = os.path.join(".pd", "semantic")
 SHUFFLE_MAP_REL = os.path.join(".pd", "shuffle-map.json")
 SCHEMA_VERSION = 1
 CONCLUSIONS = ("PASS", "REVISE", "NEEDS_EVIDENCE")
-RE_MAIN_INPUT = re.compile(r"^\s*\\input\{(sec[0-9A-Za-z_-]+)\.tex\}", re.MULTILINE)
+#: 统一口径（见 section_scan：扩展名可选、\\include 同等对待）
+RE_MAIN_INPUT = section_scan.RE_MAIN_INPUT
 
 
 def _sha256_file(path):
@@ -69,17 +71,18 @@ def _load_json(path):
 
 
 def expected_sections(workdir):
-    """受检范围 = main.tex 的 \\input{sec*.tex}（装配即交付范围）。"""
-    main_tex = os.path.join(workdir, "main.tex")
-    if not os.path.isfile(main_tex):
+    """受检范围 = main.tex 的 \\input{sec*}（装配即交付范围）。
+
+    N7：`\\input{sec1}`（不带扩展名）是合法 LaTeX，原名口径只认 `sec1.tex`
+    会扫出 0 个小节，于是"零受检项"被当成"全部通过"。口径统一到
+    section_scan：扩展名可选、\\include 同等对待、扫不出时回落磁盘 sec*.tex。
+    真的一无所有时返回 []（调用方报 SEMANTIC_NO_SECTIONS 阻断），
+    只剩 main.tex 缺失返回 None 这一种"无从判断"。
+    """
+    if not section_scan.has_main_tex(workdir):
         return None
-    with open(main_tex, encoding="utf-8", errors="replace") as f:
-        text = f.read()
-    secs = []
-    for name in RE_MAIN_INPUT.findall(text):
-        if name not in secs:
-            secs.append(name)
-    return secs
+    sections, _source = section_scan.resolve_sections(workdir)
+    return sections
 
 
 def load_shuffle_transitions(workdir):
@@ -226,6 +229,11 @@ def check_semantic_project(workdir, scope=""):
                 "code": "SEMANTIC_MAIN_MISSING",
                 "detail": "main.tex 缺失，无法确定受检小节范围"})
             sections = []
+        elif not sections:
+            # N7：零命中不是"没有小节要查"，而是"检查根本没生效"
+            errors.append({
+                "code": "SEMANTIC_NO_SECTIONS",
+                "detail": section_scan.no_slice_detail(workdir)})
     passed = 0
     for sec in sections:
         issues = check_scope(workdir, sec)

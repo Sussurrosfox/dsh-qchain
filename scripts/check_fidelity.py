@@ -81,6 +81,21 @@ RE_ASSET_FIGURE = re.compile(
 RE_ASSET_TABLE = re.compile(r"\\begin\{tabular\*?\}")
 #: 单元 locator 的行号区间（如 "§ 2.4.1 定义 L12-80"）。
 RE_LOCATOR_LINES = re.compile(r"L(\d+)-(\d+)\s*$")
+#: novelty 归一时要剥掉的括号补充说明（捕获括号内文字，供"是否只是空话"判定）。
+_RE_PAREN_NOTE = re.compile(r"[\(（\[【]([^\)）\]】]*)[\)）\]】]")
+#: novelty 归一收尾时要剥掉的标点（真声明不会以这些字符开头/结尾）。
+_NOVELTY_PUNCT = ("。.,，、;；:：!！?？~～-_—–=+*`'\"“”‘’()（）[]【】{}<>《》"
+                  "/／\\|·・×∅ø　")
+#: novelty 归一用的"空词"碎片：删光后无残渣即视为未声明新对象（见
+#: normalize_new_objects 的说明——判定的是残渣，不是穷举整串）。
+_EMPTY_TOKENS = (
+    "无新增对象", "无新增内容", "无新增", "无扩展", "无新对象", "无变化",
+    "未新增任何对象", "未新增", "没有任何", "任何", "暂无", "没有", "无", "未",
+    "新增", "扩展", "新对象", "对象", "内容", "变化", "改动", "变更", "沿用",
+    "原文", "保持", "不变", "仅",
+    "none", "null", "nil", "n/a", "na", "nothing", "empty", "blank", "[]", "()", "{}",
+)
+_EMPTY_TOKENS_SORTED = tuple(sorted(set(_EMPTY_TOKENS), key=len, reverse=True))
 
 ASSET_KIND_LABEL = {"figure": "图形", "table": "表格"}
 
@@ -221,6 +236,48 @@ def parse_coverage_map(self_dir):
             "scope": cells[col["scope"]] if "scope" in col else "",
         })
     return rows, []
+
+
+def _novelty_residue(text):
+    """把"空词"全删掉后剩下的残渣（去掉标点与空白后的小写形态）。"""
+    dense = re.sub(r"\s+", "", text or "").lower()
+    residue = dense
+    for token in _EMPTY_TOKENS_SORTED:
+        residue = residue.replace(token, "")
+    return residue.strip(_NOVELTY_PUNCT)
+
+
+def normalize_new_objects(value):
+    """coverage-map「new_objects」列的空值归一（N9 fail-close）。
+
+    审计发现：原实现用一张穷举元组 `("无","无新增","无。","-","—","--",
+    "none","NONE","N/A","n/a","无新增对象","∅")` 判空。coverage-planner 写空值
+    的写法远不止这些——「无新增。」「无（仅沿用原文）」「未新增任何对象」
+    「None」「null」「[]」「暂无」……每漏一个变体，一行本该无事的覆盖记录就被
+    FIDELITY_NOVELTY_UNAPPROVED 判成"声明了新对象却没登记扩展"，返修子 Agent
+    只能去改一个本来就没问题的格子。
+
+    改为**剥壳 + 残渣判定**（而非穷举）：
+      1. 括号里若只是空话（"（仅沿用原文）"）就整段丢掉；括号里若真有内容
+         （"（新增 Newton 迭代）"）则保留括号内的文字；
+      2. 去掉首尾标点；
+      3. 把"空词"逐个删掉，**删完什么都不剩**才判空。
+    这样既接住无穷变体，又不会误吞真声明——「无新增对象：正弦定理」删完
+    还剩"正弦定理"，照旧阻断。
+    """
+
+    def _open_note(match):
+        inner = match.group(1) or ""
+        return "" if not _novelty_residue(inner) else inner
+
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    text = _RE_PAREN_NOTE.sub(_open_note, raw)
+    text = text.strip(_NOVELTY_PUNCT)
+    if not _novelty_residue(text):
+        return ""
+    return raw
 
 
 def parse_anchors(self_dir):
@@ -598,12 +655,8 @@ def check_fidelity_project(workdir):
     warnings.extend(cov_warnings)
     if cov_rows:
         for cr in cov_rows:
-            # 口径归一化：「无 / 无新增 / - / — / none / N/A」一律视为未声明
-            # 新对象（coverage-planner 的空值口径），不得按“声明了新对象”阻断
-            nov = (cr["new_objects"] or "").strip()
-            if nov in ("无", "无新增", "无。", "-", "—", "--", "none", "NONE",
-                       "N/A", "n/a", "无新增对象", "∅"):
-                nov = ""
+            # 口径归一化（N9）：不再穷举空值写法，改判"剥壳后的残渣"
+            nov = normalize_new_objects(cr["new_objects"])
             cr["new_objects"] = nov
             if nov and cr["action"] not in ("BRIDGE", "EXTEND"):
                 errors.append({

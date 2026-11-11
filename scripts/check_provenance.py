@@ -60,6 +60,7 @@ if PLUGIN_ROOT not in sys.path:
 
 import evidence  # noqa: E402
 import request_scopes  # noqa: E402  C5：多 scope 授权唯一口径
+import section_scan  # noqa: E402
 
 TOOL_NAME = "check_provenance.py"
 TOOL_VERSION = "1.0"
@@ -74,7 +75,7 @@ CALLS_DIR_REL = os.path.join(".pd", "agent-calls")
 SEMANTIC_DIR_REL = os.path.join(".pd", "semantic")
 COVERAGE_MAP_REL = "coverage-map.md"
 
-RE_MAIN_INPUT = re.compile(r"^\s*\\input\{(sec[0-9A-Za-z_-]+)\.tex\}", re.MULTILINE)
+RE_MAIN_INPUT = section_scan.RE_MAIN_INPUT
 RE_QID_LINE = re.compile(r"^\s*%\s*qid:\s*([^\s%|]+)", re.MULTILINE)
 RE_SEC_TEX = re.compile(r"^sec[0-9A-Za-z_-]+\.tex$")
 
@@ -114,16 +115,9 @@ def _sha256_file(path):
 
 
 def expected_sections(self_dir):
-    r"""main.tex 的 \input 清单；缺失时回退磁盘 sec*.tex。"""
-    path = os.path.join(self_dir, "main.tex")
-    if os.path.isfile(path):
-        with open(path, encoding="utf-8", errors="replace") as f:
-            found = RE_MAIN_INPUT.findall(f.read())
-        if found:
-            return list(dict.fromkeys(found))
-    names = [n for n in os.listdir(self_dir) if RE_SEC_TEX.match(n)] \
-        if os.path.isdir(self_dir) else []
-    return sorted(os.path.splitext(n)[0] for n in names)
+    r"""main.tex 的 \input 清单；扫不出时回退磁盘 sec*.tex（N7 统一口径）。"""
+    sections, _source = section_scan.resolve_sections(self_dir)
+    return sections
 
 
 def _load_requests(self_dir):
@@ -235,6 +229,11 @@ def check_provenance_project(workdir, mode=MODE_FULL):
     errors, warnings = [], []
 
     sections = expected_sections(self_dir)
+    if not sections:
+        # N7：零小节 = 血缘核对没生效，不是"没有小节要查"
+        errors.append({
+            "code": "PROVENANCE_NO_SECTIONS",
+            "detail": section_scan.no_slice_detail(self_dir)})
     requests = _load_requests(self_dir)
     has_pipeline = bool(requests)
 

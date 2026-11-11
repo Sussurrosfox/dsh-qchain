@@ -59,13 +59,13 @@ CHECKS = [
     ("check_dialogue.py", "check_dialogue.json"),
     ("check_fidelity.py", "check_fidelity.json"),
     ("check_semantic.py", "check_semantic.json"),
-    ("build.py", "build.json", ["--max-overfull-pt", "300", "--allow-mdframed-breaks", "--max-underfull-teacher", "20"]),
+    ("build.py", "build.json", ["--max-overfull-pt", "300", "--allow-mdframed-breaks", "--max-underfull-teacher", "20", "--format", "{fmt}"]),
     # §19 渲染质量门禁（audit：GR.4 交付后人工发现 HTML 乱码/PDF 选项空白，
     # 而彼时全部结构门禁均 PASS）。必须在 build 之后：查的是渲染产物本身
     # （*.html / *.pdf / *.log），{fmt} 在运行期替换为实际交付格式。
     ("check_render.py", "check_render.json", ["--format", "{fmt}"]),
     ("check_budget.py", "check_budget.json", ["--stage", "delivery"]),
-    ("compare_versions.py", "compare.json"),
+    ("compare_versions.py", "compare.json", ["--format", "{fmt}"]),
     ("check_agent_audit.py", "check_agent_audit.json"),
     # §7 provenance_gate：每节可回溯 writer attempt（认证当前内容摘要）/
     # checker 结果 / qid 规划登记，写域白名单外路径一律拒绝
@@ -343,21 +343,68 @@ def _agent_calls_digest(pdir):
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
-def atomic_release(pdir, manifest, fmt="both", html_smoke=None):
-    """先写临时目录，全部成功后原子切换 release。
+class ReleaseManifestError(Exception):
+    """manifest 声明的交付物在实际包里不存在（清单与包不自洽）。"""
 
-    发布顺序（契约 C8 固定）：构建 staging → 写 manifest.json → 对 staging 做
-    格式对应的完整性/浏览器验收 → 成功才把旧 release 改名 backup → staging
-    改名 release → 清理 backup。验收失败保留原 release，不吞错。
+
+def build_deliverables(pdir, fmt="both"):
+    """按交付格式生成 deliverables 清单（T4）。
+
+    清单必须与 prepare_staging 的复制口径一一对应：旧实现无条件检查四个
+    文件是否存在、与 fmt 无关，于是 fmt=html 的包里只有 html、清单却声明
+    student.pdf/teacher.pdf —— 第三方照清单核查必然"声明了不存在的交付物"。
+    """
+    items = []
+    if fmt in ("pdf", "both"):
+        if os.path.isfile(os.path.join(pdir, "student.pdf")):
+            items.append({"file": "student.pdf", "audience": "student",
+                          "description": "学生自学与作答案（剥离解答与教师注记）"})
+        if os.path.isfile(os.path.join(pdir, "teacher.pdf")):
+            items.append({"file": "teacher.pdf", "audience": "teacher",
+                          "description": "教师备课参考案（含完整解答与设计意图）"})
+    if os.path.isfile(os.path.join(pdir, "classroom-plan.md")):
+        items.append({"file": "classroom-plan.md", "audience": "teacher",
+                      "description": "翻转课堂教师讲解方案与卡点回收表"})
+    if fmt in ("html", "both"):
+        if os.path.isfile(os.path.join(pdir, "student.html")):
+            items.append({"file": "student.html", "audience": "student",
+                          "description": "学生版自适应探究卡片牌组"})
+        if os.path.isfile(os.path.join(pdir, "teacher.html")):
+            items.append({"file": "teacher.html", "audience": "teacher",
+                          "description": "教师版卡片牌组（含对白与解答抽屉）"})
+    calls_dir = os.path.join(pdir, ".pd", "agent-calls")
+    if os.path.isdir(calls_dir) and \
+            any(f.endswith(".json") for f in os.listdir(calls_dir)):
+        items.append({"file": "agents/", "audience": "auditor",
+                      "description": "多 Agent 派发证据台账（每次子 Agent 派发的 worker 身份与产物 sha256，q_audit.md 证据链）"})
+    return items
+
+
+def release_paths(pdir):
+    """(release, staging, backup) 三个路径，发布与干跑共用同一套。"""
+    return (os.path.join(pdir, "release"),
+            os.path.join(pdir, ".release-staging"),
+            os.path.join(pdir, ".release-prev"))
+
+
+def prepare_staging(pdir, manifest, fmt="both", html_smoke=None):
+    """按 fmt 把交付物装配进 .release-staging 并做全部离线验收。
+
+    成功返回（已回填验收结果的）manifest，**staging 保留在盘上**——由调用方
+    决定是切换成 release（atomic_release）还是验收后删掉（--dry-run）。
+
+    失败抛异常并清空 staging，旧 release 一个字节都不动。抽成独立函数是为了
+    让干跑与真发布走**同一条**验收链路：T3 审计发现干跑在
+    `if args.dry_run: return 0` 处提前返回，而 HTML 侧浏览器验收只在
+    atomic_release 内部执行——于是 `--dry-run --format html` 全绿却从未
+    真的打开过包内页面。
 
     html_smoke:
         None     用随包 scripts/html_smoke.py 做真实浏览器验收（发布路径默认）
         callable 自定义验收器 f(package_dir, report_path) -> (report, exit_code)
         False    显式跳过（仅限资源/回滚类测试与开发态，调用方自负）
     """
-    rel = os.path.join(pdir, "release")
-    staging = os.path.join(pdir, ".release-staging")
-    backup = os.path.join(pdir, ".release-prev")
+    _rel, staging, _backup = release_paths(pdir)
     if os.path.exists(staging):
         shutil.rmtree(staging)
     os.makedirs(staging)
@@ -404,6 +451,27 @@ def atomic_release(pdir, manifest, fmt="both", html_smoke=None):
             if sources:
                 manifest["asset_sources"] = sources
         # manifest.json 写在最后；files 清单覆盖其余全部实际文件（不含自身）
+        # T4：清单自洽核对——manifest.deliverables 里声明的每个文件都必须真的
+        # 在包里。旧实现按 os.path.isfile(pdir/...) 逐条追加、与 fmt 无关，而
+        # staging 只按 fmt 复制，于是 fmt=html 的包里只有 3 个文件、清单却声明
+        # student.pdf/teacher.pdf——第三方照清单核查必然发现"声明了不存在的
+        # 交付物"。这里在写 manifest 之前就对账，不自洽直接中止发布。
+        declared = [str(d.get("file") or "") for d in (manifest.get("deliverables") or [])
+                    if isinstance(d, dict)]
+        missing_declared = []
+        for name in declared:
+            if not name:
+                continue
+            target = os.path.join(staging, name)
+            if name.endswith("/"):
+                if not os.path.isdir(target):
+                    missing_declared.append(name)
+            elif not os.path.isfile(target):
+                missing_declared.append(name)
+        if missing_declared:
+            raise ReleaseManifestError(
+                "manifest.deliverables 声明了包内不存在的交付物: %s"
+                % ", ".join(missing_declared))
         manifest["files"] = asset_bundle.build_file_manifest(staging)
         with open(os.path.join(staging, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -437,6 +505,21 @@ def atomic_release(pdir, manifest, fmt="both", html_smoke=None):
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+    return manifest
+
+
+def atomic_release(pdir, manifest, fmt="both", html_smoke=None):
+    """先写临时目录，全部成功后原子切换 release。
+
+    发布顺序（契约 C8 固定）：构建 staging → 写 manifest.json → 对 staging 做
+    格式对应的完整性/浏览器验收 → 成功才把旧 release 改名 backup → staging
+    改名 release → 清理 backup。验收失败保留原 release，不吞错。
+
+    装配与验收全部委托 prepare_staging（干跑复用同一条链路，见其文档）。
+    """
+    rel, staging, backup = release_paths(pdir)
+    manifest = prepare_staging(pdir, manifest, fmt=fmt, html_smoke=html_smoke)
 
     if os.path.isdir(rel):
         if os.path.exists(backup):
@@ -594,6 +677,20 @@ def main():
                                 % (script, proc.returncode, (proc.stderr or proc.stdout).strip()[:150]))
         rep = load_json(rep_path)
         reports[report_name] = rep
+
+    # T2：交付格式必须是单一真源。旧实现只给 check_render.py 传 {fmt}，
+    # build.py / compare_versions.py 各自回落 config.yaml 的 output_format——
+    # 于是 `--format html` + config.yaml=pdf 时，12 个门禁按 pdf 查、deliver 按
+    # html 打包，两套结论互相矛盾却全部"通过"。这里再加一道对账：报告里
+    # 记录的实际生效格式与本次 fmt 不一致，一律阻断（防止以后又漏传参数）。
+    for _report_name, _rep in reports.items():
+        if not isinstance(_rep, dict):
+            continue
+        _rep_fmt = str(_rep.get("output_format") or "").strip().lower()
+        if _rep_fmt and _rep_fmt != fmt:
+            blockers.append("%s 记录的 output_format=%s 与本次交付格式 %s 不一致"
+                            "（格式敏感门禁必须收到同一个 --format）"
+                            % (_report_name, _rep_fmt, fmt))
 
     # 计算产物哈希
     pdf_sha = {}
@@ -765,20 +862,7 @@ def main():
     agent_calls_digest = _agent_calls_digest(pdir)
     if agent_calls_digest:
         evidence_hashes["agent-calls"] = agent_calls_digest
-    deliverables = []
-    if os.path.isfile(os.path.join(pdir, "student.pdf")):
-        deliverables.append({"file": "student.pdf", "audience": "student", "description": "学生自学与作答案（剥离解答与教师注记）"})
-    if os.path.isfile(os.path.join(pdir, "teacher.pdf")):
-        deliverables.append({"file": "teacher.pdf", "audience": "teacher", "description": "教师备课参考案（含完整解答与设计意图）"})
-    if os.path.isfile(os.path.join(pdir, "classroom-plan.md")):
-        deliverables.append({"file": "classroom-plan.md", "audience": "teacher", "description": "翻转课堂教师讲解方案与卡点回收表"})
-    if os.path.isfile(os.path.join(pdir, "student.html")):
-        deliverables.append({"file": "student.html", "audience": "student", "description": "学生版自适应探究卡片牌组"})
-    if os.path.isfile(os.path.join(pdir, "teacher.html")):
-        deliverables.append({"file": "teacher.html", "audience": "teacher", "description": "教师版卡片牌组（含对白与解答抽屉）"})
-    if os.path.isdir(os.path.join(pdir, ".pd", "agent-calls")) and \
-            any(f.endswith(".json") for f in os.listdir(os.path.join(pdir, ".pd", "agent-calls"))):
-        deliverables.append({"file": "agents/", "audience": "auditor", "description": "多 Agent 派发证据台账（每次子 Agent 派发的 worker 身份与产物 sha256，q_audit.md 证据链）"})
+    deliverables = build_deliverables(pdir, fmt)
 
     manifest = {
         "schema_version": evidence.SCHEMA_VERSION,
@@ -819,11 +903,33 @@ def main():
         "evidence": {"evidence_hashes": evidence_hashes}
     }
 
-    # D1：干跑模式——全部校验通过后不发布，如实报告结论
+    # D1：干跑模式——全部校验通过后不发布，如实报告结论。
+    # T3：干跑**也要**跑 HTML 侧验收。旧实现在这里直接 return 0，而 HTML 离线
+    # 包验收只存在于 atomic_release 内部 —— `--dry-run --format html` 全程
+    # 没人打开过包内页面却报"全部门禁通过"，演练与真发布是两套结论。
+    # 现在干跑复用 prepare_staging 走同一条装配+验收链路，验收完删掉 staging。
     if args.dry_run:
         print("=" * 64)
-        print("[deliver] 干跑模式（--dry-run）：全部门禁校验通过，"
-              "未发布 release/（如需交付请去掉 --dry-run 重跑）。")
+        print("[deliver] 干跑模式（--dry-run）：门禁校验通过，开始干跑验收"
+              "（不发布 release/）。")
+        if fmt in ("html", "both") and not skip_html_smoke:
+            _rel, _staging, _backup = release_paths(pdir)
+            try:
+                prepare_staging(pdir, manifest, fmt=fmt, html_smoke=None)
+            except HtmlSmokeError as e:
+                print("[deliver] 发布中止（HTML 离线包浏览器验收未通过）: %s" % e)
+                print("  提示: %s" % HTML_SMOKE_SKIP_HINT)
+                return 2
+            except Exception as e:
+                print("[deliver] 干跑验收失败: %s" % e)
+                return 2
+            finally:
+                shutil.rmtree(_staging, ignore_errors=True)
+            print("[deliver] HTML 离线包浏览器验收已通过（干跑，staging 已清理）。")
+        elif fmt in ("html", "both"):
+            print("[deliver] HTML 侧浏览器验收被显式跳过（--skip-html-smoke）："
+                  "干跑结论不覆盖 HTML 包可用性。")
+        print("[deliver] 干跑结论：可交付，未发布（如需交付请去掉 --dry-run 重跑）。")
         print("=" * 64)
         return 0
 

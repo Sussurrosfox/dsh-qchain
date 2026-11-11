@@ -45,6 +45,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import evidence  # noqa: E402（scripts/ 已在 sys.path）
+import section_scan  # noqa: E402
 
 TOOL_NAME = "check_scope.py"
 TOOL_VERSION = "1.0"
@@ -55,7 +56,7 @@ SCOPE_CHANGE_REL = os.path.join(".pd", "scope-change.json")
 CONFIG_REL = "config.yaml"
 COVERAGE_MAP_REL = "coverage-map.md"
 
-RE_MAIN_INPUT = re.compile(r"^\s*\\input\{(sec[0-9A-Za-z_-]+)\.tex\}", re.MULTILINE)
+RE_MAIN_INPUT = section_scan.RE_MAIN_INPUT
 #: coverage-map 统计行：**核心推导总分钟数**: 137 分钟
 RE_CORE_MINUTES = re.compile(r"核心推导总分钟数[^\d]{0,20}(\d+)\s*分钟")
 
@@ -138,11 +139,9 @@ def _effective_minutes(cfg):
 
 
 def _main_sections(self_dir):
-    path = os.path.join(self_dir, "main.tex")
-    if not os.path.isfile(path):
-        return []
-    with open(path, encoding="utf-8", errors="replace") as f:
-        return RE_MAIN_INPUT.findall(f.read())
+    """main.tex 引用的小节（N7：口径统一到 section_scan，扫不出回落磁盘）。"""
+    sections, _source = section_scan.resolve_sections(self_dir)
+    return sections
 
 
 def check_scope_project(workdir):
@@ -240,7 +239,18 @@ def check_scope_project(workdir):
                                    for e in pending_changes[:5]))})
 
     # ---- 7. 节数规划核对（main.tex 不得引入未规划小节）----
-    sections = _main_sections(self_dir)
+    sections, sec_source = section_scan.resolve_sections(self_dir)
+    if not sections:
+        # N7：零小节 = 范围核对没生效，不是"没有小节要查"
+        errors.append({
+            "code": "SCOPE_NO_SECTIONS",
+            "detail": section_scan.no_slice_detail(self_dir)})
+    elif sec_source == "files":
+        warnings.append({
+            "code": "SCOPE_SECTIONS_FROM_FILES",
+            "detail": "main.tex 未扫到 \\input{sec*} 引用，已按工作区实存切片"
+                      "核对 %d 个小节（%s）"
+                      % (len(sections), ", ".join(sections))})
     coverage_path = os.path.join(self_dir, COVERAGE_MAP_REL)
     coverage_text = ""
     if os.path.isfile(coverage_path):
