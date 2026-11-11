@@ -14,6 +14,9 @@ import {
 import {
   resolveDispatchPolicy, DispatchPolicyError,
 } from './scripts/dispatch_policy.mjs';
+import {
+  sanitizeId, assertWithin, isWithin, PathSafetyError, normalizeRel,
+} from './scripts/path_safety.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = __dirname;
@@ -145,6 +148,16 @@ function qdReadJson(absPath) {
 
 function qdSafeJoin(selfDir, rel) {
   return safeJoinSelf(selfDir, rel);
+}
+
+/** 白名单产物里第一个非法路径（非法即整单拒绝，不跳过、不静默）。 */
+function qdFirstInvalidArtifact(selfDir, request) {
+  const arts = Array.isArray(request && request.artifacts) ? request.artifacts : [];
+  for (const a of arts) {
+    if (typeof a !== 'string' || !a.trim()) continue;
+    if (!qdSafeJoin(selfDir, a)) return a;
+  }
+  return '';
 }
 
 function qdSha256File(absPath) {
@@ -318,8 +331,14 @@ function qdResolveRequests(selfDir, args) {
 // .pd/dispatch-claims/<dispatch_id>.json  —— 以 fs.openSync(...,'wx') 原子创建
 // （Node 单线程 + O_EXCL ⇒ 同进程内并发二次调用必有一次拿到 EEXIST）。
 
+// 修复 D1：dispatch_id 直接拼进文件名，含 `../../x` 可把 claim 写到 self 之外。
+// 现在先过标识符白名单，再经 realpath 越界断言；非法 id 一律不落盘。
 function qdClaimPath(selfDir, dispatchId) {
-  return path.join(selfDir, '.pd', 'dispatch-claims', `${dispatchId}.json`);
+  const safeId = sanitizeId(dispatchId, { label: 'dispatch_id' });
+  const dir = path.join(selfDir, '.pd', 'dispatch-claims');
+  const abs = path.join(dir, `${safeId}.json`);
+  assertWithin(selfDir, abs, '派发认领文件');
+  return abs;
 }
 
 function qdPidAlive(pid) {
@@ -369,7 +388,18 @@ function qdClaimIsReusable(selfDir, request, existing) {
 
 function qdAcquireClaim(selfDir, request) {
   const dispatchId = String(request.dispatch_id || '');
-  const claimPath = qdClaimPath(selfDir, dispatchId);
+  // 修复 D1：非法 dispatch_id 一律**不落盘**，直接以显式错误返回（旧实现先
+  // mkdirSync + openSync('wx') 落 claim，之后才在 buildDispatchPrompt 报错，
+  // 于是 `../../../x` 会把 claim 写到 self 的父目录）。
+  let claimPath;
+  try {
+    claimPath = qdClaimPath(selfDir, dispatchId);
+  } catch (err) {
+    if (err instanceof PathSafetyError) {
+      return { mode: 'invalid_id', code: err.code, detail: err.message };
+    }
+    throw err;
+  }
   const writeClaim = (status, extra) => {
     const payload = {
       claim_version: 1,
@@ -432,16 +462,16 @@ function qdAcquireClaim(selfDir, request) {
 }
 
 function qdFinishClaim(selfDir, dispatchId, status, extra) {
-  const claimPath = qdClaimPath(selfDir, dispatchId);
-  const existing = qdReadJson(claimPath) || {};
-  const payload = {
-    ...existing,
-    status,
-    heartbeat_at: new Date().toISOString(),
-    finished_at: new Date().toISOString(),
-    ...(extra || {}),
-  };
   try {
+    const claimPath = qdClaimPath(selfDir, dispatchId);
+    const existing = qdReadJson(claimPath) || {};
+    const payload = {
+      ...existing,
+      status,
+      heartbeat_at: new Date().toISOString(),
+      finished_at: new Date().toISOString(),
+      ...(extra || {}),
+    };
     qdAtomicWrite(claimPath, `${JSON.stringify(payload, null, 2)}\n`);
   } catch (_) {}
 }
@@ -1616,6 +1646,7 @@ export function apply(ctx, config = {}) {
                 } else {
                   toWrite = JSON.stringify(content, null, 2);
                 }
+                assertWithin(selfDir, abs, `产物 ${rel}`);
                 qdAtomicWrite(abs, toWrite);
                 written.push(rel);
                 allWritten.push(rel);
@@ -1833,7 +1864,51 @@ export function apply(ctx, config = {}) {
           scope: request.scope || '',
           stage: request.stage || '',
         };
+        // 修复 D1/D2：认领文件落盘前先做两道前置校验（旧实现先写 claim 后校验，
+        // 非法请求会留下越界写入的文件）。任何一项不合法 ⇒ 不落盘、直接 prompt_error。
+        const badArtifact = qdFirstInvalidArtifact(selfDir, request);
+        if (badArtifact) {
+          appendDebugRecord(selfDir, {
+            event: 'claim_precheck_failed', dispatch_id: dispatchId,
+            code: 'ARTIFACT_PATH_INVALID', artifact: badArtifact,
+          });
+          return {
+            ...base,
+            status: 'prompt_error',
+            error_class: 'prompt',
+            attempts: 0,
+            attempt_id: '',
+            attempt_ids: [],
+            feedback: '',
+            total_elapsed_ms: 0,
+            evidence: '',
+            error: `ARTIFACT_PATH_INVALID: 产物路径非法（绝对路径/含 .. /越出当前 self/junction 越界）：${badArtifact}`,
+            host_starts: 0,
+            queue_ms: null,
+            host_slot: 'not_acquired',
+          };
+        }
         const claim = qdAcquireClaim(selfDir, request);
+        if (claim.mode === 'invalid_id') {
+          appendDebugRecord(selfDir, {
+            event: 'claim_id_invalid', dispatch_id: dispatchId, code: claim.code,
+          });
+          return {
+            ...base,
+            status: 'prompt_error',
+            error_class: 'prompt',
+            attempts: 0,
+            attempt_id: '',
+            attempt_ids: [],
+            feedback: '',
+            total_elapsed_ms: 0,
+            evidence: '',
+            error: `${claim.code}: ${claim.detail}`,
+            host_starts: 0,
+            queue_ms: null,
+            host_slot: 'not_acquired',
+          };
+        }
         if (claim.mode === 'reuse') {
           appendDebugRecord(selfDir, { event: 'claim_reuse', dispatch_id: dispatchId });
           return {

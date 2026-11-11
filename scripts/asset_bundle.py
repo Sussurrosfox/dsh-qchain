@@ -26,8 +26,15 @@ import hashlib
 import os
 import re
 import shutil
+import sys
 import urllib.parse
 from html.parser import HTMLParser
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import path_safety  # noqa: E402（scripts/ 已在 sys.path；T1 修复的唯一路径原语）
 
 RE_IMG = re.compile(r"\\includegraphics\s*(?:\[[^\]]*\])?\s*\{([^{}]*)\}")
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp")
@@ -360,10 +367,21 @@ def stage_html_resources(pdir, staging, katex_expected=None):
         if name.endswith(".html"):
             for ref in html_refs(os.path.join(staging, name)):
                 path = ref.split("#", 1)[0].split("?", 1)[0]
-                if path.startswith("assets/") and ".." not in path.split("/"):
-                    refs.add(urllib.parse.unquote(path))
-                elif path.startswith("katex/"):
+                if not path:
+                    continue
+                # 修复 T1：**先**做 percent 解码与安全规范化，**再**判定是否 assets/。
+                # 旧实现先按 ".." 过滤、之后才 unquote，于是 assets/%2e%2e/%2e%2e/x
+                # 通过过滤 → 解成 assets/../../x → 覆盖写到工作目录之外。
+                try:
+                    norm = path_safety.normalize_rel(path, "HTML 资源引用")
+                except path_safety.PathEscape as exc:
+                    problems.append("HTML 引用了非法资源路径（已拒绝，未复制任何文件）："
+                                    "%s —— %s" % (ref, exc))
+                    continue
+                if norm.startswith("katex/"):
                     uses_katex = True
+                elif norm.startswith("assets/"):
+                    refs.add(norm)
     # 页面引用 katex/ 时，整棵 KaTeX 树（JS/CSS/fonts）都必须随发布物
     if uses_katex:
         ksrc = os.path.join(pdir, "katex")
@@ -371,10 +389,24 @@ def stage_html_resources(pdir, staging, katex_expected=None):
             sync_tree(ksrc, os.path.join(staging, "katex"))
         else:
             problems.append("工作目录缺少 katex/ 资源目录：%s" % ksrc)
+    # 修复 T1（第二阶段）：所有复制动作前先全量校验源/目标位置，任何一个越界都
+    # 只记问题、不做复制；旧实现边复制边收集问题，越界写先发生、BundleError 后到。
+    plan = []
     for url in sorted(refs):
         src = os.path.join(pdir, *url.split("/"))
+        dest = os.path.join(staging, *url.split("/"))
+        try:
+            path_safety.assert_within(pdir, src, "资源源文件")
+            path_safety.assert_within(staging, dest, "发布资源目标")
+        except path_safety.PathEscape as exc:
+            problems.append("%s：%s" % (url, exc))
+            continue
         if os.path.isfile(src):
-            _copy_atomic(src, os.path.join(staging, *url.split("/")))
+            plan.append((src, dest))
+    if problems:
+        raise BundleError(problems)
+    for src, dest in plan:
+        _copy_atomic(src, dest)
     problems.extend(verify_bundle(
         staging, {"katex": katex_expected}
         if (katex_expected and uses_katex) else None))

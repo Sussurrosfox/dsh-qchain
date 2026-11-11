@@ -17,6 +17,7 @@
 import * as nodeFs from 'node:fs';
 import * as nodePath from 'node:path';
 import nodeCrypto from 'node:crypto';
+import { normalizeRel } from './path_safety.mjs';
 
 export const DEFAULTS = Object.freeze({
   maxPromptChars: 600000, // 完整 prompt 字符上限；超出明确报错，不静默截断
@@ -135,14 +136,58 @@ const EXECUTION_RULES = [
 // 3. 产物白名单校验
 // ---------------------------------------------------------------------------
 
+/** 最近已存在祖先的 realpath + 剩余段回填（目标不存在也能判定；junction 会被解开）。 */
+function realKeyOf(fs, path, target) {
+  let cur = path.resolve(target);
+  const rest = [];
+  for (;;) {
+    try {
+      const real = typeof fs.realpathSync.native === 'function'
+        ? fs.realpathSync.native(cur)
+        : fs.realpathSync(cur);
+      return rest.length ? path.join(real, ...rest.slice().reverse()) : real;
+    } catch (err) {
+      if (!err || (err.code !== 'ENOENT' && err.code !== 'ENOTDIR')) throw err;
+      const parent = path.dirname(cur);
+      if (parent === cur) {
+        return rest.length ? path.join(cur, ...rest.slice().reverse()) : cur;
+      }
+      rest.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+function realWithin(fs, path, root, target) {
+  const rk = realKeyOf(fs, path, root);
+  const tk = realKeyOf(fs, path, target);
+  const rel = path.relative(rk, tk);
+  if (rel === '') return true;
+  if (path.isAbsolute(rel)) return false;
+  return !(rel === '..' || rel.startsWith(`..${path.sep}`) || rel.startsWith('../'));
+}
+
+/**
+ * 白名单产物路径：规范化（解一次 percent-encoding，拒绝 .. / 绝对路径）+ realpath 越界断言。
+ *
+ * 修复 D2：旧实现只做 `path.resolve` + 字符串前缀比较，`self/assets` 若是 junction/
+ * symlink 指向工作目录之外，词法上「在 self 内」而实际写到 self 外。realpath 归一后
+ * junction 会被解开，越界随即暴露。
+ *
+ * 返回 '' 表示非法（调用方显式报错），绝不返回一个「看似合法」的越界路径。
+ */
 export function safeJoinSelf(selfDir, rel, env) {
-  const { path } = mkEnv(env);
+  const { fs, path } = mkEnv(env);
   if (typeof rel !== 'string' || !rel.trim()) return '';
-  const norm = rel.replace(/\\/g, '/');
-  if (path.isAbsolute(norm) || /^[A-Za-z]:/.test(norm) || norm.split('/').includes('..')) return '';
+  let norm;
+  try {
+    norm = normalizeRel(rel, { label: '产物路径' });
+  } catch (_) {
+    return '';
+  }
   const normSelf = path.resolve(selfDir);
-  const abs = path.resolve(normSelf, norm);
-  if (abs !== normSelf && !abs.startsWith(normSelf + path.sep)) return '';
+  const abs = path.join(normSelf, ...norm.split('/'));
+  if (!realWithin(fs, path, normSelf, abs)) return '';
   return abs;
 }
 
