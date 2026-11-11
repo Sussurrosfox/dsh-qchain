@@ -288,7 +288,7 @@ def _scan_asset_lines(text):
     return found
 
 
-def check_asset_conservation(workdir, manifest, units):
+def check_asset_conservation(workdir, manifest, units, rows=None):
     """第 8 项：源文档视觉/结构资产守恒对账。
 
     源侧：按 manifest 读取各 include 源文件原文，统计两类资产行号；用
@@ -298,11 +298,40 @@ def check_asset_conservation(workdir, manifest, units):
     产物侧：连接 self/sec*.tex 同口径统计。守恒判定：产物侧各类总数
     >= 源侧应保留总数，否则 FIDELITY_ASSET_LOST。
 
+    rows 为 source-map.md 解析行（source_id -> scope），用于在缺失报文里
+    指明每个资产“应迁入哪个切片”：scope 命中现有切片用该切片，doc-infra /
+    未登记等非切片范围并入末尾切片（学案无独立基础设施切片，致谢/页脚类
+    资产按惯例落在最后一节末尾），使 FIDELITY_ASSET_LOST 能路由到
+    REPAIR_SECTION 而不是无目标地 REPLAN 回 T1。
+
     返回 (problems, warnings, stats)；stats = {"source_kept": {...},
     "output": {...}}（各类计数），供报告 checked 区入账。
     """
     problems, warnings = [], []
     project_root = manifest.get("project_root") or os.path.dirname(workdir)
+
+    # source-map 输出范围（source_id -> scope）与现有切片清单
+    scope_of = {}
+    for r in rows or []:
+        sid = str(r.get("source_id") or "").strip().upper()
+        scope = str(r.get("scope") or "").strip()
+        if sid and scope:
+            scope_of[sid] = scope
+    sec_ids = []
+    if os.path.isdir(workdir):
+        sec_ids = [name[:-4] for name in sorted(os.listdir(workdir))
+                   if RE_SEC_TEX.match(name) and name != "sec_template.tex"]
+
+    def _target_of(sid):
+        """scope → (目标切片 id, 范围说明)；非切片范围并入末尾切片。"""
+        s = scope_of.get(str(sid or "").strip().upper(), "")
+        m = re.match(r"^(sec[0-9A-Za-z_-]+)", s)
+        if m and m.group(1) in sec_ids:
+            return m.group(1), s
+        tail = sec_ids[-1] if sec_ids else None
+        if not s:
+            return tail, "未登记输出范围，并入末尾切片 %s" % tail
+        return tail, "%s，并入末尾切片 %s" % (s, tail)
 
     # 单元 locator → 每文件行号区间表
     ranges = {}        # source_file -> [(lo, hi, source_id, disposition)]
@@ -351,7 +380,8 @@ def check_asset_conservation(workdir, manifest, units):
                 # 不在任何单元区间的资产（理论上是空白行，防御性兜底）
                 # 按应保留处理——宁可多报也不漏报
                 if not excluded:
-                    kept[kind].append((src, ln, owner))
+                    tgt, _note = _target_of(owner)
+                    kept[kind].append((src, ln, owner, tgt))
 
     # ---- 产物侧计数 ----
     prod = {"figure": [], "table": []}   # [(sec_file, lineno)]
@@ -369,19 +399,48 @@ def check_asset_conservation(workdir, manifest, units):
     for kind in ("figure", "table"):
         need, got = len(kept[kind]), len(prod[kind])
         if got < need:
+            # 按目标切片归因“仍未配齐”的资产：产物侧现有资产先抵扣各目标
+            # 切片的应保留数，清单只列抵扣后仍有缺口的切片内资产（源序取
+            # 前）。否则缺失清单永远命中第一个目标切片，已补齐的切片会被
+            # 反复返修、真正缺资产的切片永远轮不到（REPAIR 死循环）。
+            prod_by_sec = {}
+            for sec_name, _ln in prod[kind]:
+                stem = sec_name[:-4]
+                prod_by_sec[stem] = prod_by_sec.get(stem, 0) + 1
+            slots = {}
+            for e in kept[kind]:
+                if e[3]:
+                    slots[e[3]] = slots.get(e[3], 0) + 1
+            for sec, cnt in prod_by_sec.items():
+                if sec in slots:
+                    slots[sec] = max(0, slots[sec] - cnt)
+            missing, consumed = [], {}
+            for e in kept[kind]:
+                tgt = e[3]
+                if tgt and consumed.get(tgt, 0) < slots.get(tgt, 0):
+                    missing.append(e)
+                    consumed[tgt] = consumed.get(tgt, 0) + 1
+            if not missing:
+                # 归因失败（如资产落进了非目标切片）时退回全量清单
+                missing = kept[kind]
             listing = "; ".join(
-                "%s L%d%s" % (sf, ln,
-                              "（单元 %s）" % sid if sid else "（未归属单元）")
-                for sf, ln, sid in kept[kind][:20])
-            more = " …（共 %d 处，仅列前 20）" % len(kept[kind]) \
-                if len(kept[kind]) > 20 else ""
+                "%s L%d%s，迁入 %s" % (sf, ln,
+                                       "（单元 %s）" % sid if sid else "（未归属单元）",
+                                       tgt)
+                for sf, ln, sid, tgt in missing[:20])
+            more = " …（共 %d 处，仅列前 20）" % len(missing) \
+                if len(missing) > 20 else ""
+            targets = [e[3] for e in missing if e[3]]
+            tsum = "、".join("%s %d 个" % (t, targets.count(t))
+                             for t in dict.fromkeys(targets))
             problems.append({
                 "code": "FIDELITY_ASSET_LOST",
                 "detail": "%s类资产不守恒：源侧应保留 %d 个，产物 sec*.tex "
-                          "仅 %d 个，缺失 %d 个。源侧资产清单（请人工核对 "
-                          "tikz 栅格化等合法置换）: %s%s"
+                          "仅 %d 个，缺失 %d 个。仍未配齐的资产清单（按目标"
+                          "切片归因，请人工核对 tikz 栅格化等合法置换）: %s%s。"
+                          "按 source-map 输出范围仍未配齐: %s"
                           % (ASSET_KIND_LABEL[kind], need, got, need - got,
-                             listing, more)})
+                             listing, more, tsum or "无法定位")})
 
     stats = {
         "source_kept": {k: len(kept[k]) for k in kept},
@@ -539,7 +598,14 @@ def check_fidelity_project(workdir):
     warnings.extend(cov_warnings)
     if cov_rows:
         for cr in cov_rows:
-            if cr["new_objects"] and cr["action"] not in ("BRIDGE", "EXTEND"):
+            # 口径归一化：「无 / 无新增 / - / — / none / N/A」一律视为未声明
+            # 新对象（coverage-planner 的空值口径），不得按“声明了新对象”阻断
+            nov = (cr["new_objects"] or "").strip()
+            if nov in ("无", "无新增", "无。", "-", "—", "--", "none", "NONE",
+                       "N/A", "n/a", "无新增对象", "∅"):
+                nov = ""
+            cr["new_objects"] = nov
+            if nov and cr["action"] not in ("BRIDGE", "EXTEND"):
                 errors.append({
                     "code": "FIDELITY_NOVELTY_UNAPPROVED",
                     "detail": "coverage-map 行（%s）声明新对象 %r 但 "
@@ -631,7 +697,7 @@ def check_fidelity_project(workdir):
 
     # ---- 8. 资产守恒对账（源文档视觉/结构资产 vs 产物 sec*.tex）----
     asset_problems, asset_warnings, asset_stats = check_asset_conservation(
-        workdir, manifest, units)
+        workdir, manifest, units, rows)
     errors.extend(asset_problems)
     warnings.extend(asset_warnings)
 

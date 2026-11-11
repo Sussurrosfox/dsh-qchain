@@ -578,7 +578,11 @@ def inline_to_html(text, ctx):
                 i, slot_html = _convert_fillin(text, i, ctx)
                 out.append(slot_html)
                 continue
-            if name == "ansspace":
+            if name in ("ansspace", "anspace"):
+                # 答题留白：模板与切片两种拼写（双 s / 单 s）都接受。
+                # header.tex 定义双 s \ansspace，另以 \providecommand 提供
+                # 单 s \anspace 别名（LaTeX 侧两写法等价）；HTML 侧历史上
+                # 只认双 s，单 s 写法会落入未知宏兜底、以源码文本呈现。
                 k = i
                 while k < n and text[k] in " \t\n":
                     k += 1
@@ -712,6 +716,20 @@ def inline_to_html(text, ctx):
                 if i < n and text[i] == "{":
                     i, _, _ = scan_brace(text, i)
                 continue
+            if name == "footnote":
+                # \footnote{...} → 括注脚注（卡片无页脚概念，降级为行内注释）
+                k = i
+                while k < n and text[k] in " \t\n":
+                    k += 1
+                if k < n and text[k] == "{":
+                    k, inner, ok = scan_brace(text, k)
+                    if ok:
+                        out.append('<span class="qc-footnote">（注：%s）</span>'
+                                   % inline_to_html(inner.strip(), ctx))
+                        i = k
+                        continue
+                ctx.issues.append("\\footnote 缺少花括号参数")
+                continue
             # 未知宏：保留源码文本，保证内容不丢失
             out.append(html_escape("\\" + name))
             ctx.issues.append("未转换的行内宏 \\%s（按源码文本呈现）" % name)
@@ -737,6 +755,19 @@ def inline_to_html(text, ctx):
         out.append(c)
         i += 1
     return "".join(out)
+
+
+def lead_to_html(text, ctx):
+    r"""导语原文 → HTML：与题干同走 inline_to_html 管线。
+
+    历史缺陷：卡片 lead_html 由 pending_lead/between_buf 原文拼接后直接
+    插入 HTML（render_html.py 原样输出），导致 $...$ 数学、\[...\] 展示
+    公式、\includegraphics 图片、\textbf/\textit/\footnote 等宏在学生版
+    卡片上以源码文本呈现，图片也不进 assets/ 资产清单。
+    \qrawhtml 占位符会被 inline_to_html 递归解开，已渲染 HTML 不会
+    二次转义；槽位不应出现在导语（导语是引导文字），故 ctx.slots 不回灌。
+    """
+    return inline_to_html(text.strip(), ctx)
 
 
 def split_math_fillin(body, ctx, display=False):
@@ -872,7 +903,10 @@ class SecParser:
         if self.pending_lead:
             lead = "".join(self.pending_lead).strip()
             if lead:
-                card["lead_html"] = lead
+                ctx = InlineCtx(card["id"])
+                card["lead_html"] = lead_to_html(lead, ctx)
+                for msg in ctx.issues:
+                    self.issues.append("%s:%d: %s" % (self.sec, line, msg))
             self.pending_lead = []
         self.cards.append(card)
         return card
@@ -1205,7 +1239,11 @@ class SecParser:
                         self.between_buf = []
                     lead = " ".join(x for x in lead_parts if x)
                     if lead:
-                        q["lead_html"] = lead
+                        lctx = InlineCtx(q["id"])
+                        q["lead_html"] = lead_to_html(lead, lctx)
+                        for msg in lctx.issues:
+                            self.issues.append("%s:%d: %s"
+                                               % (self.sec, q["source_line"], msg))
                     self.stem_open = True
                     self.cards.append(q)
                     self.cur_question = q
@@ -1281,12 +1319,18 @@ class SecParser:
         if self.pending_lead:
             lead = "".join(self.pending_lead).strip()
             if lead:
+                lctx = InlineCtx(self.section_card["id"] if self.section_card
+                                 is not None else self.sec)
+                lead_html = lead_to_html(lead, lctx)
+                for msg in lctx.issues:
+                    self.issues.append("%s:%d: %s"
+                                       % (self.sec, len(self.lines) or 0, msg))
                 if self.section_card is not None and \
                         not self.section_card.get("lead_html"):
-                    self.section_card["lead_html"] = lead
+                    self.section_card["lead_html"] = lead_html
                 else:
                     card = self.new_card("section", len(self.lines) or 0)
-                    card["lead_html"] = lead
+                    card["lead_html"] = lead_html
         return self.cards
 
     def _flush_list(self, fr, stack):

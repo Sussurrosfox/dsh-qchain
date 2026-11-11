@@ -84,7 +84,8 @@
 1. **PDF 侧一眼可辨的失败**：缺字形（方块或空白字符）、整段空白（尤其选项括号内无字）、`\fillin` / `\textbackslash` 等宏字面泄漏、图片缺失占位或排版坍塌；
 2. **HTML 侧一眼可辨的失败**：乱码、双重转义（如字面 `&amp;lt;`、裸露的 `\fillin`）、KaTeX 未渲染的源码外泄（HTML 侧冒烟另论，不在本次范围；但审读包 `manifest.json` 的 `smoke.status` 非 `pass` 时，必须在结论中说明原因）；
 3. **smoke 缺失或未过目不得判 `PASS`**：`.pd/review/smoke/` 不存在、`smoke-manifest.json` 缺失、`png_count` 为 0，或 `smoke.status != "pass"`（按其 `note` 判断是工具缺失还是渲染失败），一律判 `NEEDS_EVIDENCE` 而非 `PASS`——缺的是证据，不是事实错误；
-4. **截图优先于文本视图**：`student-pages.txt`（`pdftotext` 抽取）的阅读顺序存疑时（双栏、图文混排），必须以渲染页截图为准，不得依据可能错序的文本补猜任务结构。
+4. **截图优先于文本视图**：`student-pages.txt`（`pdftotext` 抽取）的阅读顺序存疑时（双栏、图文混排），必须以渲染页截图为准，不得依据可能错序的文本补猜任务结构；
+5. **无视觉模型环境的人工复核替代**：若本次派发所用模型（及会话内全部可用模型）均不声明图像输入（读图工具以 `model "X" does not declare image input` 类错误失败），验收者确实无法亲自过目截图时，必须以 `.pd/review/smoke/human-review.json`（材料所有人/真人目视复核记录，逐张截图含 `judgment` 与 `evidence`）作为过目等价证据并在结论中引用该文件与其判定；该记录须由真人复核后落盘，验收者不得自行编造或替真人填写。辅助证据 `.pd/review/smoke/machine-check.json`（确定性像素分析：总墨量/分带密度/最大连续空白行/网格覆盖，用于排除大面积塌陷与整段空白）一并引用。两者齐备且 `smoke-manifest.json` 的 `smoke.status == "pass"` 时，视为满足本条 DoD；人工复核判任一张为 fail 时，按该截图对应的失败类型（缺字形/整段空白/宏泄漏/乱码）如实记 open issue 并判 `REVISE`。
 
 该条款与确定性门禁**并列**：门禁全绿不代表排版正确，冒烟未过目同样不得放行。
 
@@ -132,7 +133,7 @@ dialogue-dependency-gap / dialogue-redundancy 分类，并单独核对：
 区分事实错误、证据不足、规则冲突和可选建议。不设找错数量指标。
 不直接改写正文，不推断未观察到的学生表现或生成过程。**验收标准：核心可在预算内完成（直接核对 .pd/reports/estimate.json 与 .pd/reports/check_budget.json 结构化报告，无需人工比对生硬手填分钟数）；自学题没有被误当课堂必做**。
 
-**渲染冒烟 DoD（出具 PASS 前强制）**：必须过目 `.pd/review/smoke/` 冒烟截图（首页 + 首个含 `\fillin` 选项组的页面）：PDF 缺字形/整段空白、HTML 乱码/双重转义一眼可辨；smoke 缺失、`png_count` 为 0 或未过目不得判 `PASS`（判 `NEEDS_EVIDENCE`）；`student-pages.txt` 阅读顺序存疑时以渲染页截图为准。
+**渲染冒烟 DoD（出具 PASS 前强制）**：必须过目 `.pd/review/smoke/` 冒烟截图（首页 + 首个含 `\fillin` 选项组的页面）：PDF 缺字形/整段空白、HTML 乱码/双重转义一眼可辨；smoke 缺失、`png_count` 为 0 或未过目不得判 `PASS`（判 `NEEDS_EVIDENCE`）；`student-pages.txt` 阅读顺序存疑时以渲染页截图为准。**无视觉模型环境条款**：若你（及会话内全部可用模型）均不声明图像输入、无法亲自过目截图，则以 `.pd/review/smoke/human-review.json`（真人目视复核记录）为过目等价证据、`.pd/review/smoke/machine-check.json`（确定性像素分析）为辅助证据，两者齐备且 `smoke.status == "pass"` 时视为满足本条 DoD，并在结论中引用二者；人工复核判 fail 时按 `REVISE` 处理。
 
 ### 输入约束（主 Agent 派发时提供）
 

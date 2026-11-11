@@ -145,7 +145,9 @@ KATEX_EXTRA = {"qmathlit", "qrawhtml"}
 
 RE_BUTTON = re.compile(
     r'<button[^>]*class="qc-option"[^>]*>(.*?)</button>', re.S)
-RE_TEXCMD = re.compile(r"\\([a-zA-Z]+)\*?")
+# 负向后视：跳过 \\ 行分隔符后的字母（如 \\a_{21}），否则 \a/\b/\x/\y 等
+# 单字母命令全是矩阵换行符误报，KaTeX 侧 \\ 合法、不产生控制序列。
+RE_TEXCMD = re.compile(r"(?<!\\)\\([a-zA-Z]+)\*?")
 RE_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 RE_FILLIN = re.compile(r"\\fillin")
 RE_MISSING_CHAR = re.compile(r"Missing character")

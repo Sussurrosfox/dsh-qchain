@@ -287,39 +287,123 @@ def _normalize_math(s):
     return re.sub(r"[\s\\{}$~^&#]", "", s).lower()
 
 
-def _is_leak(ans, frag):
-    """答案泄露判定：归一化后相等 / 子串包含 / 三元组 Jaccard > 0.8。
+_MATH_WRAPPERS = {
+    "left", "right", "displaystyle", "textstyle", "limits", "quad", "qquad",
+    "mathrm", "mathnormal", "mathit", "mathbf", "text", "bigl", "bigr",
+    "Bigl", "Bigr", "biggl", "biggr", "Biggl", "Biggr", "enspace",
+    "thinspace", "!", ",", ";", ":", " ",
+}
 
-    C3：纯相似度对"台词片段包含答案"（如台词“所以趋近于0”含答案
-    “趋近于0”）漏检，子串包含是主流泄露形态，必须直接判泄露。
-    过短答案（<2 字符）不参与包含判定以避免误报。
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
+
+_INTERVAL_RE = re.compile(r"\[[^\[\]]*\]")
+
+
+def _is_textual_answer(ans):
+    """答案是否为纯文字（无数学符号）：中文词或英文词。"""
+    return not re.search(r"[\\$^_{}0-9+\-=<>()\[\]|/·]", ans)
+
+
+def _atoms(s):
+    r"""把 LaTeX 片段切成原子序列（控制词按名、其余逐字符）。
+
+    丢弃排版包裹（\left/\right/\displaystyle/\mathrm 等）与间距宏、结构花
+    括号，\dfrac/\tfrac 归一为 frac。这样 `\mathrm{d}x` 与 `\dfrac{\pi}{2}`
+    等写法差异不再造成假阳性，同时保留公式内容本身的可比对性。
     """
-    a, b = _normalize_math(ans), _normalize_math(frag)
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            m = re.match(r"\\([A-Za-z]+|.)", s[i:])
+            if m:
+                w = m.group(1)
+                if w in ("frac", "dfrac", "tfrac"):
+                    out.append("frac")
+                elif w not in _MATH_WRAPPERS:
+                    out.append(w)
+                i += m.end()
+                continue
+            i += 1
+            continue
+        if c in " \t\r\n":
+            i += 1
+            continue
+        if c in "{}$&":
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return out
+
+
+def _strip_intervals(s):
+    r"""剥掉方括号区间内容：台词写“[0,π/2]”并不等于说出答案 π/2。"""
+    prev = None
+    while prev != s:
+        prev = s
+        s = _INTERVAL_RE.sub("", s)
+    return s
+
+
+def _longest_common_run(a, b):
+    """a、b 原子序列的最长连续公共段长度（子串可在任意位置出现）。"""
     if not a or not b:
+        return 0
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    best = 0
+    for off in range(-len(short) + 1, len(long_)):
+        k = 0
+        for j in range(len(short)):
+            if 0 <= off + j < len(long_) and long_[off + j] == short[j]:
+                k += 1
+                best = max(best, k)
+            else:
+                k = 0
+    return best
+
+
+def _is_leak(ans, frag):
+    r"""答案泄露判定（C4：按数学原子序列判定，消除 LaTeX 宏假阳性，降低阈值）。
+
+    规则：
+    ① 归一化字符串完全相等 → 泄露；
+    ② 纯文字答案（中文/英文词，无数学符号）：归一化后互相包含且长度 ≥2 →
+       泄露（“取极限”含答案“极限”属主流泄露形态）；
+    ③ 含数学符号的答案：先把台词片段里的方括号区间内容剥掉，再按原子序列
+       求最长连续公共段；公共段长度 ≥3 且覆盖较长一侧的 0.6 以上才判泄露。
+       这样 `\mathrm{d}x`、`n-1` 里的 `-1`、区间 `[0,π/2]` 里的 `π/2` 不再
+       误报，而“台词整句照抄答案公式”仍然被抓住。
+    """
+    a_norm, b_norm = _normalize_math(ans), _normalize_math(frag)
+    if not a_norm or not b_norm:
         return False
-    if a == b:
+    if a_norm == b_norm:
         return True
-    if len(a) >= 2 and a in b:
+    if _is_textual_answer(ans):
+        if len(a_norm) < 2:
+            return False
+        return a_norm in b_norm or (len(b_norm) >= 3 and b_norm in a_norm)
+    fa = _atoms(ans)
+    fb = _atoms(_strip_intervals(frag))
+    if not fa or not fb:
+        return False
+    if fa == fb:
         return True
-    if len(b) >= 3 and b in a:
-        return True
-    return _token_similarity(a, b) > 0.8
-
-
-def _token_similarity(a, b):
-    """简单归一化编辑距离相似度（0~1）。"""
-    a, b = _normalize_math(a), _normalize_math(b)
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    # Jaccard on character trigrams
-    def trigrams(s):
-        return set(s[i:i+3] for i in range(len(s) - 2)) if len(s) >= 3 else {s}
-    ta, tb = trigrams(a), trigrams(b)
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / len(ta | tb)
+    run = _longest_common_run(fa, fb)
+    # 单字符答案（0/1/π 等）不判泄露：台词里出现孤立数字 0、1 太普遍，
+    # 单字符泄露的实际危害极低（选择项里有干扰项可核对）。
+    if len(fa) <= 1:
+        return False
+    # 短答案（2~4 原子）按“整段是否原样出现”判定：run == len(fa) 即泄露。
+    if len(fa) <= 4:
+        return run == len(fa)
+    if run < 3:
+        return False
+    # 泄露的前件是“答案被完整说出来”：覆盖度按答案侧（fa）计，而非较长侧。
+    # 台词句子普遍比答案长，按较长侧计会漏掉“台词直接念出答案”的真泄露。
+    return run >= 0.7 * len(fa)
 
 
 def _scan_fillin_answers_block(text):

@@ -87,6 +87,11 @@
 \NewDocumentCommand{\pdCJKTextWrap}{m}
   {
     \tl_set:Nn \l_pd_cjkwrap_tl {#1}
+    % 答案/选项参数整体已被 \ensuremath{...} 数学模式包裹，参数内部的 $ 定界符
+    % 一律剥除：否则尾部带 $ 的选项（如"相邻两列相等为 $0$"）在 \pdFillinOptions
+    % 的 \tl_use:N 处会遗留一个未闭合的数学模式，触发
+    % "! Extra }, or forgotten $."（sec6 构建阻断根因）。
+    \tl_remove_all:Nn \l_pd_cjkwrap_tl { $ }
     \regex_replace_all:NnN \c_pd_cjk_run_re { \c{text}\cB\{\1\cE\} } \l_pd_cjkwrap_tl
     \tl_use:N \l_pd_cjkwrap_tl
   }
@@ -289,6 +294,15 @@
       {\pdFillinOptions{#3}}%
   }
 \fi
+
+% 兼容别名：切片模板 sec_template.tex 使用 \ansspace（单 s）拼写，与标准答题
+% 留白宏 \anssspace（双 s）等价；此处兜底定义，避免 Undefined control sequence
+% 导致整章 PDF 编译失败（教师/学生两分支在各自分支内已定义 \anssspace）。
+\providecommand{\anspace}[1]{\ansspace{#1}}
+
+% 排版容差：中英混排下长行内公式易触发 Overfull \hbox。\emergencystretch 给
+% TeX 第三遍排版额外的词间伸缩额度，在不动内容的前提下把溢出段落拉回版心；
+\emergencystretch=3em
 
 % 编译结束时的质量摘要（写入 .log 与终端，供 build.py 解析核对）
 \AtEndDocument{%

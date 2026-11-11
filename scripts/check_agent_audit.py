@@ -284,7 +284,18 @@ def audit_agent_evidence(workdir, allow_unattested=None):
                 rec = json.load(f)
             if not isinstance(rec, dict):
                 return False
-            stamped_keys = ("scope_content_digest", "chapter_digest", "review_rule_version")
+            # 主控确定性盖章字段（t4_review_batch_nodes._stamp_review_provenance
+            # 与 _rebind_reused_delivery 追加）：仅追加字段、不改结论与 issues；
+            # 剥离后与子 Agent 落盘原文对账，否则逐轮 T4 验收记录全被判 STALE。
+            stamped_keys = (
+                "scope_content_digest",          # 本节内容摘要（主控盖章）
+                "chapter_digest",                # 章节级上下文摘要（主控盖章）
+                "review_rule_version",           # 复审规则版本（主控盖章）
+                "macro_semantic_digest",         # 宏/模板语义版本（主控盖章）
+                "delivery_check_ref",            # 复用旧审读时重测的本轮交付指纹
+                "content_review_reused",         # 复用标记（旧审读指纹≠本轮）
+                "reuse_binding",                 # scope 级复用证据
+            )
             if not any(k in rec for k in stamped_keys):
                 return False
             cleaned = dict(rec)

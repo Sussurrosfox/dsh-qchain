@@ -793,6 +793,41 @@ def _validate_acceptance_v2(rec, current_digest=None, student_pdf_sha=None,
     return problems
 
 
+def _is_reused_acceptance(rec):
+    """该验收记录是否为 scope 级复用记录（t4_review_batch_nodes 盖入
+    reuse_binding.reused=True，并附 delivery_check_ref 本轮磁盘实测指纹）。
+
+    复用记录的时效由 plan 时的四重对账（scope_content_digest /
+    chapter_digest / review_rule_version / macro_semantic_digest）保证，
+    不是由全局 workspace 摘要保证——把全局摘要套到复用记录会把
+    「他节变更后本节合法复用」误判成过期（v2 路径同此口径）。
+    """
+    binding = (rec or {}).get("reuse_binding") if isinstance(rec, dict) else None
+    return isinstance(binding, dict) and binding.get("reused") is True
+
+
+def _delivery_digests(rec):
+    """从 acceptance 记录提取 delivery_check_ref.artifact_digests（若无则空）。
+
+    复用重测指纹代表「本轮磁盘实测」，优先于停留在外部审读时刻的
+    顶层 student_pdf_sha256/student_html_sha256（与 _validate_acceptance_v2
+    的回退口径一致）。值统一剥掉可选的 ``sha256:`` 前缀，与
+    sha256_file / 顶层字段的裸十六进制口径对齐。
+    """
+    if not isinstance(rec, dict):
+        return {}
+    dref = rec.get("delivery_check_ref")
+    if isinstance(dref, dict) and isinstance(dref.get("artifact_digests"), dict):
+        out = {}
+        for rel, value in dref["artifact_digests"].items():
+            if isinstance(value, str) and value.startswith("sha256:"):
+                out[rel] = value[len("sha256:"):]
+            else:
+                out[rel] = value
+        return out
+    return {}
+
+
 def validate_acceptance_json(rec, current_digest=None, student_pdf_sha=None, student_html_sha=None):
     """校验 .pd/acceptance/<scope>.json 的记录一致性（不代替实际审读）。
 
@@ -851,17 +886,21 @@ def validate_acceptance_json(rec, current_digest=None, student_pdf_sha=None, stu
             problems.append("验收记录 %s 结论为 PASS，但存在未处理的 open "
                             "issue: %s" % (scope, ", ".join(open_issues)))
         if current_digest is not None \
-                and rec["content_digest"] != current_digest:
+                and rec["content_digest"] != current_digest \
+                and not _is_reused_acceptance(rec):
             problems.append("验收记录 %s 绑定的内容摘要与当前摘要不一致"
                             "（旧 PASS 不能冒充当前结果）" % scope)
-        if student_pdf_sha is not None \
-                and rec.get("student_pdf_sha256") and rec["student_pdf_sha256"] != student_pdf_sha:
-            problems.append("验收记录 %s 绑定的 student.pdf 哈希与当前构建"
-                            "不一致" % scope)
-        if student_html_sha is not None \
-                and rec.get("student_html_sha256") and rec["student_html_sha256"] != student_html_sha:
-            problems.append("验收记录 %s 绑定的 student.html 哈希与当前构建"
-                            "不一致" % scope)
+        delivery_digests = _delivery_digests(rec)
+        if student_pdf_sha is not None:
+            bound = delivery_digests.get("student.pdf") or rec.get("student_pdf_sha256")
+            if bound and bound != student_pdf_sha:
+                problems.append("验收记录 %s 绑定的 student.pdf 哈希与当前构建"
+                                "不一致" % scope)
+        if student_html_sha is not None:
+            bound = delivery_digests.get("student.html") or rec.get("student_html_sha256")
+            if bound and bound != student_html_sha:
+                problems.append("验收记录 %s 绑定的 student.html 哈希与当前构建"
+                                "不一致" % scope)
     return problems
 
 

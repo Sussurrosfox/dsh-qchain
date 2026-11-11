@@ -821,6 +821,27 @@ def _extract_compare_target_sec(cmp_report: Dict[str, Any],
     return sorted(hits)[0] if hits else None
 
 
+def _first_latex_error(self_dir, targets=("student", "teacher")):
+    """从 XeLaTeX 编译日志提取首个致命错误行（`! ` 开头）及其下一行
+    上下文，供构建返修理由携带真实诊断而非固定猜测。"""
+    errs = []
+    for t in targets:
+        log_path = os.path.join(self_dir, "%s.log" % t)
+        if not os.path.isfile(log_path):
+            continue
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for i, ln in enumerate(lines):
+            if ln.startswith("! "):
+                ctx = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                errs.append("%s: %s（%s）" % (t, ln.strip(), ctx[:80]))
+                break
+    return "；".join(errs)
+
+
 def node_t3_build(state: ShrinkCoursewareState) -> Dict[str, Any]:
     """T3: Compile dual-source XeLaTeX PDFs and/or HTML card decks."""
     self_dir = state.get("self_dir") or state.get("project_root", ".")
@@ -846,13 +867,27 @@ def node_t3_build(state: ShrinkCoursewareState) -> Dict[str, Any]:
         if routed["routing_action"] == "HALT":
             return routed  # 基础设施失败 / 定位不到切片：停机，不再盲猜 sec2
         target_sec = routed["repair_target"]
+        latex_err = _first_latex_error(self_dir)
+        reason_hint = (
+            "probchain 是 enumerate 环境：\\begin{probchain} 之后、第一个 "
+            "\\item 之前禁止放普通段落或 sectiondialogue/exampledialogue 等"
+            "非列表内容（LaTeX 报 missing \\item），须把它们移到 probchain "
+            "之外；item 内也不可在 \\item 之前先输出文本。"
+        )
         return {
             "build_gate": build_report,
             "build_passed": False,
             "stage": "REPAIR_LOOP",
             "routing_action": "REPAIR_SECTION",
             "repair_target": target_sec,
-            "repair_reason": f"构建排版未通过: LaTeX 编译失败在 {target_sec}，原因: 请修复 probchain 列表中 \\item 语法（如 \\textbf{{证明策略：}}必须包裹在 \\item \\qtype{{...}} 之后，不能在 \\item 之前直接输出普通文本段落，否则 LaTeX 报 missing \\item 致命错误）。",
+            "repair_reason": (
+                "构建排版未通过: LaTeX 编译失败在 %s。日志诊断: %s。修复指引: %s"
+                % (target_sec,
+                   latex_err or "编译日志无明确 `! ` 错误行，请检查 "
+                                "%s/student.log 与 %s/teacher.log"
+                                % (self_dir, self_dir),
+                   reason_hint)
+            ),
             "history": history
         }
 

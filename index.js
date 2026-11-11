@@ -18,6 +18,29 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = __dirname;
 
+// 子 Agent 回复 → 纯文本（仅用于解析失败时的原始留档，不参与解析决策）
+function rawSubagentText(raw) {
+  if (!raw) return '';
+  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'object') {
+    const blocks = raw.output || (raw.result && raw.result.output) || raw.content;
+    if (Array.isArray(blocks)) {
+      return blocks.map((b) => {
+        if (!b) return '';
+        if (typeof b === 'string') return b;
+        if (typeof b === 'object') {
+          const tag = b.type ? `[${String(b.type)}]` : '';
+          return tag + String(b.text || b.content || b.value || '');
+        }
+        return String(b);
+      }).join('\n');
+    }
+    if (typeof blocks === 'string') return blocks;
+    if (raw.text) return String(raw.text);
+  }
+  try { return JSON.stringify(raw); } catch (_) { return ''; }
+}
+
 function resolveEngineRoot(customPath) {
   if (customPath && fs.existsSync(customPath)) {
     return path.resolve(customPath);
@@ -1206,7 +1229,81 @@ export function apply(ctx, config = {}) {
         } catch (_) {}
         return null;
       })();
+      // ---- 同步激活桥接 ---------------------------------------------------
+      // 宿主 `subagent` 工具是「异步激活」语义：execute 立刻返回
+      // `started subagent <id>`（output schema = {kind:'activation', subagentId}），
+      // 最终产物只通过 settlement 消息回流，工具返回值里没有任何正文。
+      // 派发单却必须在同一次调用中拿到产物才能落盘 + 记台账，因此这里直连
+      // subagents 服务：startActivation(delivery:'caller') → await activation.result。
+      // delivery='caller' 不向父会话注入 settlement 消息（避免重复占用上下文）。
+      const resolveSubagentsService = () => {
+        try {
+          const svc = ctx?.get?.('subagents');
+          if (svc && typeof svc.startActivation === 'function') return svc;
+        } catch (_) {}
+        try {
+          const direct = ctx?.subagents;
+          if (direct && typeof direct.startActivation === 'function') return direct;
+        } catch (_) {}
+        return null;
+      };
+      const startActivationBridge = async (subArgs, attemptExec) => {
+        const svc = resolveSubagentsService();
+        if (!svc) return null;
+        const parent = attemptExec && attemptExec.agent;
+        if (!parent) return null;
+        const request = {
+          prompt: [{ type: 'text', text: String(subArgs && subArgs.prompt ? subArgs.prompt : '') }],
+          parent,
+        };
+        if (subArgs && subArgs.cwd) request.cwd = subArgs.cwd;
+        // 子 Agent 默认继承父级的 maxTokens；产物动辄 2–5 万字符（两个切片合写时更多），
+        // 验收类任务还有长篇推理（reasoning）与两件 JSON 产物，因此这里显式抬高出参上限，
+        // 默认 65536：实测 32768 时 SCNet-Max 的推理链（~75K 字符）会把最终 JSON 挤出预算、
+        // 输出被 maxTokens 截断在 JSON 中段（attempt raw 尾部落在 md 表格行中间）。
+        const budget = Number(process.env.QCHAIN_SUBAGENT_MAX_TOKENS || 0);
+        request.agentOptions = { maxTokens: Number.isFinite(budget) && budget > 0 ? budget : 65536 };
+        if (subArgs && subArgs.provider && subArgs.model) {
+          request.agentOptions.provider = subArgs.provider;
+          request.agentOptions.model = subArgs.model;
+        }
+        let lastErr = null;
+        for (const providerName of ['spawn', 'fork']) {
+          try {
+            if (typeof svc.getProvider === 'function' && !svc.getProvider(providerName)) continue;
+          } catch (_) { /* 查询失败时按可试处理 */ }
+          try {
+            const activation = await svc.startActivation({
+              provider: providerName,
+              label: (subArgs && subArgs.description) || 'qchain subagent',
+              request,
+              signal: attemptExec && attemptExec.signal,
+              delivery: 'caller',
+            });
+            let result;
+            try {
+              result = await activation.result;
+            } finally {
+              try {
+                if (typeof activation.dispose === 'function') await activation.dispose();
+              } catch (_) {}
+            }
+            return {
+              subagentId: String(activation.childId || ''),
+              output: (result && Array.isArray(result.output)) ? result.output : [],
+              stopReason: (result && result.stopReason) ? String(result.stopReason) : '',
+            };
+          } catch (err) {
+            lastErr = err;
+          }
+        }
+        if (lastErr) throw lastErr;
+        return null;
+      };
       const callSubagent = async (subArgs, attemptExec) => {
+        // 优先：同步桥接（拿到子 Agent 最终 output 块）
+        const bridged = await startActivationBridge(subArgs, attemptExec);
+        if (bridged) return bridged;
         if (subagentDef) return subagentDef.execute(subArgs, attemptExec);
         try {
           const tools = ctx?.tools || ctx?.get?.('tools');
@@ -1293,6 +1390,10 @@ export function apply(ctx, config = {}) {
           || null;
         let laneWaitMs = null;
         let hostStarts = 0;
+        // 输出长度截断补齐轮：上一轮只提交了部分白名单产物时，下一轮只要求补齐缺失项
+        let narrowMissing = [];
+        const allWritten = [];
+        const allDigests = {};
         // 槽位是否仍被占用（取消未获宿主确认）：跨 attempt 保留，供返回值与协调者判定
         let hostSlotHeld = false;
         for (let attempt = 1; attempt <= policy.attempts_allowed; attempt += 1) {
@@ -1341,9 +1442,12 @@ export function apply(ctx, config = {}) {
                 observer.peakHostInFlight = observer.hostInFlight;
               }
             }
+            const attemptPrompt = narrowMissing.length > 0
+              ? `${prompt}\n\n---\n【本轮硬约束 · 输出长度截断补齐轮】上一轮回复因输出长度上限被截断，只成功提交了 ${allWritten.join('、') || '（无）'}。本轮**只输出**下列尚未提交的产物，不要重复已提交的内容：${narrowMissing.join('、')}。每个文件仍以 <<<FILE:name>>> 开始、<<<END:name>>> 结束。`
+              : prompt;
             const hostCall = callSubagent({
               description: `qchain ${request.stage || ''} ${request.scope || dispatchId}（${request.role || '子 Agent'}）`,
-              prompt,
+              prompt: attemptPrompt,
               run_in_background: false,
               ...(route.provider && route.model
                 ? { provider: route.provider, model: route.model } : {}),
@@ -1389,10 +1493,25 @@ export function apply(ctx, config = {}) {
               });
             } else {
               hostOutcomeUsable = true;
-              parsed = parseSubagentFiles(outcome.value);
+              parsed = parseSubagentFiles(outcome.value, request.artifacts);
+              parsed.stopReason = (outcome.value && outcome.value.stopReason)
+                ? String(outcome.value.stopReason) : '';
+              if (parsed.error) {
+                // 解析失败时把原始回复落盘（截断 400KB），否则无法定位协议偏差
+                try {
+                  const rawText = rawSubagentText(outcome.value);
+                  if (rawText) {
+                    const dir = path.join(selfDir, '.pd', 'agent-attempts', dispatchId);
+                    fs.mkdirSync(dir, { recursive: true });
+                    fs.writeFileSync(path.join(dir, `${attemptId}.raw.txt`),
+                      rawText.slice(0, 400000), 'utf8');
+                  }
+                } catch (_) {}
+              }
               appendDebugRecord(selfDir, {
                 event: 'attempt_parsed', dispatch_id: dispatchId, attempt, attempt_id: attemptId,
                 run_id: parsed.runId || '',
+                stop_reason: parsed.stopReason || '',
                 files: parsed.files ? Object.keys(parsed.files) : null, error: parsed.error || '',
               });
             }
@@ -1499,6 +1618,7 @@ export function apply(ctx, config = {}) {
                 }
                 qdAtomicWrite(abs, toWrite);
                 written.push(rel);
+                allWritten.push(rel);
                 outputChars += typeof toWrite === 'string' ? toWrite.length : 0;
                 outputDigests[rel] = qdSha256File(abs);
               } catch (err) {
@@ -1509,8 +1629,10 @@ export function apply(ctx, config = {}) {
               }
             }
             if (status === 'ok') {
-              const missing = artifacts.filter((rel) => findContent(rel) === undefined);
-              if (written.length === 0) {
+              Object.assign(allDigests, outputDigests);
+              // 累计口径：补齐轮里上一轮已提交的产物不再要求重复提交
+              const missing = artifacts.filter((rel) => !allWritten.includes(rel));
+              if (allWritten.length === 0) {
                 status = 'missing_artifacts';
                 errorClass = 'content';
                 error = `子 Agent 未提交任何白名单产物: ${artifacts.join(', ')}`;
@@ -1520,6 +1642,7 @@ export function apply(ctx, config = {}) {
                 errorClass = 'content';
                 error = `部分产物缺失: ${missing.join(', ')}`;
                 feedback = `返修请补齐白名单产物: ${missing.join(', ')}`;
+                narrowMissing = missing;
               } else if (artifacts.every((rel) => before[rel]
                 && before[rel] === outputDigests[rel])) {
                 // 产物与原文件内容一致，属于合法产出，不判为错误
@@ -1643,8 +1766,9 @@ export function apply(ctx, config = {}) {
               child_run_id: parsed.runId || null,
               queue_ms: laneWaitMs,
               total_elapsed_ms: Date.now() - dispatchStartedMs,
-              artifacts_written: written,
-              output_digests: outputDigests,
+              artifacts_written: allWritten.slice(),
+              output_digests: { ...allDigests },
+              attempt_written: written.slice(),
               status,
               error_class: errorClass || 'unknown',
               attempts: attempt,
@@ -1670,7 +1794,11 @@ export function apply(ctx, config = {}) {
               evidenceAbs = abs;
             } catch (_) {}
           }
-          if (status === 'ok' || !retryable) break;
+          if (status === 'ok') break;
+          // 内容类缺失（输出长度截断）允许补齐轮：只补齐缺失产物，不计入 retry_class 判定
+          const narrowRound = status === 'missing_artifacts' && narrowMissing.length > 0
+            && attempt < policy.attempts_allowed;
+          if (status !== 'ok' && (!retryable && !narrowRound)) break;
           // 瞬时失败重试前留退避窗口（确定性，不引入随机抖动）
           await delayMs(Math.min(1000, 100 * attempt));
         }

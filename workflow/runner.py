@@ -300,9 +300,13 @@ def main():
 
     if args.status:
         # 任务10：状态查询也按**冻结版本**选图，避免用当前 YAML 误读旧会话
+        # BUGFIX：与 resume_target 对齐——检查点 state 同时携带 intent_contract
+        # 冻结块时，必须把它作为契约传入 resolve_resume，否则新检查点一律
+        # 误报 EXECUTION_CONTRACT_CONFLICT（checkpoint=有, contract=缺）。
+        _frozen_values = read_frozen_execution(db_path, args.thread_id)
         try:
             frozen_view = execution_policy.resolve_resume(
-                read_frozen_execution(db_path, args.thread_id))
+                _frozen_values, _frozen_values.get("intent_contract"))
         except execution_policy.ExecutionPolicyError as exc:
             print("[runner] 检查点执行契约异常 [%s]: %s" % (exc.code, exc.detail))
             raise SystemExit(2)

@@ -110,7 +110,17 @@ _EMPTY_STAGE_RECORD = "（本批次未产生可解析的切片验收记录）"
 #: 旧版本验收记录一律失效重审（禁止旧规则结论冒充本轮结论）。
 #: 1.1（任务16/C7）：复用条件新增 macro_semantic_digest 绑定——宏/模板语义
 #: 变化后旧内容审读不再代表本轮产物，必须重审；1.0 记录因此一律失效。
-REVIEW_RULE_VERSION = "1.1"
+#: 1.2（2026-11-11）：acceptance_prompt.md 复核规则增补「无视觉模型环境的
+#: 人工复核替代」条款（human-review.json 过目等价 + machine-check.json 辅助
+#: 证据）——渲染冒烟 DoD 在无图像输入模型环境下有了确定性的合规履行路径，
+#: 旧条款下的验收口径不再等同，1.1 记录一律失效重审。
+#: 1.3（2026-11-11）：契约修订——_rebind_reused_delivery 对复用 scope 只重测
+#: delivery_check_ref 而不改顶层三项，导致复用重绑后的 acceptance 文件摘要
+#: 没有任何派发证据可 attest（check_agent_audit 判 EVIDENCE_STALE 无法降级）。
+#: 本版起 T4 验收一律新鲜派发（双 scope 各自落证），旧 1.2 记录一律失效重审。
+#: 1.1（任务16/C7）：复用条件新增 macro_semantic_digest 绑定——宏/模板语义
+#: 变化后旧内容审读不再代表本轮产物，必须重审；1.0 记录因此一律失效。
+REVIEW_RULE_VERSION = "1.3"
 
 #: 跨节引用指纹正则（章节级上下文变更检测：某节引用其他节的文本变化）
 _RE_SEC_REF = re.compile(r"sec[0-9]+[a-z]?")

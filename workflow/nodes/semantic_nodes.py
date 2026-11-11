@@ -352,9 +352,20 @@ def node_t2_plan_check(state: ShrinkCoursewareState) -> Dict[str, Any]:
         # 仅补派缺结果/过期/schema 非法的 scope（needs_check 已覆盖全部
         # 需派发情形）；staged 状态本身不构成派发理由——已有匹配 PASS 审读
         # 的切片零派发放行（audit §14「无改动重跑不调 LLM」）。
+        #
+        # sec8 缺失自愈补丁（2026-11-10）：作者批窗口（max_concurrency ×
+        # batch_window）未覆盖全部节时，legacy 图没有回作者环，未写成的节
+        # 没有候选切片（_section_digest 为 None）——审读单拿不到靶
+        # （REVIEW_TARGET_MISSING），补派只会空转到 MAX_SEMANTIC_ROUNDS
+        # 熔断。此类节跳过审读批，留给作者环（t2_plan_dispatch /
+        # repair_section）先补写；补写后 needs_check 自然将其重新纳入。
+        if _section_digest(self_dir, sec) is None:
+            continue
         if sec == repair_target or needs_check(self_dir, sec):
             batch.append(sec)
-    if repair_target and repair_target in expected_sections and repair_target not in batch:
+    if (repair_target and repair_target in expected_sections
+            and repair_target not in batch
+            and _section_digest(self_dir, repair_target) is not None):
         batch.insert(0, repair_target)
     for sec in batch:
         statuses[sec] = "staged"
