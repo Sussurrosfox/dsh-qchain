@@ -1428,11 +1428,21 @@ export function apply(ctx, config = {}) {
           type: 'integer',
           description: '本次派发的并发槽位（正整数 1..16；0=自动）。'
             + '缺省时按 config.yaml 解析：agent_dispatch.max_concurrency > agent_max_concurrency'
-            + ' > 档位表（fast=4/safe=1/budget=2/interactive=1）。'
+            + ' > 档位表（fast=4/safe=1/budget=2/interactive=1；未配置且 run_scope 未知'
+            + ' 时默认 fast/4，要串行请显式写 agent_dispatch: safe 或传 max_concurrency=1）。'
             + '这是同时活跃的请求数，不是必须派发的请求数。',
         },
       },
     },
+    // 派发是并发安全操作：同一消息里的多张派发单（或多张 batch）应进入宿主
+    // 并行池同时跑，而不是被当成排他障碍逐张串行（宿主 executionMode 只认
+    // isConcurrencySafe；未声明即 exclusive，本插件此前从未声明，导致
+    // "并行派发"实际逐张排队）。安全依据：派发单粒度有跨进程 claim 锁
+    // （.pd/dispatch-claims/，'wx' 原子认领 + pid 存活裁决 + busy/接管三态）
+    // + 迟到内容一律丢弃（绝不启动重叠子代理）+ 产物双阶段提交/全量回滚，
+    // 不同 dispatch_id 之间无共享可写状态。
+    // 必须位于工具定义顶层；放入 parameters 会使 JSON Schema 无法结构化克隆。
+    isConcurrencySafe: () => true,
     output: {
       schema: {
         type: 'object',

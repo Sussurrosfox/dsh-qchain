@@ -60,7 +60,9 @@ def build_request(
     context: Optional[Dict[str, Any]] = None,
     scope: str = "",
     input_digest: Optional[str] = None,
-    timeout_seconds: int = 900,
+    # 2026-11-15：默认超时 900s → 3600s。生产证据：真实任务 20-50 分钟，
+    # 900s 斩杀合法长任务（且 timeout 可重试 ⇒ 最坏 3×15min 全价盲重）。
+    timeout_seconds: int = 3600,
     max_retries: int = 2,
     retry_class: str = "transient",
     batch_id: Optional[str] = None,

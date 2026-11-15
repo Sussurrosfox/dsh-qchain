@@ -362,7 +362,9 @@ class WorkerPool:
         self,
         executor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         max_concurrency: int = 4,
-        default_timeout: int = 900,
+        # 2026-11-15：默认超时 900s → 3600s（同 scripts/dispatch_attempts.mjs
+        # DEFAULT_TIMEOUT_SECONDS）；900s 会斩杀合法长任务。
+        default_timeout: int = 3600,
         max_retries: int = 2,
         worker_capabilities: Optional[Dict[str, Any]] = None,
     ) -> None:

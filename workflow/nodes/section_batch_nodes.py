@@ -91,7 +91,9 @@ DEFAULT_PROFILE = dispatch_policy.DEFAULT_PROFILE
 RUN_SCOPE_DEFAULT_PROFILE: Dict[str, str] = dict(
     dispatch_policy.RUN_SCOPE_DEFAULT_PROFILE)
 DEFAULT_BATCH_WINDOW = 2
-DEFAULT_TIMEOUT_SECONDS = 900
+# 2026-11-15：默认超时 900s → 3600s（生产证据：真实任务 20-50 分钟，
+# 900s 斩杀合法长任务且 timeout 可重试 ⇒ 最坏 3×15min 全价盲重）。
+DEFAULT_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_RETRIES = 2
 
 #: 派发配置文件（位于 self_dir 下，即项目 config.yaml）
@@ -855,7 +857,8 @@ def _section_digest_context(state: ShrinkCoursewareState, self_dir: str, sec: st
 
 def _cache_spec_cfg(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """缓存探针用的派发配置（timeout/retry 不进指纹，但 spec 需要它们）。"""
-    base: Dict[str, Any] = {"timeout_seconds": 900, "max_retries": 2}
+    # 2026-11-15：默认超时同步 3600s（不进指纹，仅保持口径一致）。
+    base: Dict[str, Any] = {"timeout_seconds": 3600, "max_retries": 2}
     if isinstance(cfg, dict):
         base.update(cfg)
     return base
@@ -1026,8 +1029,10 @@ def _section_probe_digest(
               if isinstance(source_assets, dict) and source_assets
               else _unavailable_source_assets())
     try:
+        # timeout_seconds/max_retries 不进入指纹，与探针同源取默认值即可
+        # （2026-11-15 起默认 3600s）。
         spec = _section_request_spec(
-            state, sec, {"timeout_seconds": 900, "max_retries": 2}, assets)
+            state, sec, {"timeout_seconds": 3600, "max_retries": 2}, assets)
         digest = str(build_request(state, **spec).get("input_digest") or "")
     except Exception:  # noqa: BLE001 - 缓存只是加速，算不出键就不写
         return None

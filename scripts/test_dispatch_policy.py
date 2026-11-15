@@ -302,10 +302,11 @@ class T19_NodeIntegration(unittest.TestCase):
         self.assertEqual("auto", cfg["concurrency_source"])
 
     def test_t19_16_load_config_missing_file_defaults(self):
+        # 2026-11-15：未配置时默认并行 fast/4（JS 侧读不到 run_scope，不能静默串行）
         cfg = sbn._load_dispatch_config(self.dir, "")
         self.assertEqual(1, cfg["dispatch_contract_version"])
-        self.assertEqual("safe", cfg["profile"])
-        self.assertEqual(1, cfg["max_concurrency"])
+        self.assertEqual("fast", cfg["profile"])
+        self.assertEqual(4, cfg["max_concurrency"])
         self.assertIsNone(cfg["dispatch_error"])
 
     def test_t19_17_disk_plan_batch_size_separated_from_cap(self):

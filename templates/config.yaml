@@ -59,8 +59,9 @@ dialogue_require_coverage_hook: true   # 对话块必须在 coverage-map.md 有�
 # 0 = 自动（按档位表取），负数/小数/布尔/大于 16 一律拒绝；嵌套与扁平同时为正
 # 且不一致 → CONFIG_CONCURRENCY_CONFLICT（不静默挑一个）。
 # 档位缺省推导：run_scope=full 或 execution_profile=faithful_fast → fast(4)，
-# focused/edit → interactive(1)，其余 → safe(1)。本模板**故意不预填 profile**：
-# 预填 safe 会把新工程的默认并发压回串行，且无法与「用户显式选 safe」区分。
+# focused/edit → interactive(1)，其余 → fast(4)（2026-11-15 起：JS 侧派发工具
+# 读不到 state 里的 run_scope，未配置工作区不能再被静默压成串行）。本模板
+# **故意不预填 profile**：要串行必须显式写 safe，才能与「用户显式选 safe」区分。
 # 迁移提示：旧工程没有 dispatch_contract_version 时按 legacy(1) 解释——保留
 # 旧的「扁平 agent_max_concurrency 优先」语义，不会被静默放大；显式写 2 才启用
 # 上面的新优先级与冲突诊断。
@@ -81,7 +82,7 @@ agent_dispatch:
 # agent_dispatch: safe
 agent_max_concurrency: 0      # 扁平兜底键（v2：嵌套为正时以嵌套为准；legacy：扁平优先）
 agent_batch_window: 2         # 批次窗口倍数: batch_size = min(并发*窗口, 待写节数)；排队请求数可以大于并发槽位
-agent_timeout_seconds: 900    # 单请求超时（秒）
+agent_timeout_seconds: 3600   # 单请求超时（秒；2026-11-15 起默认 3600：真实任务实测 20-50 分钟，900s 会斩杀合法长任务）
 agent_max_retries: 2          # transient 故障重试次数（content/contract 类不重试）
 agent_allow_unattested: false # 扁平兜底逃生阀（等价 agent_dispatch.allow_unattested；映射块优先）
 

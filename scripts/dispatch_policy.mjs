@@ -17,7 +17,12 @@ export const DISPATCH_PROFILES = ['interactive', 'safe', 'fast', 'budget'];
 export const PROFILE_CONCURRENCY = {
   interactive: 1, safe: 1, fast: 4, budget: 2,
 };
-export const DEFAULT_PROFILE = 'safe';
+// 未显式配置档位、run_scope 也未知时的回落：并行档 fast(4)。
+// 2026-11-15 改动：原为 safe(1)（全串行）。JS 侧派发工具读不到 state 里的
+// run_scope（只在 self/config.yaml 里找），导致"未配置工作区"实际永远串行，
+// 与"同批独立小节一次 batch_id 进同一并发池"的设计意图相反。要串行必须显式：
+// agent_dispatch: safe（或 profile: safe），run_scope=focused/edit 仍 interactive(1)。
+export const DEFAULT_PROFILE = 'fast';
 export const RUN_SCOPE_DEFAULT_PROFILE = {
   full: 'fast', focused: 'interactive', edit: 'interactive',
 };

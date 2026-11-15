@@ -321,7 +321,9 @@ def _build_check_requests(
             },
             scope=sec,
             batch_id=batch_id,
-            timeout_seconds=int(cfg.get("timeout_seconds") or 900),
+            # 2026-11-15：缺省 900s → 3600s（真实任务 20-50 分钟，见
+            # scripts/dispatch_attempts.mjs DEFAULT_TIMEOUT_SECONDS 注释）。
+            timeout_seconds=int(cfg.get("timeout_seconds") or 3600),
             max_retries=int(cfg.get("max_retries") or 2),
             retry_class="transient",
         )

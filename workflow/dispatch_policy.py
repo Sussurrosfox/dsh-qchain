@@ -66,8 +66,12 @@ SUPPORTED_DISPATCH_CONTRACT_VERSIONS = (
 DISPATCH_PROFILES = ("interactive", "safe", "fast", "budget")
 PROFILE_CONCURRENCY: Dict[str, int] = {
     "interactive": 1, "safe": 1, "fast": 4, "budget": 2}
-#: 未显式配置且 run_scope 未知时的保守回落（旧行为，保留）
-DEFAULT_PROFILE = "safe"
+#: 未显式配置且 run_scope 未知时的回落：并行档 fast(4)。
+#: 2026-11-15 改动：原为 "safe"(1)（全串行）。JS 侧派发工具读不到 state 里的
+#: run_scope（只在 self/config.yaml 里找），导致"未配置工作区"实际永远串行，
+#: 与"同批独立小节一次 batch_id 进同一并发池"的设计意图相反。要串行必须显式：
+#: agent_dispatch: safe（或 profile: safe），run_scope=focused/edit 仍 interactive(1)。
+DEFAULT_PROFILE = "fast"
 #: run_scope → 缺省档位（full=完整生成 → fast；focused/edit=交互微调）
 RUN_SCOPE_DEFAULT_PROFILE: Dict[str, str] = {
     "full": "fast", "focused": "interactive", "edit": "interactive"}

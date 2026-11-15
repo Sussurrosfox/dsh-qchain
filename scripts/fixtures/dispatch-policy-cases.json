@@ -104,7 +104,7 @@
       "why": "仅扁平键时用扁平键（嵌套缺省不冲突）",
       "config": { "dispatch_contract_version": 2, "agent_max_concurrency": 3 },
       "expect": {
-        "dispatch_contract_version": 2, "profile": "safe",
+        "dispatch_contract_version": 2, "profile": "fast",
         "profile_source": "default", "configured_concurrency": 3,
         "concurrency_source": "config:agent_max_concurrency",
         "concurrency_limit": 3, "executor_kind": "host_subagent",
@@ -114,18 +114,32 @@
     },
     {
       "name": "v2_zero_is_auto",
-      "why": "PARCFG-02：0 = 自动，不产生正向覆盖效果（回落档位表）",
+      "why": "PARCFG-02：0 = 自动，不产生正向覆盖效果（回落默认档位 fast/4）",
       "config": {
         "dispatch_contract_version": 2,
         "agent_dispatch": { "max_concurrency": 0 },
         "agent_max_concurrency": 0
       },
       "expect": {
-        "dispatch_contract_version": 2, "profile": "safe",
+        "dispatch_contract_version": 2, "profile": "fast",
         "profile_source": "default", "configured_concurrency": 0,
-        "concurrency_source": "auto", "concurrency_limit": 1,
+        "concurrency_source": "auto", "concurrency_limit": 4,
         "executor_kind": "host_subagent", "worker_max_concurrency": null,
-        "capability_verified": false, "effective_concurrency": 1,
+        "capability_verified": false, "effective_concurrency": 4,
+        "diagnostic_codes": []
+      }
+    },
+    {
+      "name": "v2_unconfigured_defaults_fast",
+      "why": "2026-11-15：v2 契约下完全未配置档位/并发且 run_scope 未知 → 默认并行 fast/4（不再静默串行）",
+      "config": { "dispatch_contract_version": 2 },
+      "run_scope": "",
+      "expect": {
+        "dispatch_contract_version": 2, "profile": "fast",
+        "profile_source": "default", "configured_concurrency": 0,
+        "concurrency_source": "auto", "concurrency_limit": 4,
+        "executor_kind": "host_subagent", "worker_max_concurrency": null,
+        "capability_verified": false, "effective_concurrency": 4,
         "diagnostic_codes": []
       }
     },
@@ -211,24 +225,24 @@
       "why": "PARCFG-03：旧契约非法标量仍按旧行为回落自动档位（只留诊断，不失败）",
       "config": { "agent_max_concurrency": "not-a-number" },
       "expect": {
-        "dispatch_contract_version": 1, "profile": "safe",
+        "dispatch_contract_version": 1, "profile": "fast",
         "profile_source": "default", "configured_concurrency": 0,
-        "concurrency_source": "auto", "concurrency_limit": 1,
+        "concurrency_source": "auto", "concurrency_limit": 4,
         "executor_kind": "host_subagent", "worker_max_concurrency": null,
-        "capability_verified": false, "effective_concurrency": 1,
+        "capability_verified": false, "effective_concurrency": 4,
         "diagnostic_codes": ["CONFIG_CONCURRENCY_INVALID"]
       }
     },
     {
       "name": "legacy_invalid_profile_falls_back",
-      "why": "PARCFG-03：旧契约未知档位回落 safe",
+      "why": "PARCFG-03：旧契约未知档位回落默认并行档 fast",
       "config": { "agent_dispatch": "turbo" },
       "expect": {
-        "dispatch_contract_version": 1, "profile": "safe",
+        "dispatch_contract_version": 1, "profile": "fast",
         "profile_source": "default", "configured_concurrency": 0,
-        "concurrency_source": "auto", "concurrency_limit": 1,
+        "concurrency_source": "auto", "concurrency_limit": 4,
         "executor_kind": "host_subagent", "worker_max_concurrency": null,
-        "capability_verified": false, "effective_concurrency": 1,
+        "capability_verified": false, "effective_concurrency": 4,
         "diagnostic_codes": ["INVALID_DISPATCH_PROFILE"]
       }
     },
@@ -241,7 +255,7 @@
       },
       "tool_override": 2,
       "expect": {
-        "dispatch_contract_version": 2, "profile": "safe",
+        "dispatch_contract_version": 2, "profile": "fast",
         "profile_source": "default", "configured_concurrency": 2,
         "concurrency_source": "tool:max_concurrency", "concurrency_limit": 2,
         "executor_kind": "host_subagent", "worker_max_concurrency": null,
@@ -258,7 +272,7 @@
       },
       "tool_override": 0,
       "expect": {
-        "dispatch_contract_version": 2, "profile": "safe",
+        "dispatch_contract_version": 2, "profile": "fast",
         "profile_source": "default", "configured_concurrency": 4,
         "concurrency_source": "config:agent_dispatch.max_concurrency",
         "concurrency_limit": 4, "executor_kind": "host_subagent",
@@ -302,7 +316,7 @@
       },
       "worker_capabilities": null,
       "expect": {
-        "dispatch_contract_version": 2, "profile": "safe",
+        "dispatch_contract_version": 2, "profile": "fast",
         "profile_source": "default", "configured_concurrency": 4,
         "concurrency_source": "config:agent_dispatch.max_concurrency",
         "concurrency_limit": 4, "executor_kind": "host_subagent",
@@ -319,7 +333,7 @@
       },
       "worker_capabilities": { "max_concurrency": 1, "sync": true },
       "expect": {
-        "dispatch_contract_version": 2, "profile": "safe",
+        "dispatch_contract_version": 2, "profile": "fast",
         "profile_source": "default", "configured_concurrency": 4,
         "concurrency_source": "config:agent_dispatch.max_concurrency",
         "concurrency_limit": 4, "executor_kind": "python_registry",
@@ -336,7 +350,7 @@
       },
       "worker_capabilities": { "max_concurrency": 4, "sync": true },
       "expect": {
-        "dispatch_contract_version": 2, "profile": "safe",
+        "dispatch_contract_version": 2, "profile": "fast",
         "profile_source": "default", "configured_concurrency": 8,
         "concurrency_source": "config:agent_max_concurrency",
         "concurrency_limit": 8, "executor_kind": "python_registry",

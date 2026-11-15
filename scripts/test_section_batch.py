@@ -285,9 +285,10 @@ class T01_DispatchConfig(unittest.TestCase):
                 cfg = sbn._load_dispatch_config(d, run_scope=scope)
                 self.assertEqual(cfg["profile"], "interactive")
                 self.assertEqual(cfg["max_concurrency"], 1)
-            # 未知 run_scope 回落 safe（保守）
+            # 未知 run_scope 回落默认并行档 fast（2026-11-15 起，不再静默串行）
             cfg = sbn._load_dispatch_config(d, run_scope="bogus")
-            self.assertEqual(cfg["profile"], "safe")
+            self.assertEqual(cfg["profile"], "fast")
+            self.assertEqual(cfg["max_concurrency"], 4)
             # 显式 agent_dispatch 永远优先于推导（向后兼容旧工程）
             write_config(d, agent_dispatch="budget")
             cfg = sbn._load_dispatch_config(d, run_scope="full")
@@ -307,10 +308,13 @@ class T01_DispatchConfig(unittest.TestCase):
     def test_missing_file_defaults(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = sbn._load_dispatch_config(d)
-            self.assertEqual(cfg["profile"], "safe")
-            self.assertEqual(cfg["max_concurrency"], 1)
+            # 2026-11-15：未配置时默认并行 fast/4（JS 侧读不到 run_scope，
+            # 不能把"未配置"静默变成全串行）
+            self.assertEqual(cfg["profile"], "fast")
+            self.assertEqual(cfg["max_concurrency"], 4)
             self.assertEqual(cfg["batch_window"], 2)
-            self.assertEqual(cfg["timeout_seconds"], 900)
+            # timeout 默认 3600s（2026-11-15 起；真实任务 20-50 分钟）
+            self.assertEqual(cfg["timeout_seconds"], 3600)
             self.assertEqual(cfg["max_retries"], 2)
 
     def test_malformed_lines_tolerated(self):
@@ -354,8 +358,8 @@ class T01_DispatchConfig(unittest.TestCase):
                         "agent_batch_window: -3\n"
                         "agent_timeout_seconds: 0\n")
             cfg = sbn._load_dispatch_config(d)
-            self.assertEqual(cfg["profile"], "safe")      # 非法档位回落
-            self.assertEqual(cfg["max_concurrency"], 1)   # 非法整数回落档位表
+            self.assertEqual(cfg["profile"], "fast")      # 非法档位回落默认并行档
+            self.assertEqual(cfg["max_concurrency"], 4)   # 非法整数回落档位表
             self.assertEqual(cfg["batch_window"], 1)      # 负窗口夹到 1
             self.assertEqual(cfg["timeout_seconds"], 1)   # 非正超时夹到 1
 
@@ -497,6 +501,8 @@ class T03_PlanBuilding(unittest.TestCase):
                 self.assertEqual(req["artifacts"],
                                  [f"{sec}.tex" for sec in scopes])
                 self.assertEqual(req["scope"], scopes[0])
+                # 夹具 write_config 显式写 agent_timeout_seconds: 900 → 显式配置
+                # 优先于默认（2026-11-15 起默认 3600s），此处仍应为 900
                 self.assertEqual(req["timeout_seconds"], 900)
                 self.assertEqual(req["max_retries"], 2)
                 self.assertEqual(req["retry_class"], "transient")

@@ -17,7 +17,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import crypto from 'node:crypto';
 
-export const DEFAULT_TIMEOUT_SECONDS = 900;
+// 2026-11-15：默认超时 900s → 3600s。生产证据：真实任务（长 TeX/JSON 产物 +
+// 长推理链）实测 20-50 分钟；900s 会斩杀合法长任务，且 timeout 属可重试类，
+// 最坏 3×15min 全价盲重。可用派发单 timeout_seconds 或 config agent_timeout_seconds 覆盖。
+export const DEFAULT_TIMEOUT_SECONDS = 3600;
 export const DEFAULT_MAX_RETRIES = 2;
 export const DEFAULT_CANCEL_GRACE_MS = 5000;
 export const ATTEMPT_SCHEMA_VERSION = 1;

@@ -287,7 +287,7 @@ test('DISP-03 策略解析：timeout/max_retries/retry_class 生效，非法值�
   assert.equal(p.attempts_allowed, 3);
   assert.equal(p.retry_class, 'transient');
   const fallback = resolveAttemptPolicy({ timeout_seconds: 0, max_retries: -3, retry_class: '' });
-  assert.equal(fallback.timeout_seconds, 900, '非正超时回落默认 900s，不静默变成立即超时');
+  assert.equal(fallback.timeout_seconds, 3600, '非正超时回落默认 3600s，不静默变成立即超时');
   assert.equal(fallback.max_retries, 0, '负数 max_retries 夹到 0');
   assert.equal(fallback.retry_class, 'transient');
   assert.equal(resolveAttemptPolicy({ retry_class: 'content', max_retries: 2 }).attempts_allowed, 1,

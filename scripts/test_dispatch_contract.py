@@ -70,9 +70,9 @@ class T01_ContractKeys(unittest.TestCase):
             req = build_request(make_state(d), **base_kwargs())
             for k in CONTRACT_KEYS + LEGACY_KEYS:
                 self.assertIn(k, req)
-            # 默认值
+            # 默认值（2026-11-15 起 timeout 默认 3600s：真实任务 20-50 分钟）
             self.assertEqual(req["scope"], "")
-            self.assertEqual(req["timeout_seconds"], 900)
+            self.assertEqual(req["timeout_seconds"], 3600)
             self.assertEqual(req["max_retries"], 2)
             self.assertEqual(req["retry_class"], "transient")
             self.assertEqual(req["status"], "pending")
@@ -149,7 +149,7 @@ class T04_WriteRequestFile(unittest.TestCase):
             # JSON 往返一致（合同字段全部持久化）
             self.assertEqual(loaded, req)
             self.assertEqual(loaded["scope"], "sec1")
-            self.assertEqual(loaded["timeout_seconds"], 900)
+            self.assertEqual(loaded["timeout_seconds"], 3600)
             self.assertEqual(loaded["retry_class"], "transient")
             self.assertRegex(loaded["input_digest"], HEX64)
             # dispatch_id 形态：带 scope 时包含 scope
