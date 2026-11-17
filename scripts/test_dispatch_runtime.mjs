@@ -282,7 +282,7 @@ test('PROMPT-04 两节批次：任务书与输出协议列出两个产物；越�
 });
 
 // ---------------------------------------------------------------- 角色化协议与上下文
-test('输出协议按角色唯一：作者/规划=FILE 块（无 JSON 指令），终审=JSON（无 FILE 块）', () => {
+test('输出协议按角色：作者/规划=FILE 块（无 JSON 指令），审读=FILE 块首选 + JSON 备选', () => {
   const { root, selfDir } = mkProject('proto');
   try {
     w(path.join(selfDir, 'sec1.tex'), '\\section*{I x}\nCANDIDATE_BODY\n');
@@ -307,11 +307,59 @@ test('输出协议按角色唯一：作者/规划=FILE 块（无 JSON 指令）�
       context: { section_id: 'sec1', section_digest: 'abc' },
     }, { selfDir, engineRoot: ROOT });
     assert.equal(review.meta.role, 'review');
-    assert.ok(!review.prompt.includes('<<<FILE:'), '终审 prompt 不含 FILE 块指令');
-    assert.ok(review.prompt.includes('{"files": {"<相对路径>": "<完整文件内容>"}}'));
+    // P2-2：审读角色的首选协议改为 FILE 块（大 JSON 的括号/转义错误是 T4 批
+    // 5 轮里 4 轮失败的直接原因），单一 JSON 对象仍作为备选被接受——解析器
+    // 两条路都认，故这里断言「两种格式都在、且 FILE 块在前」。
+    assert.ok(review.prompt.includes('<<<FILE:.pd/semantic/sec1.json>>>'),
+      '审读 prompt 首选 FILE 块指令');
+    assert.ok(review.prompt.includes('{"files": {"<相对路径>": "<完整文件内容>"}}'),
+      '单一 JSON 对象作为备选仍被说明（解析器兼容）');
+    // 只看协议段内部（模板正文里也可能出现 {"files"，那不算协议顺序）
+    const proto = review.prompt.slice(review.prompt.lastIndexOf('## 输出协议'));
+    assert.ok(proto.indexOf('<<<FILE:') < proto.indexOf('{"files":'),
+      'FILE 块必须排在 JSON 备选之前，否则模型仍会先试大 JSON');
     assert.ok(review.prompt.includes('- .pd/semantic/sec1.json'));
     assert.ok(review.prompt.includes('CANDIDATE_BODY'), '被审候选全文必须在 prompt 中（缺失时旧版根本没有）');
     assert.equal(review.meta.review_targets[0].scope, 'sec1');
+  } finally { rmrf(root); }
+});
+
+test('P2-1 提示词分层：layered 只内嵌摘要 + 附录索引，full 保持全量', () => {
+  const { root, selfDir } = mkProject('layered');
+  try {
+    w(path.join(selfDir, 'sec1.tex'), 'CANDIDATE');
+    // 大映射表：足够长，超出 layeredMapChars 才会触发过滤/截断
+    const rows = [];
+    for (let i = 0; i < 400; i += 1) {
+      rows.push(`| SRC-${String(i).padStart(3, '0')} | sec${(i % 2) + 1} | x | y |`);
+    }
+    w(path.join(selfDir, 'source-map.md'), `| 原文节点 | 学案位置 |\n| --- | --- |\n${rows.join('\n')}\n`);
+    w(path.join(selfDir, '.pd', 'review', 'student-pages.txt'), 'P'.repeat(30000));
+    const base = {
+      dispatch_id: 'd', stage: 'T4_REVIEW_SEC1', role: 'r',
+      prompt_file: 'acceptance_prompt.md',
+      artifacts: ['.pd/acceptance/sec1.json'], instruction: 'x', scope: 'sec1',
+      context: { section_id: 'sec1' },
+    };
+    const layered = RT.buildDispatchPrompt(base, { selfDir, engineRoot: ROOT });
+    const full = RT.buildDispatchPrompt(
+      { ...base, context: { ...base.context, prompt_profile: 'full' } },
+      { selfDir, engineRoot: ROOT });
+    assert.equal(layered.meta.prompt_profile, 'layered');
+    assert.equal(full.meta.prompt_profile, 'full');
+    assert.ok(layered.meta.prompt_chars < full.meta.prompt_chars,
+      'layered 必须比 full 短（否则分层没生效）');
+    assert.ok(layered.prompt.includes('## 附录索引'),
+      'layered 必须给出附录索引（路径 + 尺寸）');
+    assert.ok(layered.prompt.includes('source-map.md'), '附录索引须列出映射表路径');
+    assert.ok(layered.prompt.includes('投递通道的展示折叠'),
+      '必须提示"可见载荷被折叠 ≠ 内容缺失"，阻断子 Agent 的通读冲动');
+    assert.ok(!full.prompt.includes('## 附录索引'), 'full 档不出现附录索引');
+    // 分层不改必读层：被审候选全文仍在
+    assert.ok(layered.prompt.includes('CANDIDATE'), '必须保留被审对象全文');
+    // 字数账可用于运维定位
+    assert.equal(typeof layered.meta.layers.maps, 'number');
+    assert.ok(layered.meta.layers.maps <= RT.buildDispatchPrompt(base, { selfDir, engineRoot: ROOT }).meta.layers.maps + 1);
   } finally { rmrf(root); }
 });
 

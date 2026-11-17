@@ -6,7 +6,7 @@ GateReport 合成的 ``{category, severity: HIGH_RISK|WARN|INFO}``）。本模�
 （原条目整体放进 ``evidence.raw``）：
 
     {code, severity(error|warning|info), category, scope, qid, artifact, message,
-     evidence, input_digest, repair_kind(none|deterministic|agent|human),
+     evidence, input_digest, repair_kind(none|deterministic|environment|asset|agent|human),
      repair_target, blocking}
 
 铁律：
@@ -14,15 +14,22 @@ GateReport 合成的 ``{category, severity: HIGH_RISK|WARN|INFO}``）。本模�
   * **未知 error 不降级**：落入 ``unclassified``（human + blocking），路由为 HALT；
   * warning / info / review 绝不自动派 Agent（review 要人工复核，info 只提示）；
   * 渲染器 / 资源 / 目录 / 引擎类缺陷绝不派写作者；
+  * **唯一判据**：修复动作是否落在 ``sec*.tex`` 之内。不在就绝不派 author
+    （resource/environment/deterministic 三类都走这条），不靠门禁名猜；
   * agent 类问题定位不到切片 → 停机，不回退到“上一节 / 第一节”盲改；
-  * 基础设施失败（ERROR / 报告缺失或过期 / 门禁崩溃）→ 停机，不拿内容重试顶替。
+  * 基础设施失败（ERROR / 报告缺失或过期 / 门禁崩溃）→ 停机，不拿内容重试顶替；
+  * 兜底必须**收敛**：没有前缀大锤——未登记码 HALT 并如实报缺口
+    （``route_table_coverage``），绝不把它放大成全链重跑。
 """
 
 import re
 from typing import Any, Dict, List, NamedTuple, Optional
 
 SEVERITIES = ("error", "warning", "info")
-REPAIR_KINDS = ("none", "deterministic", "agent", "human")
+#: ``environment`` = 缺 TeX 工具/字体/引擎能力；``asset`` = 缺图片等资源文件。
+#: 两者都不是内容问题——派写作者改 sec*.tex 永远修不好，只会白烧返修预算。
+REPAIR_KINDS = ("none", "deterministic", "environment", "asset",
+                "agent", "human")
 
 #: GateReport 合成的基础设施类 category（script_runner._synthesize_gate_report）
 INFRA_CATEGORIES = ("EXECUTION_FAILURE", "REPORT_MISSING_OR_STALE")
@@ -31,6 +38,9 @@ INFRA_CATEGORIES = ("EXECUTION_FAILURE", "REPORT_MISSING_OR_STALE")
 SECTION = "@section"
 #: 路由到 REPLAN 的地图类目标
 REPLAN_TARGETS = ("source-map.md", "coverage-map.md")
+#: 非内容类修复目标（停机后由环境/资源侧处理，绝不派写作者）
+ASSET_TARGET = "asset-harvest"
+ENV_TARGET = "tex-environment"
 
 
 class Route(NamedTuple):
@@ -57,9 +67,84 @@ CODE_ROUTES: Dict[str, Route] = {
     "FIDELITY_BRIDGE_UNAPPROVED": Route("fidelity_section", "agent", SECTION, fallback=_SRC),
     "FIDELITY_ASSET_LOST": Route("fidelity_section", "agent", SECTION, fallback=_SRC),
     "FIDELITY_SOURCE_NOT_COVERED": Route("fidelity_section", "agent", SECTION, fallback=_SRC),
+    # 未登记的扩写/新增/顺序变动：修动作落在 sec*.tex 内（补登记或删改），派作者
+    "FIDELITY_EXTEND_NOT_ALLOWED": Route("fidelity_section", "agent", SECTION, fallback=_SRC),
+    "FIDELITY_EXTEND_PENDING": Route("fidelity_section", "agent", SECTION, fallback=_SRC),
+    "FIDELITY_EXTEND_UNAPPROVED": Route("fidelity_section", "agent", SECTION, fallback=_SRC),
+    "FIDELITY_NOVELTY_UNAPPROVED": Route("fidelity_section", "agent", SECTION, fallback=_SRC),
+    "FIDELITY_ORDER_VIOLATION": Route("fidelity_section", "agent", SECTION, fallback=_SRC),
+    # --- 映射契约（source-map.md）→ 最小重规划映射，绝不回头改切片 ---
+    "FIDELITY_MAP_MISSING": Route("mapping", "agent", _SRC),
+    "FIDELITY_MAP_NO_ROWS": Route("mapping", "agent", _SRC),
+    "FIDELITY_MAP_ROW_FORMAT": Route("mapping", "agent", _SRC),
+    "FIDELITY_MAP_BAD_ACTION": Route("mapping", "agent", _SRC),
+    "FIDELITY_MAP_BAD_STATUS": Route("mapping", "agent", _SRC),
+    "FIDELITY_MANIFEST_MISSING": Route("mapping", "agent", _SRC),
+    "FIDELITY_INVENTORY_MISSING": Route("mapping", "agent", _SRC),
+    "FIDELITY_CONTRACT_MISSING": Route("mapping", "agent", _SRC),
+    "FIDELITY_SOURCE_MISSING": Route("mapping", "agent", _SRC),
+    "FIDELITY_SOURCE_DIGEST_MISMATCH": Route("mapping", "agent", _SRC),
+    "FIDELITY_UNKNOWN_SOURCE_ID": Route("mapping", "agent", _SRC),
+    "FIDELITY_EXCLUDED_NOT_RECORDED": Route("mapping", "agent", _SRC),
+    "FIDELITY_EXCLUSION_MISMATCH": Route("mapping", "agent", _SRC),
+    # --- 资源定位：找不到资源本体 → 资源收割，不是内容问题 ---
+    "FIDELITY_ASSET_SOURCE_UNREADABLE": Route("asset_source", "asset", ASSET_TARGET),
+    "FIDELITY_ASSET_LOCATOR_UNKNOWN": Route("asset_locator", "asset", ASSET_TARGET),
     # --- 映射不一致 → 最小重规划映射 ---
     "FIDELITY_COVERAGE_MISSING": Route("mapping", "agent", _COV),
     "FIDELITY_COVERAGE_FORMAT": Route("mapping", "agent", _COV),
+    # 缺口登记（写进 coverage-map.md 的缺口表）→ 只改覆盖表
+    "FIDELITY_GAP_LOCATOR_UNKNOWN": Route("mapping_gap", "agent", _COV),
+    "FIDELITY_GAP_NO_REASON": Route("mapping_gap", "agent", _COV),
+    "FIDELITY_GAP_NO_SUCH_ASSET": Route("mapping_gap", "agent", _COV),
+    "FIDELITY_GAP_REDUNDANT": Route("mapping_gap", "agent", _COV),
+    "FIDELITY_GAP_STALE": Route("mapping_gap", "agent", _COV),
+    "FIDELITY_GAP_UNKNOWN_SOURCE": Route("mapping_gap", "agent", _COV),
+    # --- LaTeX 构建：把「缺资源 / 缺环境 / 内容语法」彻底分开 ---
+    # 缺图：资源问题 → 收割资源，绝不派作者（本次 run 白烧一轮返修的直接原因）
+    "LATEX_ASSET_MISSING": Route("latex_asset", "asset", ASSET_TARGET),
+    "LATEX_ASSET_OPAQUE": Route("latex_asset", "asset", ASSET_TARGET),
+    # 缺字体/缺工具/编译环境 → 环境问题 → 停机交环境侧
+    "LATEX_FONT_MISSING": Route("latex_env", "environment", ENV_TARGET),
+    "LATEX_ENV_MISSING": Route("latex_env", "environment", ENV_TARGET),
+    "LATEX_STALE_OUTPUT": Route("latex_env", "environment", ENV_TARGET),
+    "LATEX_CONFIG_FAILED": Route("latex_env", "environment", ENV_TARGET),
+    "LATEX_SOURCE_MISSING": Route("latex_env", "environment", ENV_TARGET),
+    "LATEX_COUNTER_MISMATCH": Route("latex_engine", "environment", ENV_TARGET),
+    "LATEX_INPUT_CHANGED": Route("latex_engine", "environment", ENV_TARGET),
+    # 真正的语法错 → 作者可修
+    "LATEX_SYNTAX_ERROR": Route("latex_syntax", "agent", SECTION),
+    # 卡片解析/校验失败 = 渲染器自身缺陷（如节标题正则不容嵌套花括号）→ 修渲染器
+    "LATEX_DECK_PARSE": Route("render_engine", "deterministic", "renderer"),
+    # 选项打乱问题来自 \fillin 选项 → 内容
+    "LATEX_SHUFFLE": Route("latex_shuffle", "agent", SECTION),
+    # 版式溢出：作者改不动版式，环境侧处理
+    "LATEX_OVERFULL": Route("latex_overfull", "environment", "pdf-layout"),
+    "LATEX_SUMMARY_MISSING": Route("latex_engine", "environment", ENV_TARGET),
+    # --- 编号结构（check_numbering）：全部落在 sec*.tex 内，除装配问题 ---
+    "NUMBERING_FILLIN_OPTIONS": Route("numbering_fillin", "agent", SECTION),
+    "NUMBERING_ENV_UNBALANCED": Route("numbering_env", "agent", SECTION),
+    "NUMBERING_TEACHER_ENV_COUNT": Route("numbering_teacher", "agent", SECTION),
+    "NUMBERING_HINT_VISIBLE": Route("numbering_hint", "agent", SECTION),
+    "NUMBERING_DUPLICATE_QID": Route("numbering_qid", "agent", SECTION),
+    "NUMBERING_PRACTICEMODE": Route("numbering_mode", "agent", SECTION),
+    "NUMBERING_PROBCHAIN_NESTED": Route("numbering_chain", "agent", SECTION),
+    "NUMBERING_FORBIDDEN_GLOBAL": Route("numbering_global", "agent", SECTION),
+    "NUMBERING_KNOWLEDGEBOX_MISSING": Route("numbering_box", "agent", SECTION),
+    "NUMBERING_MICROKNOWLEDGE_MISSING": Route("numbering_pre", "agent", SECTION),
+    "NUMBERING_PROBCHAIN_EMPTY": Route("numbering_chain", "agent", SECTION),
+    "NUMBERING_LEGACY_SERIES": Route("numbering_legacy", "agent", SECTION),
+    # 兜底码：编号类问题除装配外一律落在 sec*.tex 内（仍需定位成功，否则 HALT）
+    "NUMBERING_OTHER": Route("numbering_generic", "agent", SECTION),
+    # 装配问题由引擎自己的 t2_assemble_main 产生，作者改不了
+    "NUMBERING_ASSEMBLY": Route("numbering_assembly", "environment", ENV_TARGET),
+    # --- 对话层（check_dialogue）：主体是内容，配置/覆盖表分离出来 ---
+    "DIALOGUE_CONFIG_ERROR": Route("dialogue_config", "environment", ENV_TARGET),
+    "DIALOGUE_COVERAGE_MISSING": Route("dialogue_coverage", "agent", _COV),
+    "DIALOGUE_OPTOUT_MISSING": Route("dialogue_optout", "agent", SECTION),
+    "DIALOGUE_STRUCTURE": Route("dialogue_section", "agent", SECTION),
+    # 兜底码：对话层结构问题一律落在 sec*.tex 内（仍需定位成功）
+    "DIALOGUE_OTHER": Route("dialogue_generic", "agent", SECTION),
     # --- 范围/契约漂移 → 人工 ---
     "SCOPE_CONTRACT_MISSING": Route("scope_contract", "human", "scope-contract"),
     "SCOPE_CONTRACT_TAMPERED": Route("scope_contract", "human", "scope-contract"),
@@ -99,11 +184,14 @@ CODE_ROUTES: Dict[str, Route] = {
                                        strict_blocks=True),
 }
 
-#: 前缀兜底（按顺序匹配；精确码优先）。FIDELITY_* 其余均为映射/契约/清单类 →
-#: 重规划 source-map.md（与 node_t3_checks 原行为一致）。
+#: 前缀兜底（按顺序匹配；精确码优先）。
+#:
+#: N0 起 **不再有 ``FIDELITY_`` 整族前缀兜底**：那条兜底会把任何未登记的
+#: fidelity 码升级成 "REPLAN source-map.md"（重跑整个 T1 来源映射链）。本次 run
+#: 里一个 coverage-map 单元格内的裸竖线就是这么把一次单字符修复放大成 T1 全链
+#: 重跑的。现在 fidelity 的每个真实码都在 CODE_ROUTES 里逐条登记；未登记的码
+#: 落到 ``_UNCLASSIFIED`` → HALT + 如实报缺口（收敛式兜底，见 check_route_coverage）。
 PREFIX_ROUTES = (
-    ("FIDELITY_COVERAGE_", Route("mapping", "agent", _COV)),
-    ("FIDELITY_", Route("mapping", "agent", _SRC)),
     ("SCOPE_", Route("scope_contract", "human", "scope-contract")),
 )
 
@@ -132,6 +220,69 @@ GATE_ERROR_ROUTES: Dict[str, Route] = {
 STRICT_WARNING_GATES = {
     "check_pedagogy": Route("pedagogy_advisory", "agent", SECTION, strict_blocks=True),
 }
+
+#: 无 code 的门禁报告 → 用消息特征补出等价 code（N0：分类学完备性最后一道网）。
+#: 只在报告确实没给 code 时使用；给出 code 的报告一律以 code 为准。
+MESSAGE_CODE_ROUTES = (
+    # ---- build / LaTeX：先判资源，再判环境，最后才是内容语法 ----
+    (re.compile(r"Unable to load picture|File `[^`']+\.(?:png|jpg|jpeg|pdf|eps|svg)' "
+                r"not found|图片资产缺失|graphics file .* not found", re.I),
+     "LATEX_ASSET_MISSING"),
+    (re.compile(r"Font .* not (?:found|loadable)|Missing character|fontspec.*font", re.I),
+     "LATEX_FONT_MISSING"),
+    (re.compile(r"缺少 xelatex|缺少 latexmk|xelatex 依赖|env.*missing|未安装", re.I),
+     "LATEX_ENV_MISSING"),
+    (re.compile(r"双版 .* 计数不一致|SUMMARY 行", re.I), "LATEX_COUNTER_MISMATCH"),
+    (re.compile(r"不是本次编译产物|不是本次构建产物", re.I), "LATEX_STALE_OUTPUT"),
+    (re.compile(r"配置生成失败", re.I), "LATEX_CONFIG_FAILED"),
+    (re.compile(r"缺少 \S+\.tex$", re.I), "LATEX_SOURCE_MISSING"),
+    (re.compile(r"Overfull \\[hv]box|版式溢出", re.I), "LATEX_OVERFULL"),
+    (re.compile(r"(^|\s)!.*|Undefined control sequence|Missing \$|Extra \}|Runaway argument",
+                re.I), "LATEX_SYNTAX_ERROR"),
+    # ---- check_numbering ----
+    (re.compile(r"\\fillin.*(选项|参考答案|空项)", re.I), "NUMBERING_FILLIN_OPTIONS"),
+    (re.compile(r"\\item 出现在列表环境之外|没有配对的 \\begin|交叉闭合|未闭合"
+                r"|环境内没有任何 \\item", re.I), "NUMBERING_ENV_UNBALANCED"),
+    (re.compile(r"恰好含一个 .* 环境", re.I), "NUMBERING_TEACHER_ENV_COUNT"),
+    (re.compile(r"unprompted 题目块内出现学生版可见提示标记", re.I),
+     "NUMBERING_HINT_VISIBLE"),
+    (re.compile(r"qid .* 重复", re.I), "NUMBERING_DUPLICATE_QID"),
+    (re.compile(r"\\practicemode", re.I), "NUMBERING_PRACTICEMODE"),
+    (re.compile(r"probchain 嵌套", re.I), "NUMBERING_PROBCHAIN_NESTED"),
+    (re.compile(r"不得改写全局状态", re.I), "NUMBERING_FORBIDDEN_GLOBAL"),
+    (re.compile(r"缺失章节末知识总结框", re.I), "NUMBERING_KNOWLEDGEBOX_MISSING"),
+    (re.compile(r"缺失前置知识卡", re.I), "NUMBERING_MICROKNOWLEDGE_MISSING"),
+    (re.compile(r"probchain 内没有可见题目", re.I), "NUMBERING_PROBCHAIN_EMPTY"),
+    (re.compile(r"series=probchain|resume=probchain", re.I), "NUMBERING_LEGACY_SERIES"),
+    (re.compile(r"未在 main\.tex 中装配|重复装配|切片编号 .* 同时占用"
+                r"|切片引入顺序", re.I), "NUMBERING_ASSEMBLY"),
+    # ---- check_dialogue ----    (re.compile(r"config\.yaml 解析失败|工作目录不存在", re.I), "DIALOGUE_CONFIG_ERROR"),
+    (re.compile(r"缺少 coverage-map\.md", re.I), "DIALOGUE_COVERAGE_MISSING"),
+    (re.compile(r"已声明 .*off-(section|example)", re.I), "DIALOGUE_OPTOUT_MISSING"),
+    (re.compile(r"sectiondialogue|exampledialogue|\\speaker|对话块|dialogue:", re.I),
+     "DIALOGUE_STRUCTURE"),
+    # ---- check_fidelity（历史报告只给中文描述，不给 code）----
+    (re.compile(r"原文主体未覆盖|来源未覆盖|未被覆盖|未覆盖.*来源", re.I),
+     "FIDELITY_SOURCE_NOT_COVERED"),
+    (re.compile(r"未登记的扩写|未批准.*扩展|扩展未经批准|EXTEND", re.I),
+     "FIDELITY_EXTEND_UNAPPROVED"),
+    (re.compile(r"新增了原文没有|原文没有的新对象", re.I), "FIDELITY_NOVELTY_UNAPPROVED"),
+    (re.compile(r"映射行格式|映射表", re.I), "FIDELITY_MAP_ROW_FORMAT"),
+    (re.compile(r"来源 ID .*未登记|未知来源 ID", re.I), "FIDELITY_UNKNOWN_SOURCE_ID"),
+)
+
+
+def infer_code_from_message(gate: str, message: str) -> Optional[str]:
+    """报告没给 code 时，用消息特征补出等价 code；补不出返回 None。"""
+    if not message:
+        return None
+    msg = str(message)
+    for rx, code in MESSAGE_CODE_ROUTES:
+        if rx.search(msg):
+            # 只允许补出本门禁确有资格产出的码，避免跨门禁误判
+            if code in CODE_ROUTES:
+                return code
+    return None
 
 #: 渲染门禁（check_render）message → 路由；先匹配先得。
 RENDER_MESSAGE_ROUTES = (
@@ -220,6 +371,12 @@ def _lookup_route(code: str, category: str, gate: str, message: str,
             return _PLAN_ROUTE
         if art_l.endswith("student.pdf"):
             return _PDF_PAGE_ROUTE
+    if not code and category not in INFRA_CATEGORIES:
+        # 报告没给 code：用消息特征补出等价 code（分类学完备性的最后一道网）。
+        # 位置在门禁专属 message 规则之后——有专属规则的门禁保持既有优先级。
+        inferred = infer_code_from_message(gate, message)
+        if inferred:
+            return CODE_ROUTES[inferred]
     if _PAGE_RE.search(message):
         return _PDF_PAGE_ROUTE
     if gate == "check_budget":
@@ -264,8 +421,7 @@ def normalize_issue(raw: Any, *, gate: str = "", scope: str = "",
     route = _lookup_route(code, category_in, gate, message, severity, review,
                           report_category, art)
     issue: Dict[str, Any] = {
-        "code": code or route.category.upper(),
-        "severity": severity,
+        "code": code or route.category.upper(),        "severity": severity,
         "category": route.category,
         "scope": str(raw_d.get("scope") or scope or ""),
         "qid": qid,
@@ -289,7 +445,8 @@ def normalize_issue(raw: Any, *, gate: str = "", scope: str = "",
     if route.category == "classroom_plan":
         issue["artifact"] = issue["artifact"] or "classroom-plan.md"
     # warning/info 非阻断时不得带着“待派发”的修复种类（防止被误当作待办）
-    if not issue["blocking"] and route.repair_kind in ("agent", "deterministic"):
+    if not issue["blocking"] and route.repair_kind in (
+            "agent", "deterministic", "environment", "asset"):
         issue["repair_kind"] = "none"
         issue["repair_target"] = None if route.repair_target == SECTION \
             else issue["repair_target"]
@@ -419,6 +576,16 @@ def decide_route(issues: List[Dict[str, Any]], *,
     unclassified = [i for i in blocking if i["category"] == "unclassified"
                     or i["code"] == "GATE_UNEXPLAINED_FAILURE"]
     humans = [i for i in blocking if i["repair_kind"] == "human"]
+    if unclassified:
+        # N0：兜底必须收敛。未登记的错误（既没有 code 路由、也没有类别路由、
+        # 门禁还没给可推断的消息特征）不再被前缀/类目大锤放大成整链重跑——
+        # 而是停机并把「缺口」原样写进 error_message，促使第一次遇到就补表。
+        first = unclassified[0]
+        gap = first.get("code") or first.get("category") or "unclassified"
+        return _decision("HALT", "human", first["repair_target"] or "unclassified",
+                         f"未登记的错误（路由表缺口，需补 CODE_ROUTES 后重跑）: "
+                         f"{gap} → {first['message'][:120]}",
+                         blocking, unclassified)
     if humans:
         first = humans[0]
         return _decision("HALT", "human", first["repair_target"],
@@ -426,6 +593,16 @@ def decide_route(issues: List[Dict[str, Any]], *,
                          blocking, unclassified)
     agents = [i for i in blocking if i["repair_kind"] == "agent"]
     dets = [i for i in blocking if i["repair_kind"] == "deterministic"]
+    # 资源 / 环境类优先于内容类：编译环境或资源缺口没补齐时，任何内容返修都是空转
+    # （本次 run 的缺图返修就是这样白烧的）。派写作者改 sec*.tex 永远修不好它们。
+    for kind, label in (("asset", "需补齐资源"), ("environment", "需环境侧处理")):
+        hits = [i for i in blocking if i["repair_kind"] == kind]
+        if hits:
+            first = hits[0]
+            return _decision("HALT", kind, first["repair_target"],
+                             f"{label}（{first['category']}→"
+                             f"{first['repair_target'] or kind}），不派 Agent: "
+                             f"{first['message'][:120]}", blocking, unclassified)
     if agents:
         for i in agents:
             tgt = i["repair_target"] or located_target
@@ -440,7 +617,10 @@ def decide_route(issues: List[Dict[str, Any]], *,
                              blocking, unclassified)
     if dets:
         i = dets[0]
-        return _decision("HALT", "deterministic", i["repair_target"],
+        # RC-2：确定性修复不再是"死标签 + HALT"。动作是 REPAIR_DETERMINISTIC，
+        # 由 repair_deterministic 节点执行 scripts/patch_artifact.py（白名单 op +
+        # CAS）。仍然 dispatch_agent=False——确定性修复绝不派内容写作者。
+        return _decision("REPAIR_DETERMINISTIC", "deterministic", i["repair_target"],
                          f"需确定性修复（{i['category']}→{i['repair_target']}），不派 Agent: "
                          f"{i['message'][:120]}", blocking, unclassified)
     # 阻断但 repair_kind=none：规则表缺口，按未知 error 停机
@@ -457,6 +637,8 @@ def _decision(action: str, kind: str, target: Optional[str], reason: str,
         "repair_kind": kind,
         "repair_target": target,
         "dispatch_agent": action in ("REPAIR_SECTION", "REPLAN"),
+        # 确定性修复由引擎执行（repair_deterministic 节点），不是 Agent
+        "engine_action": action if action == "REPAIR_DETERMINISTIC" else "",
         "reason": reason,
         "blocking_issues": blocking,
         "unclassified": unclassified,
@@ -472,6 +654,27 @@ def route_gate_report(report: Optional[Dict[str, Any]], gate: str = "", *,
     decision = decide_route(issues, located_target=located_target)
     decision["issues"] = issues
     return decision
+
+
+# ---------------------------------------------------------------------------
+# 覆盖门禁（ROUTE_TABLE_COVERAGE）
+# ---------------------------------------------------------------------------
+
+def route_table_coverage(codes) -> Dict[str, List[str]]:
+    """给定「门禁实际会产出的 code 全集」，返回路由表缺口。
+
+    返回 ``{known_count, missing}``：``missing`` 非空即说明有门禁会产出本表查不到
+    的码——那类问题最后只能落到 ``unclassified``（HALT + 报缺口）。宁可停机报缺口，
+    也不要再出现「未登记码被前缀兜底放大成全链重跑」。
+
+    注意：``SCOPE_`` 前缀仍在 PREFIX_ROUTES 里，故 SCOPE_* 不算缺口。
+    """
+    known = set(CODE_ROUTES)
+    prefixes = tuple(p for p, _ in PREFIX_ROUTES)
+    covered = {str(c) for c in codes if c and any(str(c).startswith(p)
+                                                  for p in prefixes)}
+    missing = sorted({str(c) for c in codes if c} - known - covered)
+    return {"known_count": len(known), "missing": missing}
 
 
 def infrastructure_failure(report: Optional[Dict[str, Any]]) -> Optional[str]:

@@ -159,7 +159,18 @@ def setup_self(
         os.makedirs(html_dst_dir, exist_ok=True)
         shutil.copy2(html_src, html_dst)
 
-    # 3. 注入配置（D4：标题先消毒，防 YAML/TeX 注入链）
+    # 3. 资产收割（N1）：把原材料引用的图片/附件确定性复制进 self/。
+    #    旧实现只拷模板不搬图片 → \includegraphics 在 self/ 内找不到文件，
+    #    LaTeX 以 “Unable to load picture” 失败，会被误判成内容缺陷。
+    try:
+        if SCRIPTS_DIR not in sys.path:
+            sys.path.insert(0, SCRIPTS_DIR)
+        import harvest_assets  # noqa: PLC0415 - 延迟导入，避免循环依赖
+        harvest_assets.harvest(self_dir, quiet=False)
+    except Exception as exc:  # noqa: BLE001 - 收割失败不得阻断工作区初始化
+        print(f"[setup_self] [警告] 资产收割跳过: {exc}")
+
+    # 4. 注入配置（D4：标题先消毒，防 YAML/TeX 注入链）
     spec = {}
     if title:
         spec["main_title"] = sanitize_title(title)

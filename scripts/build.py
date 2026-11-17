@@ -72,8 +72,53 @@ def write_json(path, report):
     print("[build] 结构化报告已写入 %s" % path)
 
 
-def collect_issue(report, target, kind, msg):
-    report["issues"].append({"target": target, "severity": kind, "message": msg})
+#: 构建问题消息 → 机器码。N0 起每条构建问题都带 code：路由层据此区分
+#: 「缺资源（asset）/ 缺环境（environment）/ 内容语法错（agent）」三种。
+#: 这三者在本次 run 里曾全部被当成内容问题派给写作者，白烧返修预算。
+_BUILD_CODES = (
+    (re.compile(r"Unable to load picture|File `[^`']+\.(?:png|jpg|jpeg|pdf|eps|svg)'"
+                r" not found|图片资产缺失|graphics file .* not found", re.I),
+     "LATEX_ASSET_MISSING"),
+    (re.compile(r"Font .* not (?:found|loadable)|Missing character|fontspec", re.I),
+     "LATEX_FONT_MISSING"),
+    (re.compile(r"缺少 xelatex|缺少 latexmk|xelatex 依赖|未安装", re.I),
+     "LATEX_ENV_MISSING"),
+    (re.compile(r"双版 .* 计数不一致"), "LATEX_COUNTER_MISMATCH"),
+    (re.compile(r"不是本次编译产物|不是本次构建产物"), "LATEX_STALE_OUTPUT"),
+    (re.compile(r"配置生成失败"), "LATEX_CONFIG_FAILED"),
+    (re.compile(r"^缺少 \S+\.(?:tex|html)$"), "LATEX_SOURCE_MISSING"),
+    (re.compile(r"Overfull \\[hv]box|版式溢出"), "LATEX_OVERFULL"),
+    (re.compile(r"SUMMARY 行"), "LATEX_SUMMARY_MISSING"),
+    (re.compile(r"构建期间受审输入变化"), "LATEX_INPUT_CHANGED"),
+    # 卡片解析/校验问题：渲染器自身缺陷（如节标题正则不容嵌套花括号），不派作者
+    (re.compile(r"题目卡出现在任何节标题链之前|卡片|deck|卡序|节标题"), "LATEX_DECK_PARSE"),
+    # 选项打乱问题：来源是 \fillin 选项，属内容
+    (re.compile(r"选项"), "LATEX_SHUFFLE"),
+    (re.compile(r"PDF 编译失败|^\s*!|Undefined control sequence|Runaway argument"),
+     "LATEX_SYNTAX_ERROR"),
+)
+
+
+def build_code(message):
+    """构建问题消息 → 机器码（LATEX_*）；认不出返回 None（交由路由层兜底）。"""
+    for rx, code in _BUILD_CODES:
+        if rx.search(message or ""):
+            return code
+    return None
+
+
+def collect_issue(report, target, kind, msg, code=None):
+    item = {"target": target, "severity": kind, "message": msg}
+    resolved = code or build_code(msg)
+    if resolved:
+        item["code"] = resolved
+        # artifact 供路由层定位切片（sec*.tex 优先，其次构建产物名）
+        m = re.search(r"\b(sec[0-9A-Za-z]+)\.tex\b", msg or "")
+        if m:
+            item["artifact"] = m.group(1) + ".tex"
+        elif str(target).endswith(".tex"):
+            item["artifact"] = target
+    report["issues"].append(item)
 
 
 def check_env(format_choice="both"):

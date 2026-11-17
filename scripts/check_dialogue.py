@@ -927,6 +927,33 @@ def check(workdir):
     return problems, warnings, evidence
 
 
+#: 问题消息 → 机器码。N0 起每个问题都带 code：路由层据此判断「修复动作是否落在
+#: sec*.tex 之内」。对话层结构问题绝大多数是内容问题，但引擎配置与覆盖表要分开。
+_PROBLEM_CODES = (
+    (re.compile(r"config\.yaml 解析失败|工作目录不存在"), "DIALOGUE_CONFIG_ERROR"),
+    (re.compile(r"缺少 coverage-map\.md"), "DIALOGUE_COVERAGE_MISSING"),
+    (re.compile(r"已声明 .*off-(?:section|example)"), "DIALOGUE_OPTOUT_MISSING"),
+)
+
+
+def problem_code(message):
+    """问题消息 → 机器码（DIALOGUE_*）。"""
+    for rx, code in _PROBLEM_CODES:
+        if rx.search(message or ""):
+            return code
+    return "DIALOGUE_STRUCTURE"
+
+
+def _item(severity, message):
+    """统一 issue 形态：severity + code + message + artifact（定位切片用）。"""
+    art = ""
+    m = re.match(r"^(sec[0-9A-Za-z]+)\.tex", message or "")
+    if m:
+        art = m.group(1) + ".tex"
+    return {"severity": severity, "code": problem_code(message),
+            "message": message, "artifact": art}
+
+
 def main():
     ap = argparse.ArgumentParser(description="对话层结构与泄露检查")
     ap.add_argument("workdir", nargs="?", default=".")
@@ -942,8 +969,7 @@ def main():
                 "scope": {"workdir": workdir},
                 "input_digest": None, "html_sha256": None,
                 "status": "error",
-                "issues": [{"severity": "error",
-                            "message": "工作目录不存在: %s" % workdir}],
+                "issues": [_item("error", "工作目录不存在: %s" % workdir)],
                 "evidence": {}})
             print("[check_dialogue] 结构化报告已写入 %s" % args.json)
         return 2
@@ -963,10 +989,8 @@ def main():
                   "scope": {"workdir": workdir},
                   "input_digest": digest, "html_sha256": None,
                   "status": "fail" if problems else "pass",
-                  "issues": ([{"severity": "error", "message": p}
-                              for p in problems]
-                             + [{"severity": "warning", "message": w}
-                                for w in warnings]),
+                  "issues": ([_item("error", p) for p in problems]
+                             + [_item("warning", w) for w in warnings]),
                   "evidence": ev}
         evidence.write_report(args.json, report)
         print("[check_dialogue] 结构化报告已写入 %s" % args.json)

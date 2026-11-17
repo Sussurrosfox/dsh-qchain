@@ -55,6 +55,16 @@ for stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import evidence  # noqa: E402
 
+# RC-3：恢复原语在 workflow 包里（需要 langgraph）；只在使用时导入，
+# 避免 pdstate 的常规子命令被 langgraph 依赖拖慢/拖崩。
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, PLUGIN_ROOT)
+try:
+    from workflow import recovery  # noqa: E402
+except Exception:  # pragma: no cover - 极端环境缺 langgraph 时降级
+    recovery = None
+
 SCHEMA_VERSION = 2
 STATUS_FLOW = ("planned", "ready", "running", "produced", "checked",
                "accepted")
@@ -590,11 +600,55 @@ def main():
     p.add_argument("--tokens-out", type=int)
     p.add_argument("--retries", type=int)
     p.add_argument("--model")
+    # RC-3：HALT 的官方恢复入口（真人批准 + 备份 + 台账），替代手写 sqlite 手术
+    p = sub.add_parser("recover")
+    p.add_argument("--action", required=True,
+                   choices=list(recovery.HALT_ACTIONS) if recovery
+                   else ["abandon_dispatch", "reroute_to", "relax_budget",
+                         "retry_gate"])
+    p.add_argument("--approved-by", required=True,
+                   help="真人署名（Agent 不得自我豁免）")
+    p.add_argument("--target", help="reroute_to 的目标节点")
+    p.add_argument("--dispatch-id", help="abandon_dispatch 要撤销的派发单")
+    p.add_argument("--per-scope", type=int, default=0)
+    p.add_argument("--total", type=int, default=0)
+    p.add_argument("--reason", default="")
+    p.add_argument("--thread-id", default="qchain_session")
+    p.add_argument("--db", default=None)
+    p.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     pdir = os.path.abspath(args.project)
     if not os.path.isdir(pdir):
         print("[pdstate] 项目目录不存在: %s" % pdir)
         return 2
+
+    if args.cmd == "recover":
+        # 恢复不读 run.json（它改的是检查点状态），故在此之前分流
+        if recovery is None:
+            print("[pdstate] 当前环境缺少 workflow.recovery（langgraph 未安装？）")
+            return 2
+        try:
+            led = recovery.recover(
+                pdir, action=args.action, approved_by=args.approved_by,
+                thread_id=args.thread_id, db_path=args.db,
+                target=args.target, dispatch_id=args.dispatch_id,
+                budgets={"per_scope": args.per_scope, "total": args.total},
+                reason=args.reason, dry_run=args.dry_run)
+        except recovery.RecoveryError as exc:
+            print("[pdstate] [恢复被拒] %s" % exc)
+            return 1
+        if led.get("dry_run"):
+            print("[pdstate] （dry-run）动作 %s → as_node=%s，未改任何状态"
+                  % (led["action"], led["as_node"]))
+            print("[pdstate] 补丁: %s"
+                  % json.dumps(led["patch"], ensure_ascii=False, sort_keys=True))
+            return 0
+        print("[pdstate] 已恢复：%s（批准人 %s）→ checkpoint %s，next=%s"
+              % (led["action"], led["approved_by"],
+                 str(led.get("after_checkpoint_id"))[:8], led.get("next")))
+        print("[pdstate] 备份: %s" % led.get("backup"))
+        print("[pdstate] 台账: %s" % led.get("ledger"))
+        return 0
 
     if args.cmd == "init":
         with _RunLock(pdir):

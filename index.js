@@ -196,8 +196,74 @@ function resolveSelfWorkspaceDir(ctx, hintSelfDir) {
   return '';
 }
 
-/** 跑 scripts/ledger.py（人工批准 / advisory 延期的唯一写入通路）。 */
-async function runLedger(ctx, selfDir, argv) {
+/**
+ * A15（写入类动作专用）：为**台账写入**解析 self 工作区，歧义即报错。
+ *
+ * 旧实现 resolveSelfWorkspaceDir 允许隐式候选（cwd/self 优先）静默命中任意
+ * 历史工作区——实测把 4 条 EXTEND 人工批准写进了 `D:\Scripts\self`（一个早就
+ * 存在、与新任务无关的旧工作区），而真正的 self 里 approvals.json 一直是空的，
+ * 导致返修子 Agent 怎么也找不到批准。
+ *
+ * 写入无法回滚，宁可报错也不能猜：
+ *   - 显式传 self_dir → 只认它（不存在/非目录 → 报错）
+ *   - 未传 → 收集全部**形态合法**的隐式候选；唯一才用，多个并列即报错
+ * @returns {{dir: string, error: string, candidates: string[]}}
+ */
+function resolveSelfWorkspaceDirForWrite(ctx, hintSelfDir) {
+  const none = { dir: '', error: '', candidates: [] };
+  if (hintSelfDir) {
+    const abs = path.isAbsolute(hintSelfDir)
+      ? path.resolve(hintSelfDir)
+      : path.resolve(process.cwd(), hintSelfDir);
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
+      return { dir: '', error: `self_dir 不是已存在的目录: ${abs}`, candidates: [abs] };
+    }
+    if (!looksLikeSelfWorkspace(abs)) {
+      return {
+        dir: '',
+        error: `self_dir 不像 qchain 工作区（缺 .pd/ config.yaml / sec*.tex）: ${abs}`,
+        candidates: [abs],
+      };
+    }
+    return { dir: abs, error: '', candidates: [abs] };
+  }
+  const raw = [];
+  raw.push(path.join(process.cwd(), 'self'));
+  try {
+    const registry = ctx?.get?.('workspaceRegistry') || ctx?.workspaceRegistry;
+    if (registry && typeof registry.list === 'function') {
+      for (const entry of (registry.list() || [])) {
+        if (entry && entry.path) raw.push(path.join(entry.path, 'self'));
+      }
+    }
+  } catch (_) {}
+  raw.push(path.join(resolveCurrentProjectDir(ctx), 'self'));
+  const valid = [];
+  for (const c of raw) {
+    try {
+      if (!fs.existsSync(c) || !fs.statSync(c).isDirectory()) continue;
+      if (!looksLikeSelfWorkspace(c)) continue;
+      const abs = path.resolve(c);
+      if (!valid.includes(abs)) valid.push(abs);
+    } catch (_) {}
+  }
+  if (valid.length === 1) return { dir: valid[0], error: '', candidates: valid };
+  if (valid.length === 0) {
+    return {
+      dir: '',
+      error: '未找到 self 工作区：台账写入不做猜测，请显式传 self_dir',
+      candidates: [],
+    };
+  }
+  return {
+    dir: '',
+    error: '存在多个候选 self 工作区，台账写入不做猜测，请显式传 self_dir：\n  - '
+      + valid.join('\n  - '),
+    candidates: valid,
+  };
+}
+
+/** 跑 scripts/ledger.py（人工批准 / advisory 延期的唯一写入通路）。 */async function runLedger(ctx, selfDir, argv) {
   if (!selfDir) {
     return { success: false, output: '❌ 未找到 self 工作区目录（请指定 self_dir）', payload: null };
   }
@@ -329,8 +395,45 @@ function qdCommitArtifacts(selfDir, pending) {
   }
 }
 
+/**
+ * 证据摘要（RC-4）：同一份派发单在「请求书没变」但**证据变了**时必须重跑。
+ *
+ * 实测事故：人工把 EXTEND 批准登记进 approvals.json 后重派 T4 复验，输入文件
+ * 摘要（input_digest）没变 → 命中缓存 → 拿回旧结论（仍写「未批准」），白跑一轮。
+ * 派发单里被内嵌的证据（批准台账 / 延期台账 / 该切片的语义审读结论 / 门禁报告）
+ * 一旦变化，请求的语义就变了，指纹必须跟着变。
+ *
+ * 口径刻意收窄：只算「会改变子 Agent 看到的内容」的少量固定文件，不算全部
+ * .pd/reports（那会让指纹每次都变，等于关掉缓存）。
+ */
+function qdEvidenceDigest(selfDir, request) {
+  const scope = String(request.scope || '');
+  const rels = [
+    path.join('.pd', 'approvals.json'),
+    path.join('.pd', 'deferrals.json'),
+  ];
+  if (scope) rels.push(path.join('.pd', 'semantic', `${scope}.json`));
+  const context = (request.context && typeof request.context === 'object') ? request.context : {};
+  for (const rel of (Array.isArray(context.report_refs) ? context.report_refs : [])) {
+    const s = String(rel || '').replace(/\\/g, '/');
+    if (s) rels.push(path.join(...s.split('/')));
+  }
+  const parts = [];
+  for (const rel of rels.sort()) {
+    const abs = qdSafeJoin(selfDir, rel);
+    let digest = '';
+    try {
+      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+        digest = crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex');
+      }
+    } catch (_) { digest = 'ERR'; }
+    parts.push(`${rel.replace(/\\/g, '/')}:${digest}`);
+  }
+  return crypto.createHash('sha256').update(parts.join('\n')).digest('hex');
+}
+
 /** 请求指纹：同一 dispatch_id 只有在「请求内容完全一致」时才允许复用旧产出。 */
-function qdRequestFingerprint(request) {
+function qdRequestFingerprint(request, selfDir) {
   const canon = {
     stage: String(request.stage || ''),
     role: String(request.role || ''),
@@ -341,6 +444,8 @@ function qdRequestFingerprint(request) {
     artifacts: (Array.isArray(request.artifacts) ? request.artifacts : [])
       .map((a) => String(a).replace(/\\/g, '/')).sort(),
     context: request.context === undefined ? null : request.context,
+    // RC-4：证据摘要参与指纹（无 selfDir 的历史调用点保持旧口径）
+    evidence_digest: selfDir ? qdEvidenceDigest(selfDir, request) : '',
   };
   return crypto.createHash('sha256').update(JSON.stringify(canon)).digest('hex');
 }
@@ -608,7 +713,7 @@ function qdClaimIsReusable(selfDir, request, existing) {
   if (!(dispatchId && !qdFirstInvalidArtifact(selfDir, request))) return false;
   if (String(existing.run_id || '') !== String(request.run_id || '')) return false;
   const fingerprint = String(existing.request_fingerprint || '');
-  if (!fingerprint || fingerprint !== qdRequestFingerprint(request)) return false;
+  if (!fingerprint || fingerprint !== qdRequestFingerprint(request, selfDir)) return false;
   const expected = (existing.output_digests && typeof existing.output_digests === 'object')
     ? existing.output_digests : {};
   const keys = Object.keys(expected);
@@ -647,7 +752,7 @@ function qdAcquireClaim(selfDir, request) {
       batch_id: String(request.batch_id || ''),
       run_id: String(request.run_id || ''),
       status,
-      request_fingerprint: qdRequestFingerprint(request),
+      request_fingerprint: qdRequestFingerprint(request, selfDir),
       host: os.hostname(),
       pid: process.pid,
       claimed_at: new Date().toISOString(),
@@ -671,7 +776,7 @@ function qdAcquireClaim(selfDir, request) {
         status: 'active', host: os.hostname(), pid: process.pid,
         claimed_at: new Date().toISOString(), heartbeat_at: new Date().toISOString(),
         attempt: Number(request.attempt || 0), receipt_rel: '', output_digests: {},
-        request_fingerprint: qdRequestFingerprint(request),
+        request_fingerprint: qdRequestFingerprint(request, selfDir),
       }, null, 2)}\n`);
     } finally {
       fs.closeSync(fd);
@@ -1442,8 +1547,20 @@ export function apply(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: value.output }],
     },
     async execute(args) {
-      const selfDir = resolveSelfWorkspaceDir(ctx, args.self_dir);
       const action = String(args.action || 'approve');
+      // A15：写入（approve/revoke）必须无歧义——隐式候选多个并列即报错，
+      // 绝不把批准写进与本任务无关的历史工作区；list 只读，沿用宽松解析。
+      const resolved = action === 'list'
+        ? { dir: resolveSelfWorkspaceDir(ctx, args.self_dir), error: '' }
+        : resolveSelfWorkspaceDirForWrite(ctx, args.self_dir);
+      if (!resolved.dir) {
+        return {
+          success: false,
+          self_dir: '',
+          output: `❌ ${resolved.error || '未找到 self 工作区（请指定 self_dir）'}`,
+        };
+      }
+      const selfDir = resolved.dir;
       let argv;
       if (action === 'revoke') {
         if (!args.target_id) {
@@ -1505,8 +1622,18 @@ export function apply(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: value.output }],
     },
     async execute(args) {
-      const selfDir = resolveSelfWorkspaceDir(ctx, args.self_dir);
       const action = String(args.action || 'defer');
+      const resolved = action === 'list'
+        ? { dir: resolveSelfWorkspaceDir(ctx, args.self_dir), error: '' }
+        : resolveSelfWorkspaceDirForWrite(ctx, args.self_dir);
+      if (!resolved.dir) {
+        return {
+          success: false,
+          self_dir: '',
+          output: `❌ ${resolved.error || '未找到 self 工作区（请指定 self_dir）'}`,
+        };
+      }
+      const selfDir = resolved.dir;
       let argv;
       if (action === 'revoke') {
         if (!args.target_id) {
@@ -2609,7 +2736,7 @@ export function apply(ctx, config = {}) {
         qdFinishClaim(selfDir, dispatchId, okDone ? 'done' : 'failed', {
           receipt_rel: (result && result.evidence) || '',
           output_digests: qdCurrentDigests(selfDir, request),
-          request_fingerprint: qdRequestFingerprint(request),
+          request_fingerprint: qdRequestFingerprint(request, selfDir),
           error: (result && result.error) || '',
         });
         return result;

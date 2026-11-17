@@ -8,9 +8,13 @@ and halts if no artifact changes are made.
 PASS 才解除“本次未解决”标记；全局累计永不重置。
 """
 
+import json
+import os
 from typing import Dict, Any, List
 from ..state import ShrinkCoursewareState
 from .. import repair_budget
+from .. import recovery
+from ..adapters.script_runner import ScriptRunner
 from .agent_nodes import build_request, write_request_file, run_dispatch, snapshot
 
 
@@ -18,13 +22,52 @@ def _halt_repair(state: ShrinkCoursewareState, history: List[str], plan: Dict[st
                  reason: str) -> Dict[str, Any]:
     """无进展 / 预算耗尽 → HALT，并附未解决 issue、最后产物、attempt 来源。"""
     history.append(f"Repair: {plan['detail']}，熔断停止 [{plan['halt_reason']}]")
+    cause = ("budget_exhausted" if str(plan.get("halt_reason") or "") ==
+             "repair_budget_exhausted" else "no_progress")
     return {
         "stage": "HALTED",
         "routing_action": "HALT",
         "error_message": f"{plan['detail']}: {reason}",
         "repair_halt": plan["halt"],
+        # RC-3：不再只给一句 error_message——给出闭集恢复动作与真人批准入口，
+        # 免得下一个人现写 sqlite 手术脚本。
+        "halt_payload": recovery.build_halt_payload(
+            cause=cause, reason=f"{plan['detail']}: {reason}",
+            gate="repair", target=state.get("repair_target"),
+            dispatch_id=state.get("pending_dispatch"),
+            budget={"per_scope": (state.get("repair_attempts_by_scope") or {}),
+                    "total": state.get("repair_attempts_total"),
+                    "halt": plan.get("halt")}),
         "history": history,
     }
+
+
+def _failure_cause(state: ShrinkCoursewareState) -> str:
+    """RC-4：判定这次返修属于哪类失败，决定是否消耗内容返修额度。
+
+    优先级：显式 ``repair_failure_cause``（节点自己已经知道原因）> issue 的
+    ``repair_kind``（路由表给的分类）> 返修理由里的契约特征词 > content。
+
+    额度只给 content——契约漂移/缺资产/环境缺口不是写作者的过错，让它们吃掉
+    额度，真实内容问题就无额度可用了（本次 run 的 sec2 2/2 就是这样没的）。
+    """
+    explicit = state.get("repair_failure_cause")
+    if explicit:
+        return repair_budget.normalize_cause(explicit)
+    for issue in (state.get("repair_issues") or []):
+        if not isinstance(issue, dict):
+            continue
+        kind = str(issue.get("repair_kind") or "")
+        if kind in ("asset", "environment", "deterministic"):
+            return kind
+        if kind == "human":
+            return "infrastructure"
+    reason = str(state.get("repair_reason") or "")
+    for marker in ("当前状态为", "输入摘要已变化", "没有当前 attempt",
+                   "缺少冻结的", "不能 submit", "作废（stale）"):
+        if marker in reason:
+            return "contract"
+    return "content"
 
 
 def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
@@ -49,13 +92,15 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
 
     # C3：先判无进展/额度，再安排返修。输入摘要 = 返修前该产物的 sha256。
     input_digest = snapshot(self_dir, [tex_filename]).get(tex_filename)
+    # RC-4：失败原因决定是否消耗内容返修额度（额度是给写作者的）。
+    cause = _failure_cause(state)
     # A5：返修上限的运维覆盖走 config.yaml（扁平键或 agent_dispatch 子块），
     # 不再需要拿 msgpack 二进制改 checkpoint 的 repair_per_scope_limit。
     repair_cfg = repair_budget.load_repair_overrides(self_dir)
     plan = repair_budget.plan_repair(
         state, target_sec, reason, input_digest,
         issues=state.get("repair_issues"), artifact=tex_filename,
-        config=repair_cfg)
+        config=repair_cfg, cause=cause)
     if plan["action"] == "HALT":
         return _halt_repair(state, history, plan, reason)
 
@@ -74,16 +119,19 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
         scope=target_sec
     )
     req_ref = write_request_file(self_dir, req)
+    charged = cause in repair_budget.CHARGED_CAUSES
     history.append(
         f"Repair: 已派发 {target_sec} 返修任务 (第 {plan['attempt_no']} 次/本 scope，"
-        f"全局第 {plan['patch']['repair_attempts_total']} 次，派发单: {req_ref})")
+        f"全局第 {plan['patch']['repair_attempts_total']} 次，原因 {cause}"
+        f"{'' if charged else '（不占内容额度）'}，派发单: {req_ref})")
 
     # 计数 + 指纹 + 输入摘要与派发单在**同一次**状态更新里落盘（先持久化后派发）。
     budget_patch = plan["patch"]
     budget_patch["repair_attempt_log"] = list(budget_patch["repair_attempt_log"]) + [
         repair_budget.attempt_log_entry(
             target_sec, plan["attempt_no"], budget_patch["repair_attempts_total"],
-            req["dispatch_id"], plan["fingerprint"], input_digest, reason)
+            req["dispatch_id"], plan["fingerprint"], input_digest, reason,
+            cause=cause)
     ]
     return {
         **budget_patch,
@@ -94,6 +142,110 @@ def node_repair_section(state: ShrinkCoursewareState) -> Dict[str, Any]:
         "repair_target": target_sec,
         "stage": "REPAIR_LOOP",
         "history": history
+    }
+
+
+def _plan_rel(target: str) -> str:
+    """确定性修复计划的规范位置（按产物名分组，便于人写、便于审计）。"""
+    stem = (target or "artifact").replace("\\", "/").strip("/").replace("/", "__")
+    if stem.lower().endswith(".tex"):
+        stem = stem[:-4]
+    return f".pd/repairs/{stem}.plan.json"
+
+
+_PLAN_TEMPLATE = {
+    "schema_version": 1,
+    "reason": "",
+    "_说明": [
+        "这是确定性修复计划的空模板。每个 op 都必须带 expect_before_sha256（CAS），",
+        "命中数不符或摘要不符时整批放弃、不落盘（见 scripts/patch_artifact.py）。",
+        "可用 op：replace_literal / append_section / ensure_table_row / copy_asset。",
+        "填好删掉本 _说明 键，再 resume 流水线即可由引擎执行（不派 Agent）。",
+    ],
+    "ops": [
+        {
+            "op": "replace_literal",
+            "path": "coverage-map.md",
+            "expect_before_sha256": "<sha256 of coverage-map.md>",
+            "old": "<待替换的原文片段>",
+            "new": "<替换后的文本>",
+            "expect_count": 1,
+        }
+    ],
+}
+
+
+def node_repair_deterministic(state: ShrinkCoursewareState) -> Dict[str, Any]:
+    """RC-2：执行确定性修复（不派 Agent）。
+
+    查找 ``.pd/repairs/<target>.plan.json``：
+
+      * 存在 → 调 ``scripts/patch_artifact.py`` 执行（白名单 op + CAS + 自检）。
+        成功则回到门禁重跑；失败（CAS 不符/命中数不符）→ HALT，绝不半改。
+      * 不存在 → 写出**空模板**并 HALT，error_message 指名模板路径。
+        这是"先暴露后补表"的收敛兜底：不猜、不盲改、不派 Agent。
+
+    审计口径：本节点把执行者记为 ``engine``（与 agent 并列的合法执行者），
+    产物仍必须落盘并能被门禁复核——证据链不变。
+    """
+    self_dir = state.get("self_dir") or state.get("project_root", ".")
+    history = list(state.get("history", []))
+    target = (state.get("repair_target") or state.get("det_repair_target")
+              or "artifact")
+    plan_rel = state.get("det_repair_plan") or _plan_rel(target)
+    plan_abs = os.path.join(self_dir, *plan_rel.split("/"))
+
+    if not os.path.isfile(plan_abs):
+        os.makedirs(os.path.dirname(plan_abs), exist_ok=True)
+        try:
+            with open(plan_abs, "w", encoding="utf-8") as f:
+                json.dump(_PLAN_TEMPLATE, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            history.append(f"Repair(det): 模板写入失败: {exc}")
+        history.append(
+            f"Repair(det): 缺确定性修复计划 {plan_rel}，已写出空模板，停机待补")
+        return {
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "repair_kind": "deterministic",
+            "engine_repair": {"worker": "engine", "plan": plan_rel,
+                              "status": "plan_missing"},
+            "error_message": (
+                f"确定性修复（{target}）缺计划：请填写 {plan_rel} 后 resume 重跑；"
+                f"本轮不派 Agent、不盲改产物"),
+            "history": history,
+        }
+
+    history.append(f"Repair(det): 执行确定性修复计划 {plan_rel}")
+    runner = ScriptRunner(self_dir)
+    ledger_rel = f".pd/repairs/{os.path.basename(plan_rel)}.result.json"
+    ledger_abs = os.path.join(self_dir, *ledger_rel.split("/"))
+    code, out, err = runner.run_script(
+        "patch_artifact.py", [self_dir, plan_abs, "--json", ledger_abs])
+    detail = ((err or out or "").strip().splitlines() or [""])[-1][:300]
+    if code != 0:
+        history.append(f"Repair(det): 计划未通过（exit {code}）: {detail}")
+        return {
+            "stage": "HALTED",
+            "routing_action": "HALT",
+            "repair_kind": "deterministic",
+            "engine_repair": {"worker": "engine", "plan": plan_rel,
+                              "status": "failed", "detail": detail},
+            "error_message": (
+                f"确定性修复未通过（{target}）: {detail}；"
+                f"计划 {plan_rel} 未被应用（整批放弃，产物未被改动）"),
+            "history": history,
+        }
+    history.append(f"Repair(det): 计划已应用（engine）: {detail}")
+    return {
+        "stage": "T3_CHECKS_PENDING",
+        "routing_action": "PROCEED",
+        "repair_kind": "deterministic",
+        "engine_repair": {"worker": "engine", "plan": plan_rel,
+                          "status": "applied", "ledger": ledger_rel},
+        "repair_target": None,
+        "repair_reason": "",
+        "history": history,
     }
 
 
@@ -115,6 +267,8 @@ def node_repair_await(state: ShrinkCoursewareState) -> Dict[str, Any]:
             "routing_action": "HALT",
             "error_message": state.get("error_message") or "返修回路已熔断",
             "repair_halt": state.get("repair_halt"),
+            # 原样带出上游 halt_payload（恢复入口不因经过一个节点而丢失）
+            "halt_payload": state.get("halt_payload"),
             "history": history,
         }
     req = state.get("pending_dispatch")

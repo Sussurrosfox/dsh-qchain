@@ -28,7 +28,8 @@ from .delivery_nodes import (
 )
 from .repair_nodes import (
     node_repair_section,
-    node_repair_await
+    node_repair_await,
+    node_repair_deterministic
 )
 from .section_batch_nodes import (
     node_t2_plan_dispatch,
@@ -69,6 +70,7 @@ __all__ = [
     "node_t4_promote_and_deliver",
     "node_repair_section",
     "node_repair_await",
+    "node_repair_deterministic",
     "node_t2_plan_dispatch",
     "node_t2_dispatch_sections",
     "node_t2_join_sections",

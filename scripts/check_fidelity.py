@@ -247,12 +247,24 @@ def parse_coverage_map(self_dir):
             new_col = i
             break
     rows = []
-    for line in lines[header_idx + 2:]:
+    bad_rows = []
+    ncol = len(header)
+    for offset, line in enumerate(lines[header_idx + 2:]):
         s = line.strip()
         if not s.startswith("|"):
-            continue
+            break  # 主表到此结束：文件后部还有载体题表/对话承接表等独立表格
+        lineno = header_idx + 3 + offset  # 1-based 行号
         cells = [c.strip() for c in s.strip("|").split("|")]
         if len(cells) <= max(src_col, act_col):
+            bad_rows.append("第 %d 行只有 %d 个单元格（表头 %d 列）"
+                            % (lineno, len(cells), ncol))
+            continue
+        if len(cells) > ncol:
+            # N0：多出来的单元格以前被静默容忍 → 列错位 → 把 reason/action 读错，
+            # 再触发一次假的 FIDELITY_NOVELTY_UNAPPROVED，最后被兜底成 T1 全链重跑。
+            # 现在如实报格式问题并跳过该行，绝不在错位的单元格上做判定。
+            bad_rows.append("第 %d 行有 %d 个单元格，多于表头 %d 列（多半是单元格内"
+                            "未转义的竖线 |）" % (lineno, len(cells), ncol))
             continue
         rows.append({
             "source_ids": cells[src_col] if src_col < len(cells) else "",
@@ -261,7 +273,14 @@ def parse_coverage_map(self_dir):
                                               and new_col < len(cells)) else "",
             "scope": cells[col["scope"]] if "scope" in col else "",
         })
-    return rows, []
+    warns = []
+    if bad_rows:
+        warns.append({
+            "code": "FIDELITY_COVERAGE_FORMAT",
+            "detail": "coverage-map.md 有 %d 行单元格数与表头不一致，已跳过这些行"
+                      "（列错位会导致误判）：%s"
+                      % (len(bad_rows), "；".join(bad_rows[:5]))})
+    return rows, warns
 
 
 def _novelty_residue(text):

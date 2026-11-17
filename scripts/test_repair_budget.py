@@ -477,5 +477,78 @@ class REPAIR04_TransportReplanIndependent(LoopBase):
                           self.state["retry_count"]), snap)
 
 
+class REPAIR05_BudgetByCause(LoopBase):
+    """RC-4：额度只为 content 记账，非内容原因照常派发但不烧额度。"""
+
+    def test_non_content_cause_does_not_consume_quota(self):
+        self.dispatch_patch()
+        self.state["execution_profile"] = rb.FAST_PROFILE  # 2/2 最紧
+        self.state["repair_failure_cause"] = "contract"
+        for i in range(3):
+            verdict, _ = self.round("sec1", f"契约漂移 variant {i}")
+            self.assertEqual(verdict, "OK", "非内容原因不该熔断")
+        self.assertEqual(self.state["repair_attempts_by_scope"], {},
+                         "契约问题不计入 scope 额度")
+        self.assertEqual(self.state["repair_attempts_total"], 0)
+        self.assertEqual(self.state["repair_attempts_by_cause"],
+                         {"contract": 3}, "非内容派发仍要留审计痕迹")
+
+    def test_content_quota_survives_prior_non_content_rounds(self):
+        self.dispatch_patch()
+        self.state["execution_profile"] = rb.FAST_PROFILE
+        self.state["repair_failure_cause"] = "asset"
+        self.round("sec1", "缺图 fig_1.jpg")
+        self.state.pop("repair_failure_cause")
+        outcomes = [self.round("sec1", f"真实内容问题 {i}")[0] for i in range(3)]
+        self.assertEqual(outcomes, ["OK", "OK", "HALT"],
+                         "缺资产不吃额度，内容问题仍有完整的 2 次")
+        self.assertEqual(self.state["repair_attempts_by_scope"], {"sec1": 2})
+        self.assertEqual(self.state["repair_attempts_by_cause"],
+                         {"asset": 1, "content": 2})
+
+    def test_explicit_cause_wins_over_reason_markers(self):
+        self.assertEqual(
+            repair_nodes._failure_cause(
+                {"repair_failure_cause": "environment",
+                 "repair_reason": "当前状态为 stale，不能 submit"}),
+            "environment", "显式原因优先于理由里的契约特征词")
+
+    def test_contract_markers_are_detected_from_reason(self):
+        self.assertEqual(
+            repair_nodes._failure_cause(
+                {"repair_reason": "切片提交失败: [冲突] sec1 当前状态为 stale"}),
+            "contract")
+        self.assertEqual(
+            repair_nodes._failure_cause({"repair_reason": "语义审读 REVISE"}),
+            "content")
+
+    def test_issue_kind_drives_cause(self):
+        self.assertEqual(
+            repair_nodes._failure_cause(
+                {"repair_issues": [{"code": "LATEX_ASSET_MISSING",
+                                   "repair_kind": "asset"}],
+                 "repair_reason": "编译失败"}),
+            "asset")
+        self.assertEqual(
+            repair_nodes._failure_cause(
+                {"repair_issues": [{"code": "X", "repair_kind": "human"}]}),
+            "infrastructure")
+
+    def test_unknown_cause_is_charged_as_content(self):
+        self.assertEqual(rb.normalize_cause("banana"), "content",
+                         "未知原因按 content 计——宁可多烧额度，不可漏记")
+        self.assertEqual(rb.normalize_cause(None), "content")
+
+    def test_no_progress_still_halts_for_non_content_cause(self):
+        # 产物没被改动、理由也一模一样 → 无进展熔断照旧生效
+        self.dispatch_patch(edit=False)
+        self.state["repair_failure_cause"] = "contract"
+        self.assertEqual(self.round("sec1", "同一个契约问题")[0], "OK")
+        self.assertEqual(self.round("sec1", "同一个契约问题")[0], "HALT",
+                         "不占额度不等于可以无限重试同一个原因")
+        self.assertEqual(self.state["repair_halt"]["halt_reason"],
+                         rb.NO_PROGRESS)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -579,6 +579,45 @@ def _scan_included_forbidden(workdir, name, seen, problems):
         _scan_included_forbidden(workdir, tgt, seen, problems)
 
 
+#: 问题消息 → 机器码。N0 起每个问题都带 code：路由层据此判断「修复动作是否落在
+#: sec*.tex 之内」，而不是靠门禁名一律派作者重写。未匹配到的落 NUMBERING_OTHER。
+_PROBLEM_CODES = (
+    (re.compile(r"\\fillin.*(选项|参考答案|空项)"), "NUMBERING_FILLIN_OPTIONS"),
+    (re.compile(r"\\item 出现在列表环境之外|没有配对的 \\begin|交叉闭合|未闭合"
+                r"|环境内没有任何 \\item"), "NUMBERING_ENV_UNBALANCED"),
+    (re.compile(r"恰好含一个 .* 环境"), "NUMBERING_TEACHER_ENV_COUNT"),
+    (re.compile(r"unprompted 题目块内出现学生版可见提示标记"), "NUMBERING_HINT_VISIBLE"),
+    (re.compile(r"qid .* 重复"), "NUMBERING_DUPLICATE_QID"),
+    (re.compile(r"\\practicemode"), "NUMBERING_PRACTICEMODE"),
+    (re.compile(r"probchain 嵌套"), "NUMBERING_PROBCHAIN_NESTED"),
+    (re.compile(r"不得改写全局状态"), "NUMBERING_FORBIDDEN_GLOBAL"),
+    (re.compile(r"缺失章节末知识总结框"), "NUMBERING_KNOWLEDGEBOX_MISSING"),
+    (re.compile(r"缺失前置知识卡"), "NUMBERING_MICROKNOWLEDGE_MISSING"),
+    (re.compile(r"probchain 内没有可见题目"), "NUMBERING_PROBCHAIN_EMPTY"),
+    (re.compile(r"series=probchain|resume=probchain"), "NUMBERING_LEGACY_SERIES"),
+    (re.compile(r"未在 main\.tex 中装配|重复装配|切片编号 .* 同时占用"
+                r"|切片引入顺序"), "NUMBERING_ASSEMBLY"),
+)
+
+
+def problem_code(message):
+    """问题消息 → 机器码（NUMBERING_*）。"""
+    for rx, code in _PROBLEM_CODES:
+        if rx.search(message or ""):
+            return code
+    return "NUMBERING_OTHER"
+
+
+def _item(severity, message):
+    """统一 issue 形态：severity + code + message + artifact（定位切片用）。"""
+    art = ""
+    m = re.match(r"^(sec[0-9A-Za-z]+)\.tex", message or "")
+    if m:
+        art = m.group(1) + ".tex"
+    return {"severity": severity, "code": problem_code(message),
+            "message": message, "artifact": art}
+
+
 def main():
     ap = argparse.ArgumentParser(description="切片装配与题链结构检查")
     ap.add_argument("workdir", nargs="?", default=".")
@@ -603,10 +642,8 @@ def main():
         report["evidence"]["unresolved_inputs"] = manifest["unresolved"]
 
     def emit_report():
-        report["issues"] = ([{"severity": "error", "message": p}
-                             for p in problems]
-                            + [{"severity": "warning", "message": w}
-                               for w in warnings])
+        report["issues"] = ([_item("error", p) for p in problems]
+                            + [_item("warning", w) for w in warnings])
         if args.json:
             evidence.write_report(args.json, report)
             print("[check_numbering] 结构化报告已写入 %s" % args.json)

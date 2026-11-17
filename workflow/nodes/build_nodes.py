@@ -14,6 +14,7 @@ from ..adapters.script_runner import ScriptRunner
 from ..adapters.gate_runner import GateRunner
 from .. import issues as issues_mod
 from .. import repair_budget
+from .. import recovery as _recovery
 
 
 def _extract_target_sec(report: Dict[str, Any], self_dir: str = None) -> str:
@@ -123,7 +124,8 @@ def _provenance_repair_section(report: Dict[str, Any]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _halt_patch(gate_patch: Dict[str, Any], history: List[str], label: str,
-                reason: str, repair_target: Optional[str] = None) -> Dict[str, Any]:
+                reason: str, repair_target: Optional[str] = None,
+                *, cause: str = "gate_reject") -> Dict[str, Any]:
     history.append(f"T3: {label} -> HALT: {reason}")
     return {
         **gate_patch,
@@ -133,6 +135,9 @@ def _halt_patch(gate_patch: Dict[str, Any], history: List[str], label: str,
         # unknown_target），供人工与证据使用；HALT 一律由 stage 终止图，不据此派发。
         "repair_target": repair_target,
         "error_message": f"{label}: {reason}",
+        # RC-3：结构化停机载荷（闭集恢复动作 + 真人批准入口），替代人工手术脚本
+        "halt_payload": _recovery.build_halt_payload(
+            cause=cause, reason=reason, gate=label, target=repair_target),
         "history": history,
     }
 
@@ -143,7 +148,9 @@ def _infra_halt(gate_patch: Dict[str, Any], history: List[str], label: str,
     reason = issues_mod.infrastructure_failure(report)
     if reason is None:
         return None
-    return _halt_patch(gate_patch, history, label, f"门禁基础设施失败（非内容问题）: {reason}")
+    return _halt_patch(gate_patch, history, label,
+                       f"门禁基础设施失败（非内容问题）: {reason}",
+                       cause="infrastructure")
 
 
 def _routed_failure(gate_patch: Dict[str, Any], history: List[str], gate: str,
@@ -158,7 +165,12 @@ def _routed_failure(gate_patch: Dict[str, Any], history: List[str], gate: str,
         report, gate, located_target=located,
         content_exit_failure=content_exit_failure)
     if decision["action"] == "HALT":
-        return _halt_patch(gate_patch, history, label, decision["reason"])
+        cause = ("unclassified" if decision.get("unclassified")
+                 else "route_gap" if "缺口" in str(decision.get("reason") or "")
+                 else "gate_reject")
+        return _halt_patch(gate_patch, history, label, decision["reason"],
+                           repair_target=decision.get("repair_target"),
+                           cause=cause)
     return {
         **gate_patch,
         "stage": "REPAIR_LOOP",
@@ -316,6 +328,26 @@ def _pdstate_task_status(self_dir: str, sec: str) -> Optional[str]:
         return ((data.get("tasks") or {}).get(sec) or {}).get("status")
     except Exception:
         return None
+
+
+def _harvest_assets(self_dir: str, history: List[str]) -> None:
+    """N1：编译前收割资产（图片等）。失败只记历史，不阻断编译。
+
+    收割器把原材料引用的图片复制进 self/ 并落
+    ``.pd/reports/assets-harvest.json`` 台账；缺图/冲突逐条可审计。
+    """
+    try:
+        runner = ScriptRunner(self_dir)
+        code, out, err = runner.run_script("harvest_assets.py", [self_dir])
+    except Exception as exc:  # noqa: BLE001 - 收割失败不得阻断构建
+        history.append(f"T3: 资产收割跳过（异常）: {exc}")
+        return
+    detail = (out or "").strip().splitlines()
+    head = detail[0] if detail else (err or "").strip()[:200]
+    if code == 0:
+        history.append(f"T3: 资产收割完成: {head}")
+    else:
+        history.append(f"T3: 资产收割有冲突 (exit {code}): {head}")
 
 
 def _mark_scopes_checked(self_dir: str, expected: Sequence[str],
@@ -519,34 +551,54 @@ def node_t3_checks(state: ShrinkCoursewareState) -> Dict[str, Any]:
         if infra is not None:
             return infra
         fid_codes = _fidelity_codes(fid_report)
-        sec_hit = _fidelity_repair_section(fid_report)
-        if sec_hit:
+        # N0：忠实性不再走“有切片就修节、否则一律 REPLAN source-map.md”的手写
+        # 兜底（那会把 coverage-map 里的一个竖线错放大成整条 T1 映射链重跑）。
+        # 改为按 code 逐条登记的统一路由表裁决：正文级 → 修节，映射契约级 →
+        # 只重规划对应地图，资源级 → 停机交资源侧，未登记码 → 停机报缺口。
+        decision = issues_mod.route_gate_report(
+            fid_report, "check_fidelity",
+            located_target=_fidelity_repair_section(fid_report))
+        if decision["action"] == "HALT":
+            return _halt_patch(gate_patch, history, "来源忠实性门禁",
+                               decision["reason"])
+        if decision["action"] == "REPAIR_DETERMINISTIC":
             return {
                 **gate_patch,
                 "stage": "REPAIR_LOOP",
-                "routing_action": "REPAIR_SECTION",
-                "repair_target": sec_hit,
-                "repair_reason": f"来源忠实性门禁未通过 ({','.join(fid_codes)}): {fid_report['status']}",
+                "routing_action": "REPAIR_DETERMINISTIC",
+                "repair_target": decision["repair_target"],
+                "repair_reason": (
+                    f"来源忠实性门禁未通过（确定性修复，不派 Agent） "
+                    f"({','.join(fid_codes)}): {fid_report['status']}"),
                 "history": history
             }
-        replan_count = state.get("replan_count", 0) + 1
-        if replan_count > 3:
-            history.append(f"T3: 忠实性重规划次数超限 ({replan_count} > 3)，熔断停止")
+        if decision["action"] == "REPLAN":
+            replan_count = state.get("replan_count", 0) + 1
+            if replan_count > 3:
+                history.append(f"T3: 忠实性重规划次数超限 ({replan_count} > 3)，熔断停止")
+                return {
+                    **gate_patch,
+                    "replan_count": replan_count,
+                    "stage": "HALTED",
+                    "routing_action": "HALT",
+                    "error_message": f"来源忠实性重规划次数超限: {fid_report['status']}",
+                    "history": history
+                }
             return {
                 **gate_patch,
                 "replan_count": replan_count,
-                "stage": "HALTED",
-                "routing_action": "HALT",
-                "error_message": f"来源忠实性重规划次数超限: {fid_report['status']}",
+                "stage": "REPAIR_LOOP",
+                "routing_action": "REPLAN",
+                "repair_target": decision["repair_target"],
+                "repair_reason": f"来源映射/扩展契约违规 ({','.join(fid_codes)}): {fid_report['status']}",
                 "history": history
             }
         return {
             **gate_patch,
-            "replan_count": replan_count,
             "stage": "REPAIR_LOOP",
-            "routing_action": "REPLAN",
-            "repair_target": "source-map.md",
-            "repair_reason": f"来源映射/扩展契约违规 ({','.join(fid_codes)}): {fid_report['status']}",
+            "routing_action": "REPAIR_SECTION",
+            "repair_target": decision["repair_target"],
+            "repair_reason": f"来源忠实性门禁未通过 ({','.join(fid_codes)}): {fid_report['status']}",
             "history": history
         }
 
@@ -863,6 +915,10 @@ def node_t3_build(state: ShrinkCoursewareState) -> Dict[str, Any]:
 
     fmt = state.get("output_format") or (state.get("user_spec") or {}).get("output_format") or "both"
 
+    # N1 资产收割：编译前把 sec*.tex / 原材料引用的图片确定性复制进 self/。
+    # 缺图不是内容缺陷（写作者改 sec*.tex 永远修不好），先补齐再编译。
+    _harvest_assets(self_dir, history)
+
     build_report = runner.run_gate_script(
         gate_name="build",
         script_name="build.py",
@@ -877,7 +933,9 @@ def node_t3_build(state: ShrinkCoursewareState) -> Dict[str, Any]:
         base = {"build_gate": build_report, "build_passed": False}
         routed = _routed_failure(base, history, "build", "构建排版门禁", build_report,
                                  "", located_sec, content_exit_failure=True)
-        if routed["routing_action"] == "HALT":
+        if routed["routing_action"] in ("HALT", "REPAIR_DETERMINISTIC"):
+            # HALT：基础设施失败/定位不到切片；REPAIR_DETERMINISTIC：
+            # 资源/渲染类确定性缺陷交给引擎（patch_artifact），都不派作者。
             return routed  # 基础设施失败 / 定位不到切片：停机，不再盲猜 sec2
         target_sec = routed["repair_target"]
         latex_err = _first_latex_error(self_dir)
@@ -933,8 +991,9 @@ def node_t3_build(state: ShrinkCoursewareState) -> Dict[str, Any]:
                 "build_passed": False}
         routed = _routed_failure(base, history, "check_render", "渲染质量门禁",
                                  render_report, "", target_sec)
-        if routed["routing_action"] == "HALT":
-            # 资源/引擎类缺陷（机械问题）、基础设施失败、定位不到切片：不派作者
+        if routed["routing_action"] in ("HALT", "REPAIR_DETERMINISTIC"):
+            # 资源/引擎类缺陷（机械问题→引擎执行 patch_artifact）、基础设施失败、
+            # 定位不到切片：一律不派作者
             return routed
         target_sec = routed["repair_target"]
         return {

@@ -39,6 +39,7 @@ from .nodes import (
     node_t4_promote_and_deliver,
     node_repair_section,
     node_repair_await,
+    node_repair_deterministic,
     node_t2_plan_check,
     node_t2_dispatch_check,
     node_t2_join_check
@@ -80,6 +81,7 @@ from .edges import (
     route_after_acceptance_verify,
     route_after_repair_dispatch,
     route_after_repair_await,
+    route_after_deterministic_repair,
     route_after_t2_plan_check,
     route_after_t2_dispatch_check,
     route_after_t2_join_check,
@@ -146,6 +148,8 @@ def create_legacy_graph(checkpointer: Optional[Any] = None) -> Any:
     # Repair loop
     workflow.add_node("repair_section", node_repair_section)
     workflow.add_node("repair_await", node_repair_await)
+    # RC-2：确定性修复执行器（引擎执行 patch_artifact，不派 Agent）
+    workflow.add_node("repair_deterministic", node_repair_deterministic)
 
     # 2. Connect Edges
     workflow.add_edge(START, "phase0_breakpoint")
@@ -340,6 +344,7 @@ def create_legacy_graph(checkpointer: Optional[Any] = None) -> Any:
         {
             "t3_build": "t3_build",
             "repair_section": "repair_section",
+            "repair_deterministic": "repair_deterministic",
             "t2_plan_check": "t2_plan_check",
             "t1_request_source_audit": "t1_request_source_audit",
             "t1_request_coverage_plan": "t1_request_coverage_plan",
@@ -434,6 +439,17 @@ def create_legacy_graph(checkpointer: Optional[Any] = None) -> Any:
         route_after_repair_await,
         {
             "t2_submit_and_check_sections": "t2_submit_and_check_sections",
+            "t3_checks": "t3_checks",
+            END: END
+        }
+    )
+
+    # RC-2：确定性修复执行器（引擎执行，不派 Agent）。修完回门禁重跑；
+    # 计划缺失/未通过 → 节点自身返回 HALTED，由条件边收口到 END。
+    workflow.add_conditional_edges(
+        "repair_deterministic",
+        route_after_deterministic_repair,
+        {
             "t3_checks": "t3_checks",
             END: END
         }
@@ -586,6 +602,7 @@ def create_fast_graph(checkpointer: Optional[Any] = None) -> Any:
     # ---- 返修回路（与 legacy 同名同实现）----
     workflow.add_node("repair_section", node_repair_section)
     workflow.add_node("repair_await", node_repair_await)
+    workflow.add_node("repair_deterministic", node_repair_deterministic)
 
     workflow.add_edge(START, "phase0_breakpoint")
     workflow.add_conditional_edges("phase0_breakpoint", route_after_phase0, {
@@ -650,6 +667,7 @@ def create_fast_graph(checkpointer: Optional[Any] = None) -> Any:
     workflow.add_conditional_edges("t3_checks", route_after_fast_checks, {
         "t3_build": "t3_build",
         "repair_section": "repair_section",
+        "repair_deterministic": "repair_deterministic",
         # 审读证据缺失/过期 → 补派合并终审（本图不设逐节 checker）
         "t4_plan_combined_review": "t4_plan_combined_review",
         # REPLAN：来源/覆盖类问题在 fast 图里同样重新生成三表（同一次派发）
@@ -712,6 +730,12 @@ def create_fast_graph(checkpointer: Optional[Any] = None) -> Any:
         "t2_submit_and_check_sections": "t2_submit_and_check_sections",
         END: END,
     })
+    # RC-2：fast 图同样接入确定性修复执行器
+    workflow.add_conditional_edges(
+        "repair_deterministic", route_after_deterministic_repair, {
+            "t3_checks": "t3_checks",
+            END: END,
+        })
 
     saver = checkpointer if checkpointer is not None else MemorySaver()
     return workflow.compile(checkpointer=saver)

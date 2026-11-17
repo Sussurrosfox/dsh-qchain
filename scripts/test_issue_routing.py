@@ -220,14 +220,27 @@ class ROUTE02_UnknownErrorHalts(NodeBase):
         fid = rep("check_fidelity", "REJECT", raw={"errors": [
             {"code": "FIDELITY_UNGROUNDED_QID", "detail": "sec2 引用了未登记 qid"}]})
         self.assertEqual(self.checks(check_fidelity=fid)["repair_target"], "sec2")
+        # N0：契约级改用**真实**码（此前用合成码 FIDELITY_MAP_BROKEN 钉住了
+        # “未登记码一律 REPLAN source-map.md”的大锤行为；现在未登记码收敛为
+        # HALT + 缺口报告，真实码照旧按表裁决）。
         fid2 = rep("check_fidelity", "REJECT", raw={"errors": [
-            {"code": "FIDELITY_MAP_BROKEN", "detail": "映射表损坏"}]})
+            {"code": "FIDELITY_MAP_MISSING", "detail": "映射表损坏"}]})
         p2 = self.checks(check_fidelity=fid2)
         self.assertEqual((p2["routing_action"], p2["repair_target"]),
                          ("REPLAN", "source-map.md"))
         sco = rep("check_scope", "REJECT", raw={"errors": [
             {"code": "SCOPE_PROFILE_DRIFT", "detail": "x"}]})
         self.assertEqual(self.checks(check_scope=sco)["routing_action"], "HALT")
+
+    def test_unregistered_fidelity_code_halts_with_gap_instead_of_replan(self):
+        # N0：兜底必须收敛——未登记码不再被前缀大锤放大成 T1 全链重跑，
+        # 而是停机并把缺口写进 error_message（先暴露、后补表）。
+        fid = rep("check_fidelity", "REJECT", raw={"errors": [
+            {"code": "FIDELITY_MAP_BROKEN", "detail": "映射表损坏"}]})
+        patch = self.checks(check_fidelity=fid)
+        self.assertEqual(patch["routing_action"], "HALT")
+        self.assertIn("未登记", patch["error_message"])
+        self.assertIn("FIDELITY_MAP_BROKEN", patch["error_message"])
 
     def test_fidelity_gate_crash_halts_instead_of_replan(self):
         err = rep("check_fidelity", "ERROR", exit_code=130)
@@ -310,7 +323,11 @@ class ROUTE03_NoAgentForReviewInfoAndMechanical(NodeBase):
                 self.assertNotEqual(issue["category"], "unclassified")
                 d = iss.decide_route([issue], located_target="sec1")
                 self.assertFalse(d["dispatch_agent"], d)
-                self.assertEqual(d["action"], "HALT")
+                # RC-2：确定性缺陷不再干停机，交引擎（patch_artifact）执行；
+                # 但绝不派 Agent 改 sec*.tex。
+                self.assertEqual(d["action"], "REPAIR_DETERMINISTIC", d)
+                self.assertTrue(d.get("engine_action"), d)
+                self.assertNotEqual(d["action"], "REPAIR_SECTION")
 
     def test_render_source_defect_dispatches_author_only_when_located(self):
         issue = iss.normalize_issue(
@@ -322,12 +339,14 @@ class ROUTE03_NoAgentForReviewInfoAndMechanical(NodeBase):
         d = iss.decide_route([issue], located_target="sec2")
         self.assertEqual((d["action"], d["repair_target"]), ("REPAIR_SECTION", "sec2"))
 
-    def test_render_resource_failure_in_node_halts_without_author(self):
+    def test_render_resource_failure_in_node_never_dispatches_author(self):
         FakeScriptRunner.gate_reports["build"] = rep("build")
         FakeGateRunner.overrides["check_render"] = raw_issue_report(
             "check_render", "缺少本地 KaTeX 资源")
         patch = bn.node_t3_build(dict(self.state))
-        self.assertEqual(patch["routing_action"], "HALT")
+        # 资源类缺陷由引擎确定性修复（REPAIR_DETERMINISTIC），不派作者、
+        # 也不再干停机把人工晾在那里。
+        self.assertEqual(patch["routing_action"], "REPAIR_DETERMINISTIC")
         self.assertNotEqual(patch["routing_action"], "REPAIR_SECTION")
 
     def test_render_source_failure_in_node_repairs_located_section(self):

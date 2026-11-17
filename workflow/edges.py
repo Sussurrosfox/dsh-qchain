@@ -213,6 +213,9 @@ def route_after_shuffle(state: ShrinkCoursewareState) -> str:
 def route_after_checks(state: ShrinkCoursewareState) -> str:
     if state.get("stage") == "HALTED":
         return END
+    if state.get("routing_action") == "REPAIR_DETERMINISTIC":
+        # RC-2：确定性缺陷交引擎执行（scripts/patch_artifact.py），不派 Agent。
+        return "repair_deterministic"
     if state.get("routing_action") == "REPLAN":
         # 卡 07：覆盖/预算类问题只回 coverage-planner（来源哈希未变，不重跑
         # source-auditor）；source-map 类问题（来源/映射契约）仍回 source-auditor。
@@ -247,6 +250,19 @@ def route_after_fast_checks(state: ShrinkCoursewareState) -> str:
             and _is_fast(state) and state.get("gate_phase") == "final":
         return "t4_verify_acceptance"
     return route_after_checks(state)
+
+
+def route_after_deterministic_repair(state: ShrinkCoursewareState) -> str:
+    """RC-2 确定性修复执行器之后：修好回门禁重跑，否则收口。
+
+    预算口径：确定性修复不吃内容返修额度（repair_budget 只统计 agent 派发），
+    但仍有自己的护栏——计划文件缺失/未通过时节点直接 HALTED，不循环重试。
+    """
+    if state.get("stage") == "HALTED":
+        return END
+    if state.get("routing_action") == "HALT":
+        return END
+    return "t3_checks"
 
 
 def route_after_build(state: ShrinkCoursewareState) -> str:

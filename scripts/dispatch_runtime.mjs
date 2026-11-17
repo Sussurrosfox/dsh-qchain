@@ -23,7 +23,16 @@ export const DEFAULTS = Object.freeze({
   maxPromptChars: 600000, // 完整 prompt 字符上限；超出明确报错，不静默截断
   maxMapChars: 40000, // 单张映射表全文上限；超出才按 scope 过滤
   maxSourceFiles: 200, // 目录输入无 inventory 时最多枚举的文本文件数
+  // P2-1 提示词分层：layered 把"必读层"压到约 40K 以内（任务书 + 被审对象 +
+  // 证据摘要），映射表与学生版页文本降为"附录层：只给路径 + 摘要 + 行数"。
+  // 宿主投递通道会折叠超长载荷的中段（实测 T4 233K 提示词里任务书被折掉约
+  // 90K token，子 Agent 察觉后转去读盘补全、耗尽预算），故必读层必须自足。
+  promptProfile: 'layered', // full | layered
+  layeredMapChars: 12000, // 分层模式下每张映射表最多内嵌的字符数
+  layeredPackChars: 8000, // 分层模式下 student-pages.txt 最多内嵌的字符数
 });
+
+export const PROMPT_PROFILES = ['full', 'layered'];
 
 export class DispatchPromptError extends Error {
   constructor(code, message, detail = {}) {
@@ -116,16 +125,21 @@ export function normalizeScopes(request) {
 export function outputProtocol(role, artifacts) {
   const list = artifacts.map((a) => `- ${a}`).join('\n');
   if (role === 'review') {
+    // P2-2：审读产物改以 FILE 块为首选（哨兵协议），大 JSON 仍接受但降为备选。
+    // 实测 T4 批 5 轮里 4 轮死在 JSON 结构上（括号未闭合、键放在 files 之外、
+    // 字符串内未转义反斜杠）；FILE 块没有嵌套与转义问题，且解析器两条路都认。
+    const blocks = artifacts.map((a) => `<<<FILE:${a}>>>\n<${a} 的完整内容>\n<<<END:${a}>>>`);
     return [
-      '## 输出协议（本角色唯一协议：单个 JSON 对象；不要使用 FILE 块）',
+      '## 输出协议（本角色首选 FILE 块；单一 JSON 对象也接受）',
       '【硬性约束，凌驾于本任务书一切其他表述之上】你的最终回复中严禁出现任何',
-      '分析、推理、审读笔记、计划、复述或解释性文字——回复中只要有一个非 JSON',
-      '字符，解析即失败、本派发单作废、前面的全部审读工作归零。所有思考必须在',
-      '内部完成；先在内部审读完，然后一次性给出下面的 JSON 对象作为唯一回复。',
-      `最终回复必须只是一个可解析的 JSON 对象，形如 {"files": {"<相对路径>": "<完整文件内容>"}}，不要包裹多余文字。`,
-      `files 的键必须恰好等于下列 ${artifacts.length} 个白名单路径（缺任何一个即判该派发单失败）：`,
+      '分析、推理、审读笔记、计划、复述或解释性文字——只要出现非产物内容，',
+      '本次派发即判失败。所有思考必须在内部完成；先在内部审读完，再一次性给出',
+      `下列 ${artifacts.length} 个白名单产物。`,
+      '**首选格式（无嵌套、无转义，最不易出错）**：每个产物一个 FILE 块，文件名与白名单逐字一致：',
+      blocks.join('\n'),
+      `**备选格式**：也可以只给一个可解析的 JSON 对象 {"files": {"<相对路径>": "<完整内容>"}}，键必须恰好等于下列 ${artifacts.length} 个路径。两种格式都不会被额外加分，FILE 块更稳。`,
+      '白名单路径（缺任何一个即判该派发单失败）：',
       list,
-      '.json 产物的内容可直接写成对象；其余产物为完整文件文本（JSON 字符串内的反斜杠需转义）。',
     ].join('\n');
   }
   const blocks = artifacts.map((a) => `<<<FILE:${a}>>>\n<${a} 的完整原始内容，直接粘贴，不做任何转义>\n<<<END:${a}>>>`);
@@ -490,6 +504,18 @@ export function buildDispatchPrompt(request, envIn) {
   const maxPromptChars = Number(ctxObj.max_prompt_chars || req.max_prompt_chars
     || envIn.maxPromptChars) || DEFAULTS.maxPromptChars;
   const maxMapChars = Number(envIn.maxMapChars) || DEFAULTS.maxMapChars;
+  // P2-1：提示词分层档位（per-request 覆盖 > config.yaml > 默认 layered）
+  const rawProfile = String(
+    ctxObj.prompt_profile || req.prompt_profile || envIn.promptProfile
+    || DEFAULTS.promptProfile).toLowerCase();
+  const promptProfile = PROMPT_PROFILES.includes(rawProfile) ? rawProfile : DEFAULTS.promptProfile;
+  const layered = promptProfile === 'layered';
+  const mapCharLimit = layered ? Math.min(maxMapChars, DEFAULTS.layeredMapChars) : maxMapChars;
+  // 附录层：只登记路径 + 尺寸，供子 Agent 按需只读（而不是把正文塞进提示词）
+  const appendix = [];
+  const noteAppendix = (rel, chars, why) => {
+    appendix.push(`- ${rel}（${chars} 字符）${why ? `：${why}` : ''}`);
+  };
 
   const promptFile = String(req.prompt_file || 'subagent_prompt.md').replace(/^prompts[\\/]/, '');
   const tpl = readIfFile(fs, path.join(engineRoot, 'prompts', promptFile));
@@ -579,9 +605,14 @@ export function buildDispatchPrompt(request, envIn) {
     ]) {
       const t = readIfFile(fs, path.join(selfDir, file));
       if (!t) continue;
-      const sel = selectMapRows(t, mapKeys, { limit: maxMapChars, label: file });
-      mapMeta[file] = { chars: sel.text.length, filtered: sel.filtered, omitted_lines: sel.omitted_lines };
+      const sel = selectMapRows(t, mapKeys, { limit: mapCharLimit, label: file });
+      mapMeta[file] = { chars: sel.text.length, full_chars: t.length,
+                        filtered: sel.filtered, omitted_lines: sel.omitted_lines };
+      const why = sel.omitted_lines
+        ? `已按本批 scope 过滤，其余 ${sel.omitted_lines} 行未内嵌`
+        : (sel.text.length < t.length ? '已截断' : '');
       mapBlocks.push(`\n## ${title}${sel.filtered ? '（已按本批 scope 过滤，关键行完整保留）' : '（全文）'}\n\`\`\`markdown\n${sel.text}\n\`\`\``);
+      if (layered) noteAppendix(file, t.length, why || '全文已内嵌，如需其它 scope 的行可只读该文件');
     }
   }
 
@@ -756,11 +787,13 @@ export function buildDispatchPrompt(request, envIn) {
     }
     const pagesTxt = readIfFile(fs, path.join(selfDir, '.pd', 'review', 'student-pages.txt'));
     if (pagesTxt) {
-      const cap = 24000;
+      const cap = layered ? DEFAULTS.layeredPackChars : 24000;
       const truncated = pagesTxt.length > cap;
-      const t = truncated ? `${pagesTxt.slice(0, cap)}\n…（截断：共 ${pagesTxt.length} 字符，仅前 ${cap} 字符；渲染冒烟 DoD 只需首页与首个含 \\fillin 选项组的页面，均在开头）` : pagesTxt;
+      const t = truncated ? `${pagesTxt.slice(0, cap)}\n…（截断：共 ${pagesTxt.length} 字符，仅前 ${cap} 字符；渲染冒烟 DoD 只需首页与首个含 \\fillin 选项组的页面，均在开头；其余部分可按路径只读）` : pagesTxt;
       packParts.push(`### .pd/review/student-pages.txt（学生版 PDF 文本层抽取，${pagesTxt.length} 字符${truncated ? `，前 ${cap} 字符` : '，全文'}）\n\`\`\`\n${t}\n\`\`\``);
       packMeta.push({ path: '.pd/review/student-pages.txt', chars: pagesTxt.length });
+      if (layered && truncated) noteAppendix('.pd/review/student-pages.txt', pagesTxt.length,
+        `已内嵌前 ${cap} 字符，需要后文可按路径只读`);
     }
     if (packParts.length) {
       reviewPack = `\n## 审读包与预算证据（验收 DoD 可核对输入，已全文内嵌，禁止再读文件）\n`
@@ -813,6 +846,18 @@ export function buildDispatchPrompt(request, envIn) {
     ...artifacts.map((a) => `- ${a}${artScopes[a] ? `（scope: ${artScopes[a]}）` : ''}`),
   ].filter((s) => s !== '').join('\n');
 
+  // ---- 附录索引（P2-1 分层：把大载荷挪出必读层，只留路径 + 尺寸） ----
+  let appendixBlock = '';
+  if (layered && appendix.length) {
+    appendixBlock = [
+      '\n## 附录索引（未全文内嵌的输入；如确需细节，用 read 工具按路径只读，不要通读全文）',
+      ...appendix,
+      '提示：本任务书已包含完成任务所需的全部规则与判断依据；附录只用于核对个别数字或行。'
+        + '若你的可见载荷看起来被缩短了，那是投递通道的展示折叠，不是内容缺失——不要为了"补全载荷"去通读文件。',
+    ].join('\n');
+  }
+
+
   const tail = [
     repairBlock ? `\n${repairBlock}` : '',
     schemaBlock ? `\n${schemaBlock}` : '',
@@ -822,6 +867,7 @@ export function buildDispatchPrompt(request, envIn) {
     (!rendered.sourceTemplatePlaced && sourceBlock) ? `\n${sourceBlock}` : '',
     reviewPack,
     reviewTargets,
+    appendixBlock,
     `\n${outputProtocol(role, artifacts)}`,
     `\n${EXECUTION_RULES}`,
   ].filter((s) => s !== '').join('\n');
@@ -838,6 +884,8 @@ export function buildDispatchPrompt(request, envIn) {
       });
   }
   const occurrences = (needle) => prompt.split(needle).length - 1;
+  const sumChars = (arr, key = 'chars') => arr.reduce((n, x) => n + (Number(x[key]) || 0), 0);
+  const mapChars = Object.values(mapMeta).reduce((n, m) => n + m.chars, 0);
   return {
     prompt,
     meta: {
@@ -846,6 +894,19 @@ export function buildDispatchPrompt(request, envIn) {
       artifacts,
       prompt_chars: prompt.length,
       prompt_sha256: sha256Text(crypto, prompt),
+      prompt_profile: promptProfile,
+      // P2-1：分层字数账（必读层 = 模板 + 任务书 + 被审对象 + 来源 + 协议）
+      layers: {
+        template: rendered.text.length,
+        task: taskBlock.length,
+        source: sourceBlock.length,
+        maps: mapChars,
+        review_targets: sumChars(reviewMeta),
+        review_pack: sumChars(packMeta),
+        repair: repairBlock.length,
+        appendix: appendixBlock.length,
+        protocol: outputProtocol(role, artifacts).length + EXECUTION_RULES.length,
+      },
       source_files: collected.sources.map((s) => ({ path: s.rel, chars: s.chars, sha256: s.sha256 })),
       source_chars: collected.sources.reduce((n, s) => n + s.chars, 0),
       source_block_count: occurrences(SOURCE_BEGIN),

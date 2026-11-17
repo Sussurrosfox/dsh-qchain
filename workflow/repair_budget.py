@@ -41,6 +41,20 @@ LEGACY_TOTAL_LIMIT: Optional[int] = None  # legacy 无全局上限（沿用旧�
 FAST_PER_SCOPE_LIMIT = 2
 FAST_TOTAL_LIMIT = 6
 
+#: 返修失败的**原因**闭集（RC-4）。额度只为 ``CHARGED_CAUSES`` 里的原因记账：
+#: 返修额度是给「写作者需要再改一次内容」准备的资源，被契约漂移、缺资产、
+#: 环境缺口这些与 sec*.tex 无关的失败吃掉，是本次 run 里 sec2 的 2/2 被
+#: 非内容问题耗尽、真实内容问题反而无额度可用的直接原因。
+CAUSES = ("content", "contract", "asset", "environment",
+          "deterministic", "infrastructure")
+CHARGED_CAUSES = ("content",)
+
+
+def normalize_cause(cause: Any) -> str:
+    """未知原因一律按 ``content`` 计（宁可少占便宜，不可漏记额度）。"""
+    c = str(cause or "").strip().lower()
+    return c if c in CAUSES else "content"
+
 #: 归一化 evidence 时丢弃的非语义字段名（时间/耗时/运行标识）。公式、qid 不在其内。
 _VOLATILE_KEYS = frozenset({
     "timestamp", "time", "ts", "created_at", "updated_at", "started_at",
@@ -315,8 +329,13 @@ def load_ops_override(self_dir: Optional[str]) -> Dict[str, Any]:
 def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Optional[str],
                 *, issues: Optional[List[Dict[str, Any]]] = None,
                 artifact: Optional[str] = None,
-                config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                config: Optional[Dict[str, Any]] = None,
+                cause: str = "content") -> Dict[str, Any]:
     """决定“安排下一次内容返修”还是 HALT；纯函数，不读写磁盘。
+
+    ``cause``（RC-4）区分失败原因：只有 ``CHARGED_CAUSES``（content）消耗额度，
+    其余原因（契约漂移 / 缺资产 / 环境缺口 / 确定性可修）照常派发、照常审计，
+    但**不烧内容返修额度**——额度是给写作者的，不是给基础设施的。
 
     返回::
 
@@ -327,9 +346,12 @@ def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Op
     ``patch`` 是须随派发单同一次 checkpoint 写入的全部持久字段（完整新 dict，
     不依赖 reducer）。HALT 不增加任何计数。
     """
+    cause = normalize_cause(cause)
+    charged = cause in CHARGED_CAUSES
     per_scope, total_limit, profile = resolve_limits(state, config)
     by_scope = dict(state.get("repair_attempts_by_scope") or {})
     total = int(state.get("repair_attempts_total") or 0)
+    by_cause = dict(state.get("repair_attempts_by_cause") or {})
     last_fp = dict(state.get("repair_last_fingerprint_by_scope") or {})
     last_digest = dict(state.get("repair_last_digest_by_scope") or {})
     log = list(state.get("repair_attempt_log") or [])
@@ -344,6 +366,8 @@ def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Op
         "total_attempts": total,
         "per_scope_limit": per_scope,
         "total_limit": total_limit,
+        "cause": cause,
+        "attempts_by_cause": by_cause,
         "unresolved_reason": reason,
         "fingerprint": fp,
         "last_artifact": {"path": artifact, "digest": input_digest},
@@ -359,7 +383,8 @@ def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Op
                        f"（已修 {scope_attempts} 次）"),
             "halt": {**halt_ctx, "halt_reason": NO_PROGRESS},
         }
-    if scope_attempts >= per_scope or (total_limit is not None and total >= total_limit):
+    if charged and (scope_attempts >= per_scope
+                    or (total_limit is not None and total >= total_limit)):
         which = (f"scope {scope} 已达 {scope_attempts}/{per_scope}"
                  if scope_attempts >= per_scope
                  else f"全局累计已达 {total}/{total_limit}")
@@ -369,14 +394,24 @@ def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Op
             "halt": {**halt_ctx, "halt_reason": BUDGET_EXHAUSTED},
         }
 
-    by_scope[scope] = scope_attempts + 1
+    by_cause[cause] = int(by_cause.get(cause) or 0) + 1
     last_fp[scope] = fp
     last_digest[scope] = input_digest
+    if charged:
+        by_scope[scope] = scope_attempts + 1
+        attempt_no = by_scope[scope]
+        total_after = total + 1
+    else:
+        # 非内容原因：不动额度计数，但它仍是一次真实派发（审计要看得见）
+        attempt_no = scope_attempts
+        total_after = total
     return {
-        "action": "SCHEDULE", "attempt_no": by_scope[scope], "fingerprint": fp,
+        "action": "SCHEDULE", "attempt_no": attempt_no, "fingerprint": fp,
+        "cause": cause,
         "patch": {
             "repair_attempts_by_scope": by_scope,
-            "repair_attempts_total": total + 1,
+            "repair_attempts_total": total_after,
+            "repair_attempts_by_cause": by_cause,
             "repair_last_fingerprint_by_scope": last_fp,
             "repair_last_digest_by_scope": last_digest,
             "repair_attempt_log": log,  # 调用方追加本次 dispatch_id 后再写回
@@ -385,11 +420,12 @@ def plan_repair(state: Dict[str, Any], scope: str, reason: str, input_digest: Op
 
 
 def attempt_log_entry(scope: str, attempt_no: int, total_no: int, dispatch_id: str,
-                      fingerprint: str, input_digest: Optional[str], reason: str
-                      ) -> Dict[str, Any]:
+                      fingerprint: str, input_digest: Optional[str], reason: str,
+                      cause: str = "content") -> Dict[str, Any]:
     return {
         "scope": scope, "attempt": attempt_no, "total": total_no,
         "dispatch_id": dispatch_id, "fingerprint": fingerprint,
+        "cause": normalize_cause(cause),
         "input_digest": input_digest, "reason": normalize_evidence(reason)[:300],
     }
 
