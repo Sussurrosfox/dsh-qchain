@@ -143,8 +143,7 @@ def _patch_for(action: str, *, self_dir: str, target: Optional[str],
                 % (target, " / ".join(REROUTE_TARGETS)))
         patch = dict(clear)
         patch.update({"stage": "ROUTED", "pending_dispatch": None,
-                      "repair_target": None, "reroute_target": target,
-                      "repair_failure_cause": "manual_reroute"})
+                      "repair_target": None, "reroute_target": target})
         return "t2_shuffle_options", patch
 
     if action == "relax_budget":
@@ -162,15 +161,50 @@ def _patch_for(action: str, *, self_dir: str, target: Optional[str],
                 total, int(cfg.get("repair_max_total") or 0))
         patch = dict(clear)
         patch.update({"stage": "T3_CHECKS_PENDING", "execution_config": cfg,
-                      "repair_halt": None, "pending_dispatch": None,
-                      "repair_failure_cause": "budget_relaxed"})
+                      "repair_halt": None, "pending_dispatch": None})
         return "repair_await", patch
 
     # retry_gate
     patch = dict(clear)
-    patch.update({"stage": "T3_CHECKS_PENDING", "pending_dispatch": None,
-                  "repair_failure_cause": "gate_retried"})
+    patch.update({"stage": "T3_CHECKS_PENDING", "pending_dispatch": None})
     return "repair_await", patch
+
+
+def _locate(start: str, db_path: Optional[str]) -> tuple:
+    """把「项目根 / self 工作区」归一成 (self_dir, db_path)，两者都认。
+
+    * ``.pd`` 目录在哪，哪里就是 self 工作区（本插件所有台账都在 self/.pd）；
+    * 检查点库优先用调用方显式给的路径，否则在
+      ``<self>/.langgraph``、``<self>/../.langgraph``、``cwd/.langgraph`` 里找。
+
+    找不到时抛 RecoveryError 并列出**所有**找过的位置——恢复失败时最怕的是
+    "目录在哪"这种二次摸索。
+    """
+    base = os.path.abspath(start)
+    candidates_self = [base] + ([os.path.join(base, "self")]
+                                if os.path.isdir(os.path.join(base, "self")) else [])
+    self_dir = next((d for d in candidates_self
+                     if os.path.isdir(os.path.join(d, ".pd"))), candidates_self[-1])
+
+    if db_path:
+        resolved = os.path.abspath(db_path)
+        if not os.path.isfile(resolved):
+            raise RecoveryError("检查点数据库不存在: %s" % resolved)
+        return self_dir, resolved
+
+    looked = []
+    for cand in (os.path.join(self_dir, ".langgraph",
+                              "courseware_checkpoints.sqlite"),
+                 os.path.join(os.path.dirname(self_dir), ".langgraph",
+                              "courseware_checkpoints.sqlite"),
+                 os.path.join(os.getcwd(), ".langgraph",
+                              "courseware_checkpoints.sqlite")):
+        if cand in looked:
+            continue
+        looked.append(cand)
+        if os.path.isfile(cand):
+            return self_dir, cand
+    raise RecoveryError("检查点数据库不存在；已查找：%s" % "、".join(looked))
 
 
 def recover(self_dir: str, *, action: str, approved_by: str,
@@ -186,8 +220,10 @@ def recover(self_dir: str, *, action: str, approved_by: str,
     self_dir = os.path.abspath(self_dir)
     if not os.path.isdir(self_dir):
         raise RecoveryError("工作区不存在: %s" % self_dir)
-    db_path = db_path or os.path.join(self_dir, ".langgraph",
-                                      "courseware_checkpoints.sqlite")
+    # 位置归一：调用方可能给「项目根」也可能给「self 工作区」——.pd 与
+    # .langgraph 在两者下的相对位置不同（本插件 .pd 在 self/、检查点库在项目根），
+    # 故两个都认，而不是让操作者去猜。
+    self_dir, db_path = _locate(self_dir, db_path)
     if not os.path.isfile(db_path):
         raise RecoveryError("检查点数据库不存在: %s" % db_path)
 

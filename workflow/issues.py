@@ -157,6 +157,19 @@ CODE_ROUTES: Dict[str, Route] = {
     "SCOPE_CORE_BUDGET_OVERFLOW": Route("scope_contract", "human", "scope-contract",
                                         strict_blocks=True),
     "SCOPE_MUST_COVER_EMPTY": Route("scope_advisory", "none", None, strict_blocks=True),
+    # 冻结执行策略与当前 YAML 不一致：改 YAML 不生效，须新 thread 或真人重新确认
+    "SCOPE_EXECUTION_POLICY_DRIFT": Route("scope_contract", "human", "scope-contract"),
+    # 零小节（main.tex 没扫到 \input、工作区也没有切片）= 核对根本没生效，
+    # 不是"没有小节要查"——按环境处理，绝不能派作者补内容
+    "SCOPE_NO_SECTIONS": Route("scope_env", "environment", ENV_TARGET),
+    # warning 级标记：main.tex 未扫到 \input，已按实存切片核对
+    "SCOPE_SECTIONS_FROM_FILES": Route("scope_advisory", "none", None,
+                                       strict_blocks=True),
+    # 派发计划构造期错误（请求优先级/相邻性/重叠）：编排器内部缺陷，不是产物问题
+    "SCOPE_ORDER": Route("dispatch_plan", "human", "dispatch-plan"),
+    "SCOPE_NOT_ADJACENT": Route("dispatch_plan", "human", "dispatch-plan"),
+    "SCOPE_OVERFLOW": Route("dispatch_plan", "human", "dispatch-plan"),
+    "SCOPE_OVERLAP": Route("dispatch_plan", "human", "dispatch-plan"),
     # --- 语义审读 / 血缘：定位到切片才派，定位不到停 ---
     "SEMANTIC_MISSING": Route("semantic", "agent", SECTION),
     "SEMANTIC_STALE": Route("semantic", "agent", SECTION),
@@ -165,6 +178,12 @@ CODE_ROUTES: Dict[str, Route] = {
     "SEMANTIC_REVISE": Route("semantic", "agent", SECTION),
     "SEMANTIC_NEEDS_EVIDENCE": Route("semantic", "agent", SECTION),
     "SEMANTIC_MAIN_MISSING": Route("assembly", "human", "main.tex"),
+    # 零小节 = 审读没生效（同 SCOPE_NO_SECTIONS）；人工延期标记是人的决定，不再派作者
+    "SEMANTIC_NO_SECTIONS": Route("semantic_env", "environment", ENV_TARGET),
+    "SEMANTIC_REVISE_DEFERRED": Route("semantic_deferral", "human", SECTION),
+    # faithful_fast 构建前的占位状态：证据还没产出，不是可修的内容缺陷
+    "SEMANTIC_PENDING_REVIEW": Route("semantic_pending", "human", "combined-review"),
+    "PROVENANCE_NO_SECTIONS": Route("provenance_env", "environment", ENV_TARGET),
     "PROV_NO_DISPATCH_CHAIN": Route("provenance", "agent", SECTION),
     "PROV_SECTION_MISSING": Route("provenance", "agent", SECTION),
     "PROV_WRITER_DIGEST_MISSING": Route("provenance", "agent", SECTION),
@@ -182,18 +201,19 @@ CODE_ROUTES: Dict[str, Route] = {
     "CLASSROOM_PLAN_INVALID": Route("classroom_plan", "deterministic", "classroom-plan.md"),
     "STUDENT_PDF_PAGE_OVERFLOW": Route("pdf_page_overflow", "human", "pdf-layout",
                                        strict_blocks=True),
+    # coverage-map 的 carrier_qid 留空 → 无法判定任务数，补覆盖表而非改切片
+    "BUDGET_CARRIER_MISSING": Route("budget_carrier", "agent", _COV),
 }
 
 #: 前缀兜底（按顺序匹配；精确码优先）。
 #:
-#: N0 起 **不再有 ``FIDELITY_`` 整族前缀兜底**：那条兜底会把任何未登记的
-#: fidelity 码升级成 "REPLAN source-map.md"（重跑整个 T1 来源映射链）。本次 run
+#: N0 起 **不再有任何整族前缀兜底**：``FIDELITY_`` 那条会把任何未登记的
+#: fidelity 码升级成 "REPLAN source-map.md"（重跑整个 T1 来源映射链）——本次 run
 #: 里一个 coverage-map 单元格内的裸竖线就是这么把一次单字符修复放大成 T1 全链
-#: 重跑的。现在 fidelity 的每个真实码都在 CODE_ROUTES 里逐条登记；未登记的码
-#: 落到 ``_UNCLASSIFIED`` → HALT + 如实报缺口（收敛式兜底，见 check_route_coverage）。
-PREFIX_ROUTES = (
-    ("SCOPE_", Route("scope_contract", "human", "scope-contract")),
-)
+#: 重跑的；``SCOPE_`` 那条则会把未知范围问题静默判给人工，缺口从此看不见。
+#: 现在每个真实码都在 CODE_ROUTES 里逐条登记，未登记的码落到 ``_UNCLASSIFIED``
+#: → HALT + 如实报缺口（收敛式兜底，由 scripts/test_route_coverage.py 看守）。
+PREFIX_ROUTES = ()
 
 #: category 级路由（GateReport 合成类别 / check_budget category / 通用）
 CATEGORY_ROUTES: Dict[str, Route] = {
@@ -667,7 +687,8 @@ def route_table_coverage(codes) -> Dict[str, List[str]]:
     的码——那类问题最后只能落到 ``unclassified``（HALT + 报缺口）。宁可停机报缺口，
     也不要再出现「未登记码被前缀兜底放大成全链重跑」。
 
-    注意：``SCOPE_`` 前缀仍在 PREFIX_ROUTES 里，故 SCOPE_* 不算缺口。
+    注意：前缀兜底已全部删除（``PREFIX_ROUTES == ()``），故 ``missing`` 就是
+    真实缺口全集——没有任何 ``SCOPE_`` / ``FIDELITY_`` 之类的整族豁免。
     """
     known = set(CODE_ROUTES)
     prefixes = tuple(p for p, _ in PREFIX_ROUTES)
