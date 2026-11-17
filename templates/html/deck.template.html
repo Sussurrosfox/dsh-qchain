@@ -184,7 +184,13 @@ body[data-version="teacher"] .qc-ansspace{background:transparent; border-bottom:
 .qc-img{max-width:100%; height:auto; border:1px solid var(--qc-line); border-radius:8px; margin:8px 0; background:#fff}
 
 /* ---------- 教材表格（由 tabular 环境机械转换而来） ---------- */
-.qc-table-wrap{overflow-x:auto; margin:10px 0}
+/* contain 说明（NAV-03）：Chromium 把 overflow:auto 容器内宽表格的"幽灵"
+   布局溢出（表格最小内容宽度）沿祖先链并入文档可滚动区域，即使该容器
+   自身已按 padding 边裁剪——结果是窄视口下页面出现一段无法消除的横向
+   空白滚动（实测 390px 视口被 539px 的表顶成 scrollWidth=495）。给滚动
+   容器加 contain:layout paint 切断这条传播路径，表格仍在容器内横向
+   滚动、渲染逐像素不变（窄/宽视口与打印均已验证）。 */
+.qc-table-wrap{overflow-x:auto; margin:10px 0; contain:layout paint}
 .qc-table{border-collapse:collapse; margin:2px auto; font-size:.95em; background:#fff}
 .qc-table td{padding:3px 12px; text-align:center; border-bottom:1px solid var(--qc-line); white-space:nowrap}
 .qc-table tr.qc-tr-head td{font-weight:700; background:#eff6ff; border-bottom:1.5px solid var(--qc-primary)}

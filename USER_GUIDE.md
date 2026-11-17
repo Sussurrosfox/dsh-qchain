@@ -11,6 +11,7 @@
 > **Agent 接入层（DSH 插件）说明**：
 > - `qchain_pipeline` 工具的 `resume` 必须携带真人提供的 Phase 0 令牌（`token` 参数）；令牌由流水线写入 `.langgraph/phase0_token.txt`，严禁 Agent 自行读取。
 > - `qchain_gate` 工具为**严格只读体检**：`classroom_plan` 采用纯只读模式（`--check`），检测教案中的未替换占位符残留（如 `______`），不再破坏性覆盖教师的手改教案；`shuffle` 走 `--verify` 不改写切片源文件，`delivery` 走 `--dry-run` 只检查不发布 `release/`，`compare` 为 `--diagnostic` 诊断模式（报告会醒目标注"已跳过部分核对"，不得按完整通过解读）。
+> - `qchain_dispatch` 的 `request_ref` 是**单请求返修入口**，不是整批复原入口：逐单调用时每次并发槽只有 1 个请求（`laneCount=1`），同批 N 个请求会被逐条串行，白丢并行能力。整批复原一律改用 `batch_id`（详见本节第 5 小节）。
 
 ### 1. 启动流水线
 在 Windows 终端中执行：
@@ -57,6 +58,20 @@ python workflow/runner.py --project . --status
    全部成功退出码为 0，任一失败为 2；`--json` 输出机器可读报告。
 3. **替换引用**：人工或脚本把源文档中的 tikz 块替换为 `\includegraphics{assets/<主名>-NN.png}`（tex2cards 对 `\includegraphics` 已有成熟支持，流水线无需其他改动）。
 4. **正常跑流水线**：按本节第 1 步启动即可。
+
+### 5. AGENT_DISPATCH 中断的批量恢复（硬约束）
+
+流水线在 T1/T2/T4 节点以 `AGENT_DISPATCH` 中断挂起时，载荷会给出 `.pd/agent-requests/*.json` 派发单。恢复方式是**硬约束**，不是偏好：
+
+| 场景 | 调用方式 | 并发 |
+|---|---|---|
+| **整批复原（默认、绝大多数情况）** | `qchain_dispatch({ batch_id: "<批次 id>" })` | 同批 N 个请求进入同一并发池，`laneCount = min(并发上限, N)` |
+| 单个请求返修（只重派失败的那一个） | `qchain_dispatch({ request_ref: ".pd/agent-requests/<id>.json" })` | `laneCount = 1`，必然串行 |
+
+- **批次 id 从哪来**：`.pd/dispatch-batches/<batch_id>.json` 索引文件（内含 `request_ids`、`run_id`、`plan_rel`、`plan_digest`），或直接由中断载荷的批次字段给出。批量入口据此索引解析，不会去扫 `.pd/agent-requests` 下的历史 pending。
+- **为什么不能逐单恢复**：每个批次（T2 写作、T2 语义审读、T4 逐节验收、T4 合并终审）内的请求彼此独立，本来就该并行；逐条 `request_ref` 会把「一批」拆成 N 次串行调用，墙钟时间放大近 N 倍，且每轮都要重新等待人机交互。只有确实只需要重做失败的那一节时才用 `request_ref`。
+- **宿主侧保护**：通过 `request_ref` 调用时，若该派发单经 `.pd/dispatch-batches/` 索引确认属于某个多请求批次，工具报告会追加一条 `💡 该派发单属于批次 …` 提示，提醒改用 `batch_id`。该提示宁可不显示也不猜测（命中歧义、`run_id` 不一致、批次只有一个请求时均不提示）。
+- **批次必须一次派发完整**：同一批次的全部 `dispatch_id` 都为 `ok` 之后，才能 `qchain_pipeline` 以 `action: "resume"` 恢复执行；缺任一即为半途状态。
 
 ---
 

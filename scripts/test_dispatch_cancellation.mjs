@@ -635,8 +635,13 @@ test('DISP-05 生产代码把 attempt signal 交给三个适配分支（源码�
   // 三个分支都必须出现 attemptExec.signal
   const occurrences = (src.match(/attemptExec\.signal/g) || []).length;
   assert.ok(occurrences >= 2, `attemptExec.signal 应出现在 tools.execute 与 subagents.start 分支（实测 ${occurrences}）`);
-  assert.match(src, /subagentDef\.execute\(subArgs,\s*attemptExec\)/,
+  // 分支一：tools.get("subagent")。形参名不写死——生产实现里该分支传的是
+  // 剥去过宿主 schema 的 toolArgs（删掉 max_tokens），语义要求是「第二实参
+  // 必须是 attemptExec」，写死形参名会让任何局部改名都误报。
+  assert.match(src, /subagentDef\.execute\([A-Za-z_$][\w$]*,\s*attemptExec\)/,
     '分支一（tools.get("subagent")）必须收到 attemptExec');
+  assert.match(src, /\{\s*max_tokens\s*:[^}]*\.\.\.[A-Za-z_$][\w$]*\s*\}\s*=\s*subArgs/,
+    '分支一不得把 max_tokens 透传给宿主 subagent schema（须解构剔除）');
 });
 
 test('DISP-05 真实宿主取消契约：execute(args, exec) 消费 exec.signal（静态核验，宿主源码只读）', (t) => {

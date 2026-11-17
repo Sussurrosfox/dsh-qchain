@@ -19,7 +19,7 @@ missing / unresolved 字段，绝不静默遗漏。
   sha256_file(path)            -> str | None
   collect_inputs(project)      -> manifest dict
   content_digest(manifest)     -> str (64 hex)
-  digest_paths(paths)          -> (str, entries list)
+  digest_paths(paths, overrides=None) -> (str, entries list)
   write_report(path, report)   -> None
 
 F07 追加（材料/验收/疑似项证据，均为纯函数）：
@@ -59,6 +59,17 @@ def sha256_file(path):
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def sha256_bytes(data):
+    """字节内容 SHA256（十六进制）；data 为 None 时返回 None。纯函数。
+
+    与 sha256_file 对偶：供「同一路径换一种内容口径」的调用方复用
+    （典型：pdstate 把 config.yaml 的运行时调参键剥离后再参与摘要）。
+    """
+    if data is None:
+        return None
+    return hashlib.sha256(data).hexdigest()
 
 
 def _strip_comments(text):
@@ -216,8 +227,8 @@ def content_digest(manifest):
     return hashlib.sha256(blob).hexdigest()
 
 
-def digest_paths(paths):
-    """对若干文件/目录的内容求确定性摘要（纯函数，不看 mtime）。
+def digest_paths(paths, overrides=None):
+    r"""对若干文件/目录的内容求确定性摘要（纯函数，不看 mtime）。
 
     paths 中文件以其路径尾部为键，目录递归展开为 "<dirname>/<相对路径>"
     键；键排序后连同内容 SHA256 做确定格式 JSON 序列化再求总摘要。
@@ -227,12 +238,31 @@ def digest_paths(paths):
     （被覆盖者永远不参与摘要与 stale 判定）。现按键冲突逐级上溯父目录名
     直至唯一；无冲突时键与旧版完全一致（行为兼容）。
     返回 (hexdigest, entries)，entries 为 [{"path", "sha256"}] 排序清单。
+
+    overrides: {路径: bytes}——以给定字节**代替该路径的文件内容**参与摘要。
+    用于把「运行时调参」从受审输入中剥离（pdstate 对 config.yaml 的归一化：
+    改派发并发/模型路由/返修预算不得作废已冻结的候选）。语义约束：
+    路径仍须存在（不存在一律记 None，不静默放行）；只换内容口径，不增删
+    条目。键按 normpath(abspath) 归一，调用方不必关心相对/绝对写法；
+    overrides 为空时行为与旧版完全一致。
     """
+    norm_overrides = {}
+    for key, data in (overrides or {}).items():
+        if data is None:
+            continue
+        norm_overrides[os.path.normpath(os.path.abspath(key))] = data
+
+    def _digest_one(p):
+        norm = os.path.normpath(os.path.abspath(p))
+        if norm in norm_overrides:
+            return sha256_bytes(norm_overrides[norm])
+        return sha256_file(p)
+
     # 第一遍：收集 (完整路径, sha256, 首选键)
     collected = []
     for p in paths:
         if os.path.isfile(p):
-            collected.append((os.path.normpath(p), sha256_file(p), None))
+            collected.append((os.path.normpath(p), _digest_one(p), None))
         elif os.path.isdir(p):
             base = os.path.basename(os.path.normpath(p))
             for root, _dirs, names in os.walk(p):
@@ -240,7 +270,7 @@ def digest_paths(paths):
                     ap = os.path.join(root, n)
                     rel = os.path.relpath(ap, p).replace(os.sep, "/")
                     # 目录展开键天然含 dirname 前缀，冲突概率低，保留旧口径
-                    collected.append((os.path.normpath(ap), sha256_file(ap),
+                    collected.append((os.path.normpath(ap), _digest_one(ap),
                                       "%s/%s" % (base, rel)))
         else:
             collected.append((os.path.normpath(p), None, None))

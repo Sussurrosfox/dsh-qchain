@@ -201,9 +201,15 @@ async function runLedger(ctx, selfDir, argv) {
   if (!selfDir) {
     return { success: false, output: '❌ 未找到 self 工作区目录（请指定 self_dir）', payload: null };
   }
+  // apply() 作用域里有 const engineRoot；本函数在模块顶层，历史上直接引用
+  // 同名自由变量导致 ReferenceError（engineRoot is not defined），人工批准
+  // 台账完全写不进去。这里改为就地解析：插件目录优先（与 resolveEngineRoot
+  // 的第二条回退一致），调用方可传 projectRoot 覆盖。
+  const hint = (ctx && typeof ctx.get === 'function' && ctx.get('projectRoot')) || undefined;
+  const engineRoot = resolveEngineRoot(hint);
   const res = await runPython(
     [path.join(engineRoot, 'scripts', 'ledger.py'), ...argv, '--self', selfDir, '--json'],
-    selfDir, 60000, pythonBin);
+    selfDir, 60000, resolvePythonBin());
   const raw = [res.stdout, res.stderr].filter(Boolean).join('\n').trim();
   let payload = null;
   try {
@@ -486,6 +492,59 @@ function qdResolveRequests(selfDir, args) {
     return qdResolveBatch(selfDir, String(args.batch_id));
   }
   return qdResolveNoArg(selfDir);
+}
+
+/**
+ * P1：逐单 request_ref 派发时的「可批量化」提示。
+ *
+ * request_ref 是给**单请求返修**用的入口；整批复原必须走 batch_id——只有
+ * batch_id 才会把同批 N 个请求塞进同一个并发池（execute 里的
+ * laneCount = Math.max(1, Math.min(maxConcurrency, requests.length))）。
+ * 逐条 request_ref 调用时每条 laneCount 都是 1，同批 N 个请求只能串行，
+ * 白丢并行能力。
+ *
+ * 判定口径（宁可不提示，也不猜）：
+ *  · 只在 .pd/dispatch-batches/ 批次索引里按 dispatch_id / request_refs 精确
+ *    归属查找，绝不扫描 .pd/agent-requests 下全部历史 pending；
+ *  · 命中 0 个批次（游离单）或 >1 个批次（归属歧义）一律不提示；
+ *  · run_id 与批次索引不一致（历史残留）不提示；
+ *  · 批次只有 1 个请求时提示无意义，不提示。
+ */
+function qdBatchHint(selfDir, request) {
+  try {
+    const dir = path.join(selfDir, '.pd', 'dispatch-batches');
+    let names = [];
+    try {
+      names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort();
+    } catch (_) {
+      return '';
+    }
+    const did = String((request && request.dispatch_id) || '');
+    if (!did) return '';
+    const rel = `.pd/agent-requests/${did}.json`;
+    const runId = String((request && request.run_id) || '');
+    const hits = [];
+    for (const name of names) {
+      const idx = qdReadJson(path.join(dir, name));
+      if (!idx) continue;
+      const ids = Array.isArray(idx.request_ids) ? idx.request_ids.map((v) => String(v)) : [];
+      const refs = Array.isArray(idx.request_refs) ? idx.request_refs.map((v) => String(v)) : [];
+      if (!ids.includes(did) && !refs.includes(rel)) continue;
+      if (runId && String(idx.run_id || '') && String(idx.run_id) !== runId) continue;
+      // 批次 id 一律取索引文件名（= batch_id，与 qdResolveRequests 的寻址约定
+      // 一致），不采信索引里的 batch_id 字段，避免把 `../` 之类拼进后续路径。
+      hits.push(name.replace(/\.json$/, ''));
+    }
+    if (hits.length !== 1) return '';
+    const idx = qdReadJson(qdBatchIndexPath(selfDir, hits[0]));
+    const count = Array.isArray(idx && idx.request_ids) ? idx.request_ids.length : 0;
+    if (count <= 1) return '';
+    return `💡 该派发单属于批次 ${hits[0]}（共 ${count} 个请求）。request_ref 是单请求返修入口，`
+      + `整批复原请改用 qchain_dispatch({ batch_id: "${hits[0]}" }) 一次进入同一并发池`
+      + `（逐单调用每条 laneCount=1，${count} 个请求会退化为串行）。`;
+  } catch (_) {
+    return '';
+  }
 }
 
 // ---- 幂等认领 / 重放（任务20，C12.2） ------------------------------------
@@ -1014,7 +1073,10 @@ export function apply(ctx, config = {}) {
         const icon = pass ? '✔ PASS' : '✖ FAIL';
         const msg = [res.stdout, res.stderr].filter(Boolean).join('\n') || (pass ? '门禁通过' : '门禁未通过');
         const noteLine = note ? `${note}\n` : '';
-        reports.push(`[${icon}] ${name}:\n${noteLine}${msg}`);
+        // P0：不再直接 push 共享 reports 数组，改为返回条目文本。并行执行时
+        // push 的先后等于各门禁完成的先后，报告顺序会随耗时抖动；由调用方按
+        // 固定规范顺序装配，gate=all 的输出才能逐字节复现。
+        return `[${icon}] ${name}:\n${noteLine}${msg}`;
       };
 
       const gateHandlers = {
@@ -1036,6 +1098,9 @@ export function apply(ctx, config = {}) {
           // Missing character、U+FFFD 不可见字形、空选项组（）。结构门禁
           // 全 PASS 也挡不住这类“渲染级”失败，故单列硬门禁。
           // 需在 build.py 之后运行（读 *.html / *.pdf / *.log）。
+          // 注：gate=all 并行化（见下方 P0 注释）后此排序不再构成数据依赖——
+          // build 门禁走 --check-env 只做环境预检、不产产物；产物来自上一轮
+          // 构建，本门禁读的是既有文件。
           const rndReport = path.join(targetDir, '.pd', 'reports', 'check_render.json');
           try {
             fs.mkdirSync(path.dirname(rndReport), { recursive: true });
@@ -1128,28 +1193,91 @@ export function apply(ctx, config = {}) {
         test_runtime: () => runScript('运行时契约自动化套件 (test_runtime.py)', 'scripts/test_runtime.py', [], '', 600000),
       };
 
+      // ---- gate=all 并行化（P0，audit：18 个门禁里 17 个互不依赖） ----------
+      // 原实现逐个 await 串行，墙钟时间 = 各门禁耗时之和：每个门禁都要另起一个
+      // Python 子进程，慢门禁（test_runtime 数分钟、delivery 4~6 分钟）把整轮
+      // 拖到十几分钟，而它们彼此之间并没有数据依赖。
+      //
+      // 分层依据必须按脚本实际行为判定，不能按门禁名字臆测：
+      //  · scripts/build.py --check-env 只做 XeLaTeX 环境预检（build.py:460-461
+      //    命中即 return check_env(fmt)），不编译、不写产物 ⇒ 与读产物的门禁
+      //    在同一调用内无依赖（原注释「render 须在 build 之后」指的是产物必须
+      //    已存在，而 env 预检本来就不生产产物，排序并无担保作用）；
+      //  · scripts/check_render.py / check_html.py / compare_versions.py 均为
+      //    只读检查（读 *.html / *.pdf / *.log），各自只写自己的
+      //    .pd/reports/*.json，互不覆写；
+      //  · scripts/test_runtime.py 只用合成临时工程（test_runtime.py:6「不依赖
+      //    也不触碰真实 self/」），不碰目标工作区；
+      //  · scripts/make_review_pack.py 只读 student.pdf/teacher.pdf，写
+      //    .pd/review/ 与 .pd/reports/render_smoke.json；
+      //  · scripts/gen_classroom_plan.py 走 --check 纯只读，不覆写手改教案。
+      // 唯一例外是 scripts/deliver.py --dry-run：它内部整轮重跑 build.py 真实
+      // 编译，并覆写 .pd/reports/check_*.json 与 *.pdf/*.html（deliver.py:55-74
+      // 的 PRE_CHECKS/CHECKS 清单）。若与读这些文件的门禁并发，双方会读到半成品、
+      // 报告互相覆写 ⇒ 必须单独放最后一层串行执行。
+      //
+      // 输出顺序：层内与层间都按 GATE_ORDER 固定顺序装配，与串行版本逐一对应；
+      // 唯一差异是 test_runtime 从「delivery 之后」提到本层末尾（它不再需要等
+      // 交付门禁）。汇总语义 allPassed 不变：任一脚本非零退出或抛异常都记 FAIL。
+      // 并发上限 6：这些是独立 Python 子进程，17 个同时起会与 XeLaTeX/测试套件
+      // 抢 CPU；6 已足以把「耗时之和」压成「分批之和」。
+      const GATE_ORDER = [
+        'pedagogy', 'numbering', 'fidelity', 'semantic', 'scope', 'provenance',
+        'budget', 'classroom_plan', 'dialogue', 'shuffle', 'build', 'check_html',
+        'render', 'compare', 'review_pack', 'agent_audit', 'test_runtime',
+      ];
+      const GATE_LAYERS = [GATE_ORDER, ['delivery']];
+      const GATE_PARALLELISM = 6;
+      const runGateLayer = async (names) => {
+        const entries = new Array(names.length);
+        let cursor = 0;
+        const lane = async () => {
+          while (cursor < names.length) {
+            const i = cursor;
+            cursor += 1;
+            const handler = gateHandlers[names[i]];
+            if (typeof handler !== 'function') {
+              allPassed = false;
+              entries[i] = `[✖ FAIL] ${names[i]}:\n门禁未注册（GATE_ORDER 与 gateHandlers 不一致）`;
+              continue;
+            }
+            try {
+              entries[i] = await handler();
+            } catch (err) {
+              // 单门禁抛错不再中止整轮：记为该门 FAIL 并继续跑完其余门禁
+              // （汇总只会更严不会更松；串行版本是整体抛错、其余门禁什么都看不到）。
+              allPassed = false;
+              entries[i] = `[✖ FAIL] ${names[i]}:\n门禁执行异常：`
+                + `${(err && (err.message || String(err))) || '未知错误'}`;
+            }
+            if (!entries[i]) {
+              // 兜底：handler 忘了 return runScript(...) 时，该门禁不能从报告里
+              // 凭空消失（静默漏报比报错更危险）。
+              allPassed = false;
+              entries[i] = `[✖ FAIL] ${names[i]}:\n门禁未返回报告条目（handler 未返回 runScript 结果）`;
+            }
+          }
+        };
+        await Promise.all(Array.from(
+          { length: Math.max(1, Math.min(GATE_PARALLELISM, names.length)) },
+          () => lane(),
+        ));
+        for (const entry of entries) if (entry) reports.push(entry);
+      };
+
       if (args.gate === 'all') {
-        await gateHandlers.pedagogy();
-        await gateHandlers.numbering();
-        await gateHandlers.fidelity();
-        await gateHandlers.semantic();
-        await gateHandlers.scope();
-        await gateHandlers.provenance();
-        await gateHandlers.budget();
-        await gateHandlers.classroom_plan();
-        await gateHandlers.dialogue();
-        await gateHandlers.shuffle();
-        await gateHandlers.build();
-        await gateHandlers.check_html();
-        // 渲染质量门禁须在 build/check_html 之后（读 *.html / *.pdf / *.log）
-        await gateHandlers.render();
-        await gateHandlers.compare();
-        await gateHandlers.review_pack();
-        await gateHandlers.agent_audit();
-        await gateHandlers.delivery();
-        await gateHandlers.test_runtime();
+        for (const layer of GATE_LAYERS) {
+          await runGateLayer(layer);
+        }
       } else if (gateHandlers[args.gate]) {
-        await gateHandlers[args.gate]();
+        try {
+          const entry = await gateHandlers[args.gate]();
+          if (entry) reports.push(entry);
+        } catch (err) {
+          allPassed = false;
+          reports.push(`[✖ FAIL] ${args.gate}:\n门禁执行异常：`
+            + `${(err && (err.message || String(err))) || '未知错误'}`);
+        }
       } else {
         reports.push(`[?] 门禁 ${args.gate}: 未知门禁项`);
         allPassed = false;
@@ -1414,7 +1542,9 @@ export function apply(ctx, config = {}) {
       properties: {
         request_ref: {
           type: 'string',
-          description: '单个派发单 JSON 路径（相对 self_dir 或绝对路径）；与 batch_id 二选一',
+          description: '单个派发单 JSON 路径（相对 self_dir 或绝对路径）；与 batch_id 二选一。'
+          + ' ⚠ 这是单请求返修入口：逐单调用时每条 laneCount=1，同批多个请求只能串行。'
+          + '整批复原请改用 batch_id（一次进入同一并发池）。',
         },
         batch_id: {
           type: 'string',
@@ -1535,6 +1665,11 @@ export function apply(ctx, config = {}) {
         };
       }
 
+      // P1：逐单 request_ref 调用时给出「可批量化」提示（判定口径见 qdBatchHint）
+      const batchHint = (args.request_ref && requests.length === 1)
+        ? qdBatchHint(selfDir, requests[0])
+        : '';
+
       // ---- 派发配置（与 Python 状态机同源：workflow/dispatch_policy.py） -----
       // 任务19（C12）：这里只向 Python 取**原始输入**（config.yaml 原始键、
       // run_scope、execution_profile、已冻结的 dispatch 块），并发解析由
@@ -1648,13 +1783,25 @@ export function apply(ctx, config = {}) {
         if (subArgs && subArgs.cwd) request.cwd = subArgs.cwd;
         // 子 Agent 默认继承父级的 maxTokens；产物动辄 2–5 万字符（两个切片合写时更多），
         // 验收类任务还有长篇推理（reasoning）与两件 JSON 产物，因此这里显式抬高出参上限，
-        // 默认 65536：实测 32768 时 SCNet-Max 的推理链（~75K 字符）会把最终 JSON 挤出预算、
-        // 输出被 maxTokens 截断在 JSON 中段（attempt raw 尾部落在 md 表格行中间）。
+        // 默认 262144：实测 SCNet-Max 的推理链可吞掉 65536 token 全部预算（纯思考 2796 行
+        // 无产物 / 占位文件两种死法），作者角色还需要在同一预算里放下 2–5 万字符的正文，
+        // 65536/131072 均已被证明不够（T4 验收 233K 提示词 + 逐 qid JSON 在 131072 下
+        // 触发 max-tokens 截断）。route 里的 max_tokens（小输出上限模型）可覆盖默认值。
         const budget = Number(process.env.QCHAIN_SUBAGENT_MAX_TOKENS || 0);
-        request.agentOptions = { maxTokens: Number.isFinite(budget) && budget > 0 ? budget : 65536 };
+        const defaultBudget = Number.isFinite(budget) && budget > 0 ? budget : 262144;
+        const routeBudget = Number(subArgs && subArgs.max_tokens);
+        request.agentOptions = {
+          maxTokens: Number.isFinite(routeBudget) && routeBudget > 0 ? routeBudget : defaultBudget,
+        };
         if (subArgs && subArgs.provider && subArgs.model) {
           request.agentOptions.provider = subArgs.provider;
           request.agentOptions.model = subArgs.model;
+        }
+        // route 可带 reasoning_effort（model_map 的 T4 等路由）：改变路由而不指明 effort 时
+        // 宿主会清掉父级 effort、让目标模型自定默认；这里显式下发 route 声明的档位
+        // （例如 our-free-model 的 combo 链需要档位来决定输出上限）。
+        if (subArgs && subArgs.reasoning_effort) {
+          request.agentOptions.reasoningEffort = subArgs.reasoning_effort;
         }
         // 修复 N3：记「生效路由」。宿主在 startActivation 内部用
         // resolveChildAgentOptions 决定子 Agent 的路由：请求里没给 provider/model
@@ -1739,9 +1886,12 @@ export function apply(ctx, config = {}) {
           if (attemptExec) attemptExec.hostMode = 'bridge';
           return bridged;
         }
+        // 回落路径走宿主 subagent 工具/服务：桥接专用扩展键（max_tokens 等）不在
+        // 宿主工具 schema 内，剔除后再投递，避免未知参数校验失败。
+        const { max_tokens: _dropRouteMaxTokens, ...toolArgs } = subArgs;
         if (subagentDef) {
           if (attemptExec) attemptExec.hostMode = 'async-fallback';
-          return subagentDef.execute(subArgs, attemptExec);
+          return subagentDef.execute(toolArgs, attemptExec);
         }
         try {
           const tools = ctx?.tools || ctx?.get?.('tools');
@@ -1749,7 +1899,7 @@ export function apply(ctx, config = {}) {
             if (attemptExec) attemptExec.hostMode = 'async-fallback';
             return tools.execute({
               name: 'subagent',
-              arguments: subArgs,
+              arguments: toolArgs,
               agent: attemptExec && attemptExec.agent,
               signal: attemptExec && attemptExec.signal,
               callId: attemptExec && attemptExec.callId,
@@ -1760,8 +1910,8 @@ export function apply(ctx, config = {}) {
         if (subagents && typeof subagents.start === 'function') {
           if (attemptExec) attemptExec.hostMode = 'subagents-service';
           const run = await subagents.start('spawn', {
-            label: subArgs.description || 'qchain subagent',
-            prompt: [{ type: 'text', text: subArgs.prompt }],
+            label: toolArgs.description || 'qchain subagent',
+            prompt: [{ type: 'text', text: toolArgs.prompt }],
             parent: attemptExec && attemptExec.agent,
             signal: attemptExec && attemptExec.signal,
           });
@@ -1894,6 +2044,8 @@ export function apply(ctx, config = {}) {
               run_in_background: false,
               ...(route.provider && route.model
                 ? { provider: route.provider, model: route.model } : {}),
+              ...(route.reasoning_effort ? { reasoning_effort: route.reasoning_effort } : {}),
+              ...(route.max_tokens ? { max_tokens: route.max_tokens } : {}),
             }, attemptExec);
             const outcome = await settleWithCancel({
               abort, hostPromise: hostCall, graceMs: policy.cancel_grace_ms,
@@ -2693,6 +2845,7 @@ export function apply(ctx, config = {}) {
           + ` ｜ 执行并发槽 effective_concurrency: ${maxConcurrency}`
           + ` ｜ 并发上限 concurrency_limit: ${dispatchPolicy.concurrency_limit}`
           + ` ｜ 宿主能力: ${capabilityNote}`,
+        ...(batchHint ? [batchHint] : []),
         ...(batchObservation
           ? [`并发观测（口径 ${batchObservation.observed_scope}，仅宿主调用窗口）:`
             + ` 峰值在飞 ${batchObservation.peak_observed_host_in_flight}`

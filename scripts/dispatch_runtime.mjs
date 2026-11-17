@@ -72,7 +72,15 @@ export function resolveStageRoute(stage, modelMap) {
   for (const key of [...stageRouteCandidates(stage), 'DEFAULT', '*']) {
     const route = norm[key];
     if (route && route.provider && route.model) {
-      return { provider: String(route.provider), model: String(route.model), matched_key: key };
+      // 额外键（可选）：reasoning_effort（'lite'|'light'|'balanced'|'deep' 等，按供应商档位）、
+      // max_tokens（正整数，覆盖默认输出预算；小输出上限模型可显式调小避免 API 拒绝）。
+      const extra = {};
+      if (route.reasoning_effort) extra.reasoning_effort = String(route.reasoning_effort);
+      if (route.max_tokens) {
+        const mt = Number(route.max_tokens);
+        if (Number.isFinite(mt) && mt > 0) extra.max_tokens = mt;
+      }
+      return { provider: String(route.provider), model: String(route.model), matched_key: key, ...extra };
     }
   }
   return {};
@@ -110,6 +118,10 @@ export function outputProtocol(role, artifacts) {
   if (role === 'review') {
     return [
       '## 输出协议（本角色唯一协议：单个 JSON 对象；不要使用 FILE 块）',
+      '【硬性约束，凌驾于本任务书一切其他表述之上】你的最终回复中严禁出现任何',
+      '分析、推理、审读笔记、计划、复述或解释性文字——回复中只要有一个非 JSON',
+      '字符，解析即失败、本派发单作废、前面的全部审读工作归零。所有思考必须在',
+      '内部完成；先在内部审读完，然后一次性给出下面的 JSON 对象作为唯一回复。',
       `最终回复必须只是一个可解析的 JSON 对象，形如 {"files": {"<相对路径>": "<完整文件内容>"}}，不要包裹多余文字。`,
       `files 的键必须恰好等于下列 ${artifacts.length} 个白名单路径（缺任何一个即判该派发单失败）：`,
       list,
@@ -130,6 +142,9 @@ const EXECUTION_RULES = [
   '- 严禁调用 subagent 或任何“派发/二次委托”类工具；你本人就是执行者，必须亲自完成本任务。',
   '- 严禁以相同或近似参数反复调用同一个工具；所需信息一次读取到位，之后直接产出结果。',
   '- 允许使用 read/grep/glob 只读工具查看输入；不得使用 write/edit/apply_patch 等写盘工具（宿主会按白名单原子写盘）。',
+  '- 【反探索】严禁阅读或运行本任务书之外的任何「流水线自身实现」——包括但不限于 scripts/ 下的 check_*.py、pdstate.py、workflow/ 目录、prompts/ 模版、插件 index.js、宿主调度器源码。本任务书已经包含你需要的全部规则与输入；评分与校验逻辑与你无关，理解它们不会帮助交付。此类阅读只会消耗你的时间与输出预算，并直接导致超时或截断失败。',
+  '- 【反探索】不要试图“先弄清整套系统如何工作再动手”。按任务书逐条执行即可：读懂输入 → 直接产出白名单产物。对系统的任何好奇心都是本任务失败的最大风险。',
+  '- 【产出优先】先把全部白名单产物完整写出来，这是唯一的交付物；写完之后若还有余力，再对照任务书自查一遍，绝不要在产出之前做任何“准备工作”。',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1063,35 @@ function truncationHint(raw) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// 8c. 平衡对象扫描（解析回退用，纯字符串、无副作用）
+// ---------------------------------------------------------------------------
+// 子 Agent 有时在合法 JSON 之后粘一个游离引号或半句解释
+// （"{"files": {...}}" 后面跟一个多余的 '"'），strict parse 报
+// "Unexpected non-whitespace character after JSON"，repairJsonString 修不了
+// （它只修串内引号）。这里按括号深度（含字符串内豁免）找到首个完整闭合的
+// 顶层对象，截取前缀再走 strict parse。
+function balancedObjectEnd(s) {
+  if (!s || s[0] !== '{') return -1;
+  let depth = 0;
+  let inStr = false;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (inStr) {
+      if (ch === '\\') { i += 1; continue; }
+      if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{' || ch === '[') depth += 1;
+    else if (ch === '}' || ch === ']') {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
 export function parseSubagentFiles(raw, artifacts) {
   if (!raw) return { files: null, runId: '', error: '子 Agent 无返回' };
   let runId = '';
@@ -1159,6 +1203,32 @@ export function parseSubagentFiles(raw, artifacts) {
         p = tolerantJsonParse(m[0]);
         if (pickFiles(p)) parsed = p;
       }
+    }
+  }
+
+  // 3b. 平衡对象前缀回退：合法 JSON + 尾部多余字符（游离引号/半句解释）。
+  //     按括号深度截首个完整闭合对象再 strict parse。
+  if (!parsed) {
+    const end = balancedObjectEnd(trimmed);
+    if (end > 0) {
+      try {
+        const p = JSON.parse(trimmed.slice(0, end));
+        if (pickFiles(p)) parsed = p;
+      } catch (_) { /* 落到下一档 */ }
+    }
+  }
+
+  // 3c. 顶层 artifact 键提升：子 Agent 把某个白名单产物路径写到了 files
+  //     之外（{"files": {...}, ".pd\acceptance\x-source-vs-output.md": "..."}）。
+  //     仅提升命中白名单的键，其余顶层键一律保持原样（绝不在 files 里注入
+  //     未声明的产物名）。
+  if (parsed && Array.isArray(artifacts) && artifacts.length > 0) {
+    const wanted = new Set(artifacts.map((a) => String(a).replace(/^\.\//, '')));
+    if (!parsed.files || typeof parsed.files !== 'object') parsed.files = {};
+    for (const k of Object.keys(parsed)) {
+      if (k === 'files' || !wanted.has(k)) continue;
+      if (parsed.files[k] === undefined) parsed.files[k] = parsed[k];
+      delete parsed[k];
     }
   }
 

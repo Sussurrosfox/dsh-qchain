@@ -71,7 +71,7 @@ RE_TOKEN = re.compile(
     r"\\begin\s*\{(" + _BLOCK_ENVS_RE + r")\}"       # 1=begin 环境
     r"|\\end\s*\{(" + _BLOCK_ENVS_RE + r")\}"        # 2=end 环境
     r"|(\\item\b)"                                    # 3=列表项/题目
-    r"|\\section\s*\*\s*\{([^{}]*)\}"                # 4=节标题
+    r"|\\section\s*\*\s*\{((?:[^{}]|\{[^{}]*\})*)\}"  # 4=节标题（容许一层嵌套花括号，如 $\mathfrak{S}_n$）
     r"|\\qtype\s*\{([^{}]*)\}"                       # 5=题型
     r"|\\practicemode\s*\{([^{}]*)\}"                # 6=练习模式
     r"|(\\speaker)(?=\s*\{)"                        # 7=对话台词（参数另行扫描）

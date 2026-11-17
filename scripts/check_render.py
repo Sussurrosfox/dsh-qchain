@@ -139,6 +139,13 @@ KATEX_MACROS = {
     "not",
     # --- KaTeX 大型算子（已在随包中核验）---
     "bigsqcup", "bigvee", "bigwedge", "bigodot", "bigotimes", "biguplus",
+    # --- KaTeX 定界符尺寸族（\bigl/\bigr 等，KaTeX 原生支持，
+    # 此前缺漏导致 sec 判 REVISE 的假阳性）---
+    "big", "Big", "bigg", "Bigg", "bigl", "Bigl", "biggl", "Biggl",
+    "bigr", "Bigr", "biggr", "Biggr",
+    # --- KaTeX 原生支持的常见关系/二元记号（此前缺漏同理）---
+    "triangleleft", "trianglerighteq", "vdash", "dashv", "wr", "models",
+    "lnsim", "succ", "prec", "preceq", "succeq", "sqsubseteq", "sqsupseteq",
 }
 # 白名单判定：剥掉反斜杠后的命令名（可能带 * 后缀）
 KATEX_EXTRA = {"qmathlit", "qrawhtml"}

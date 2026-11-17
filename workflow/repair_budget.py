@@ -171,12 +171,22 @@ def resolve_limits(state: Dict[str, Any],
     cfg_total = _as_int(cfg.get("repair_total_limit"))
     if frozen_total is None and not isinstance(ov_total, int) and cfg_total is not None:
         total = cfg_total
+    # 运维覆盖（ops_override）：冻结执行契约之上的唯一显式放宽通道（见
+    # ``load_ops_override``）。优先级：ops_override > frozen > state > config > profile。
+    ops = load_ops_override(state.get("self_dir") or state.get("project_root"))
+    if "repair_per_scope_limit" in ops:
+        per_scope = ops["repair_per_scope_limit"]
+    if "repair_total_limit" in ops:
+        total = ops["repair_total_limit"]  # None = 显式解除全局上限（合法取值）
     return per_scope, total, profile
 
 
 def limits_source(state: Dict[str, Any],
                   config: Optional[Dict[str, Any]] = None) -> str:
-    """返修上限的生效来源：frozen / state / config / profile（排障用，进 HALT 证据）。"""
+    """返修上限的生效来源：ops_override / frozen / state / config / profile（排障用，进 HALT 证据）。"""
+    ops = load_ops_override(state.get("self_dir") or state.get("project_root"))
+    if ops:
+        return "ops_override"
     frozen = state.get("execution_config")
     frozen = frozen if isinstance(frozen, dict) else {}
     for key in ("repair_max_per_scope", "repair_max_total"):
@@ -250,6 +260,55 @@ def load_repair_overrides(self_dir: Optional[str]) -> Dict[str, Any]:
                 raw = nested.get(key)
         if raw is not None:
             out[key] = raw
+    return out
+
+
+def load_ops_override(self_dir: Optional[str]) -> Dict[str, Any]:
+    """工作区级运维覆盖：``self/.pd/repair-ops-override.json``。
+
+    Phase 0 冻结的返修额度是**会话级执行契约**，``config.yaml`` 无法覆盖已冻结
+    值（F4）。当冻结额度在运行中被正当耗尽、但仍需安排已规划的内容返修
+    （例：T2 阶段的语义返修用满预算后，T3 本地门禁又发现对话悬置原则违规），
+    运维人员可在本文件显式放宽——这是 frozen 之上的唯一例外通道，**由人落盘、
+    当场生效、逐工作区隔离、不进 checkpoint**::
+
+        {
+          "repair_per_scope_limit": 12,
+          "repair_total_limit": null,      // null = 显式解除全局上限
+          "approved_by": "<真人>",
+          "reason": "...",
+          "applied_at": "..."
+        }
+
+    ``approved_by`` / ``reason`` 仅作审计记录、不参与判定；非法取值 / 文件缺失 /
+    JSON 损坏一律视为未设置（返回 ``{}``），绝不抛错。
+    """
+    out: Dict[str, Any] = {}
+    if not self_dir:
+        return out
+    path = os.path.join(self_dir, ".pd", "repair-ops-override.json")
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return out
+    if not isinstance(data, dict):
+        return out
+    for key in ("repair_per_scope_limit", "repair_total_limit"):
+        raw = data.get(key)
+        if key == "repair_total_limit" and raw is None and key in data:
+            out[key] = None  # 显式 null = 解除全局上限
+            continue
+        if isinstance(raw, bool):
+            continue
+        if isinstance(raw, int) and raw >= 0:
+            out[key] = raw
+        elif isinstance(raw, str) and raw.strip().lstrip("-").isdigit():
+            n = int(raw.strip())
+            if n >= 0:
+                out[key] = n
     return out
 
 

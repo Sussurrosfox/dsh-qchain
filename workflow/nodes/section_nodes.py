@@ -46,6 +46,125 @@ def _pdstate_task_status(self_dir: str, sec: str) -> Optional[str]:
         return None
 
 
+#: pdstate submit 失败信息中的**契约/新鲜度**特征：输入漂移、任务状态机、
+#: attempt 身份不符。这些由节点自身「重冻结基线」即可修复，写作者改内容无效。
+#: 旧实现把这类失败也包成 repair_reason 派给内容返修专员：子 Agent 逐字节
+#: 不改 → no_change 判 HALTED（作者自述只能删 checkpoint 恢复）；改 → 又触发
+#: stale_digest 重审已 PASS 的内容，并白烧返修预算。两类 Agent 都修不了。
+_CONTRACT_FAIL_MARKERS = (
+    "输入摘要已变化",
+    "当前状态为",
+    "没有当前 attempt",
+    "缺少冻结的",
+    "task.json 的",
+    "result.json 复述的",
+    "result.json 输出路径",
+    "候选文件哈希",
+)
+#: 候选内容结构问题（切片纯度底线）——这类必须回到写作者返修。
+_CONTENT_FAIL_MARKERS = ("候选切片不得包含", "候选文件为空")
+
+
+def _classify_submit_failure(err_msg: str) -> str:
+    """pdstate submit 失败归类：``content``（内容结构）或 ``contract``。
+
+    内容特征优先（一条信息同时命中两类时以内容为准）；命中契约特征表则明确
+    判契约。无法识别时按 contract 处理：submit 的其余失败（缺 result.json /
+    候选不存在 / 未知任务）在节点已完成纳管的前提下只可能是契约问题，静默改派
+    写作者只会重演上面那类死循环。
+    """
+    if any(marker in err_msg for marker in _CONTENT_FAIL_MARKERS):
+        return "content"
+    if any(marker in err_msg for marker in _CONTRACT_FAIL_MARKERS):
+        return "contract"
+    return "contract"
+
+
+def _pdstate_submit_with_selfheal(
+    self_dir: str,
+    active_sec: str,
+    runner: ScriptRunner,
+    history: List[str],
+    success_note: str = "正式切片",
+) -> tuple:
+    """跑 pdstate submit；失败后按**新鲜**状态自愈，杜绝 TOCTOU 误路由。
+
+    pdstate 检查 3（输入摘要漂移）会在 submit 调用**内部**把任务标 stale，
+    因此失败后不得沿用进节点前读到的 status 快照——旧实现正是因此漏掉
+    「submit 过程中被标 stale」这一最常见情形，自愈分支从未触发。这里失败
+    后重读 run.json，确属 stale/failed/blocked/planned 才走
+    mark ready → start（重快照当前输入摘要）→ 纳管候选 → 重试 submit。
+
+    ``success_note`` 只影响历史串措辞（faithful_fast 路径称"候选"、legacy
+    称"正式切片"），不改变控制流与产物。
+
+    返回 ``(exit_code, message, fail_kind)``；成功时 ``fail_kind`` 为 ``""``，
+    失败时为 ``"content"`` / ``"contract"``（见 _classify_submit_failure）。
+    """
+    code, out, err = runner.run_script(
+        "pdstate.py", [self_dir, "submit", active_sec])
+    if code == 0:
+        history.append(
+            f"T2: pdstate.py submit {active_sec} 成功提升{success_note}")
+        return 0, (out or ""), ""
+
+    # 失败后**重读**状态：本次 submit 可能已把任务标 stale（检查 3）
+    fresh_status = _pdstate_task_status(self_dir, active_sec)
+    if fresh_status is None or fresh_status in ("stale", "failed", "blocked",
+                                                "planned"):
+        history.append(
+            f"T2: submit 失败后重读状态={fresh_status}"
+            f"（进节点快照可能已过期），走重冻结自愈："
+            f"mark ready → start 重快照输入摘要")
+        _ensure_task_ready_and_start(self_dir, active_sec, runner)
+    if _import_direct_candidate(self_dir, active_sec, runner, history):
+        code, out, err = runner.run_script(
+            "pdstate.py", [self_dir, "submit", active_sec])
+        if code == 0:
+            history.append(
+                f"T2: pdstate.py submit {active_sec} 纳管后成功提升{success_note}")
+            return 0, (out or ""), ""
+    msg = (err or out or "submit failed").strip()
+    return code, msg, _classify_submit_failure(msg)
+
+
+def _submit_failure_patch(
+    active_sec: str,
+    err_msg: str,
+    fail_kind: str,
+    self_dir: str,
+    history: List[str],
+) -> Dict[str, Any]:
+    """按失败类别给出路由补丁：内容问题回写作者，契约问题定向 HALT。
+
+    契约失败定向 HALT 并附人工处置命令，而不是改派内容返修——写作者无法
+    执行 mark/start，改派只会得到 no_change HALTED 或重审已 PASS 的内容。
+    """
+    if fail_kind == "content":
+        history.append(f"T2: 切片 {active_sec} 提交失败: {err_msg}")
+        return {
+            "stage": "REPAIR_LOOP",
+            "routing_action": "REPAIR_SECTION",
+            "repair_target": active_sec,
+            "repair_reason": f"切片提交失败: {err_msg}",
+            "history": history
+        }
+    history.append(
+        f"T2: 切片 {active_sec} 提交契约失败（非内容问题，写作者修不了）: "
+        f"{err_msg}")
+    return {
+        "stage": "HALTED",
+        "routing_action": "HALT",
+        "error_message": (
+            f"切片提交契约失败（写作者无法修复，已停止派发内容返修）: "
+            f"{err_msg}；处置：python scripts/pdstate.py {self_dir}/ "
+            f"mark {active_sec} ready && "
+            f"python scripts/pdstate.py {self_dir}/ start {active_sec} "
+            f"（重冻结输入基线）后重试 submit"),
+        "history": history
+    }
+
+
 def _fast_record_prebuild_ready(
     state: ShrinkCoursewareState,
     self_dir: str,
@@ -87,30 +206,13 @@ def _fast_record_prebuild_ready(
         }
 
     if cur_status not in ("produced", "checked"):
-        code_sub, out_sub, err_sub = runner.run_script(
-            "pdstate.py", [self_dir, "submit", active_sec])
+        # 与 legacy 相同：submit 失败后重读状态、补 ready/start、把落盘的
+        # 候选正式纳管后重试（TOCTOU 自愈，见 _pdstate_submit_with_selfheal）
+        code_sub, err_msg, fail_kind = _pdstate_submit_with_selfheal(
+            self_dir, active_sec, runner, history, success_note="候选")
         if code_sub != 0:
-            # 与 legacy 相同：先补 ready/start 再把落盘的候选正式纳管后重试
-            if cur_status is None or cur_status in ("stale", "failed",
-                                                    "blocked", "planned"):
-                _ensure_task_ready_and_start(self_dir, active_sec, runner)
-            if _import_direct_candidate(self_dir, active_sec, runner, history):
-                code_sub, out_sub, err_sub = runner.run_script(
-                    "pdstate.py", [self_dir, "submit", active_sec])
-            if code_sub != 0:
-                err_msg = (err_sub or out_sub or "submit failed").strip()
-                history.append(f"T2: 切片 {active_sec} 提交失败: {err_msg}")
-                return {
-                    "stage": "REPAIR_LOOP",
-                    "routing_action": "REPAIR_SECTION",
-                    "repair_target": active_sec,
-                    "repair_reason": f"切片提交失败: {err_msg}",
-                    "history": history,
-                }
-            history.append(
-                f"T2: pdstate.py submit {active_sec} 纳管后成功提升候选")
-        else:
-            history.append(f"T2: pdstate.py submit {active_sec} 成功提升候选")
+            return _submit_failure_patch(
+                active_sec, err_msg, fail_kind, self_dir, history)
         digest = _sha256_file(sec_tex)
 
     history.append(
@@ -439,32 +541,19 @@ def node_t2_submit_and_check_sections(state: ShrinkCoursewareState) -> Dict[str,
             code_sub = 0
             history.append(f"T2: 切片 {active_sec} 状态已为 {cur_status}，跳过重复 submit")
         else:
-            # 1. Try submit
-            code_sub, out_sub, err_sub = runner.run_script("pdstate.py", [self_dir, "submit", active_sec])
-            if code_sub == 0:
-                history.append(f"T2: pdstate.py submit {active_sec} 成功提升正式切片")
-            else:
+            # 1. Try submit（失败后重读状态再决定自愈——pdstate 检查 3 会把
+            #    任务在 submit 内部标 stale，沿用进节点快照会漏掉最常见情形）
+            code_sub, err_msg, fail_kind = _pdstate_submit_with_selfheal(
+                self_dir, active_sec, runner, history)
+            if code_sub != 0:
                 # B3+: 契约旁路（直接就绪模式）已移除。写作者直接把 <sec>.tex
-                # 落在 self/ 根目录是 interrupt 模式的常态路径——将其正式纳管为
-                # 当前 attempt 候选后重试 submit；契约校验（身份/新鲜度/结构）
-                # 仍由 pdstate 完整执行，纳管失败或重试失败一律定点返修。
-                if cur_status is None or cur_status in ("stale", "failed", "blocked", "planned"):
-                    _ensure_task_ready_and_start(self_dir, active_sec, runner)
-                if _import_direct_candidate(self_dir, active_sec, runner, history):
-                    code_sub, out_sub, err_sub = runner.run_script(
-                        "pdstate.py", [self_dir, "submit", active_sec])
-                    if code_sub == 0:
-                        history.append(f"T2: pdstate.py submit {active_sec} 纳管后成功提升正式切片")
-                if code_sub != 0:
-                    err_msg = (err_sub or out_sub or "submit failed").strip()
-                    history.append(f"T2: 切片 {active_sec} 提交失败: {err_msg}")
-                    return {
-                        "stage": "REPAIR_LOOP",
-                        "routing_action": "REPAIR_SECTION",
-                        "repair_target": active_sec,
-                        "repair_reason": f"切片提交失败: {err_msg}",
-                        "history": history
-                    }
+                # 落在 self/ 根目录是 interrupt 模式的常态路径——自愈路径已把它
+                # 正式纳管为当前 attempt 候选并重试过 submit；契约校验（身份/
+                # 新鲜度/结构）仍由 pdstate 完整执行。内容结构问题回写作者，
+                # 契约问题定向 HALT（写作者改内容修不了，详见
+                # _submit_failure_patch 注释）。
+                return _submit_failure_patch(
+                    active_sec, err_msg, fail_kind, self_dir, history)
 
         # 2. Mark checked（B3：退出码必须检查，非 0 一律返修，不得继续置 checked）
         if cur_status == "checked":

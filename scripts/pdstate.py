@@ -74,6 +74,17 @@ TASK_INPUT_FILES = ("header.tex", "footer.tex", "config.tex",
                     "config-class.tex", "student.tex", "teacher.tex",
                     "config.yaml", "source-map.md", "dependency-map.md",
                     "coverage-map.md")
+# config.yaml 中的**运行时调参键**：派发并发/模型路由/超时/重试/证据逃生阀
+# 与内容返修预算。这些键只改宿主派发与预算行为，不改变写作者收到的输入内容。
+# 旧实现把整个 config.yaml 计入冻结输入摘要，于是「按官方注释运行时改一行
+# 派发参数」就会让所有在途任务 stale——pdstate 与 agent_dispatch 对同一个
+# 文件持两套语义（一侧运行时可调、一侧冻结基线）。这里把运行键从摘要口径中
+# 剥离：改它们不作废候选，改版面/标题/对话层/容量等**内容键**照常作废。
+RUNTIME_CONFIG_KEYS = ("agent_dispatch", "agent_max_concurrency",
+                       "agent_batch_window", "agent_timeout_seconds",
+                       "agent_max_retries", "agent_allow_unattested",
+                       "repair_per_scope_limit", "repair_total_limit",
+                       "dispatch_contract_version")
 INPUT_RE = re.compile(r"\\input\{(sec[^/\\}.]+?)(?:\.tex)?\}")
 # 候选切片中禁止出现的内容（切片纯度底线）
 CANDIDATE_FORBIDDEN = ("\\documentclass", "\\begin{document}",
@@ -194,7 +205,54 @@ def baseline_sources(pdir, task_id):
 def task_input_digest(pdir, task_id):
     """基线输入摘要（init/旧任务用；start 之后的任务以 input_sources 为准）。"""
     paths = [os.path.join(pdir, n) for n in baseline_sources(pdir, task_id)]
-    return evidence.digest_paths(paths)[0]
+    return digest_task_inputs(paths)[0]
+
+
+def config_runtime_agnostic_bytes(path):
+    """config.yaml 的「内容口径」字节：剥离运行时调参键后确定性序列化。
+
+    PyYAML 缺失 / 解析失败 / 顶层不是映射 / 读文件失败时返回 None——调用方
+    随即退回整文件口径。保守方向明确：宁可误标 stale（多跑一次自愈重冻结），
+    也不静默放行任何真实变更。
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return None
+    try:
+        doc = yaml.safe_load(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    stripped = {str(k): v for k, v in doc.items()
+                if str(k) not in RUNTIME_CONFIG_KEYS}
+    blob = json.dumps(stripped, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+    return b"config.yaml#runtime-agnostic\n" + blob
+
+
+def digest_task_inputs(paths):
+    """任务输入摘要：config.yaml 以运行时无关口径参与，其余来源原样。
+
+    返回 evidence.digest_paths 的 (digest, entries)；entries 里 config.yaml
+    的 sha256 即归一化口径摘要，人工可核对「改派发参数不变、改版面参数变」。
+    """
+    overrides = {}
+    for p in paths:
+        if os.path.basename(str(p)) != "config.yaml":
+            continue
+        if not os.path.isfile(p):
+            continue  # 缺失来源由 digest_paths 记 None，不在此放行
+        data = config_runtime_agnostic_bytes(p)
+        if data is not None:
+            overrides[p] = data
+    return evidence.digest_paths(paths, overrides)
 
 
 def resolve_sources(pdir, sources):
@@ -210,7 +268,7 @@ def current_input_digest(pdir, task_id, task):
     """任务当前输入摘要：已 start 的任务按登记的 input_sources 重算。"""
     src = task.get("input_sources")
     if src:
-        return evidence.digest_paths(resolve_sources(pdir, src))[0]
+        return digest_task_inputs(resolve_sources(pdir, src))[0]
     return task_input_digest(pdir, task_id)
 
 
@@ -313,7 +371,7 @@ def cmd_start(pdir, run, path, args):
             copied.append(dest)
         else:
             missing.append(src)
-    digest, entries = evidence.digest_paths(copied + missing)
+    digest, entries = digest_task_inputs(copied + missing)
 
     task_json = {
         "schema_version": SCHEMA_VERSION,
@@ -423,7 +481,8 @@ def cmd_submit(pdir, run, path, args):
         task["status"] = "stale"  # 当前输入改变 → stale（不动冻结摘要）
         save_run(path, run)
         print("[pdstate] [冲突] %s 的输入摘要已变化，候选结果作废（stale）；"
-              "请按新输入重新派发，不得以迟到结果覆盖当前版本。" % tid)
+              "请按新输入重新派发（mark ready → start 重冻结基线），"
+              "不得以迟到结果覆盖当前版本。" % tid)
         return 1
 
     # ---- 4. result 复述四身份字段，输出路径与哈希正确 ----
